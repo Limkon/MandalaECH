@@ -1,0 +1,13 @@
+{
+	"outbounds":	[{
+			"type":	"socks_tls",
+			"tag":	"新加坡",
+			"server":	"www.visa.com.sg",
+			"server_port":	443,
+			"username":	"0ae3428c-7c30-458d-92e4-146baedd06bd",
+			"password":	"132579",
+			"tls":	{
+				"server_name":	"zoo.cbu.net"
+			}
+		}]
+}
