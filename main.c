@@ -1,7 +1,6 @@
 // =================================================================================
 //  Windows 7 终极修复版代理客户端 (main.c) - Final Integrated Version
 // =================================================================================
-
 #ifndef UNICODE
 #define UNICODE
 #endif
@@ -74,6 +73,7 @@ wchar_t g_iniFilePath[MAX_PATH] = {0};
 UINT g_hotkeyModifiers = MOD_CONTROL | MOD_ALT; 
 UINT g_hotkeyVk = 'H';                          
 int g_localPort = 1080;
+WNDPROC g_oldListBoxProc = NULL;
 
 static const unsigned char base64_table[256] = {
     0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
@@ -914,11 +914,22 @@ void OpenSettingsWindow() {
     ShowWindow(h, SW_SHOW);
 }
 
+LRESULT CALLBACK ListBox_Proc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_KEYDOWN) {
+        if (wParam == 'A' && (GetKeyState(VK_CONTROL) & 0x8000)) {
+            SendMessage(hWnd, LB_SETSEL, TRUE, -1);
+            return 0; 
+        }
+    }
+    return CallWindowProc(g_oldListBoxProc, hWnd, msg, wParam, lParam);
+}
+
 LRESULT CALLBACK NodeMgrWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     static HWND hList;
     switch(msg) {
         case WM_CREATE:
-            hList = CreateWindowW(L"LISTBOX", NULL, WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | LBS_NOTIFY, 10, 10, 360, 170, hWnd, (HMENU)ID_NODEMGR_LIST, NULL, NULL);
+            hList = CreateWindowW(L"LISTBOX", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|WS_VSCROLL|LBS_NOTIFY|LBS_EXTENDEDSEL, 10, 10, 360, 170, hWnd, (HMENU)ID_NODEMGR_LIST, NULL, NULL);
+            g_oldListBoxProc = (WNDPROC)SetWindowLongPtr(hList, GWLP_WNDPROC, (LONG_PTR)ListBox_Proc);
             CreateWindowW(L"BUTTON", L"删除选中节点", WS_CHILD | WS_VISIBLE, 10, 185, 120, 30, hWnd, (HMENU)ID_NODEMGR_DEL, NULL, NULL);
             SendMessage(hWnd, WM_REFRESH_NODELIST, 0, 0); 
             break;
@@ -929,16 +940,27 @@ LRESULT CALLBACK NodeMgrWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             break;
         case WM_COMMAND:
             if (LOWORD(wParam) == ID_NODEMGR_DEL) {
-                int idx = SendMessage(hList, LB_GETCURSEL, 0, 0);
-                if (idx != LB_ERR) {
-                    wchar_t buf[256]; SendMessageW(hList, LB_GETTEXT, idx, (LPARAM)buf);
-                    DeleteNode(buf); SendMessage(hWnd, WM_REFRESH_NODELIST, 0, 0);
-                    MessageBoxW(hWnd, L"节点已删除", L"提示", MB_OK);
-                } else MessageBoxW(hWnd, L"请先在列表中选择一个节点", L"提示", MB_OK);
+                int selCount = SendMessage(hList, LB_GETSELCOUNT, 0, 0);
+                if (selCount <= 0) { MessageBoxW(hWnd, L"请先选择至少一个节点", L"提示", MB_OK); break; }
+                wchar_t confirmMsg[64]; wsprintfW(confirmMsg, L"确定要删除选中的 %d 个节点吗？", selCount);
+                if (MessageBoxW(hWnd, confirmMsg, L"确认删除", MB_YESNO | MB_ICONQUESTION) != IDYES) break;
+                int* selIndices = (int*)malloc(selCount * sizeof(int));
+                if (!selIndices) break;
+                SendMessage(hList, LB_GETSELITEMS, (WPARAM)selCount, (LPARAM)selIndices);
+                wchar_t** tagsToDelete = (wchar_t**)malloc(selCount * sizeof(wchar_t*));
+                for (int i = 0; i < selCount; i++) {
+                    int len = SendMessage(hList, LB_GETTEXTLEN, selIndices[i], 0);
+                    tagsToDelete[i] = (wchar_t*)malloc((len + 1) * sizeof(wchar_t));
+                    SendMessageW(hList, LB_GETTEXT, selIndices[i], (LPARAM)tagsToDelete[i]);
+                }
+                for (int i = 0; i < selCount; i++) { DeleteNode(tagsToDelete[i]); free(tagsToDelete[i]); }
+                free(tagsToDelete); free(selIndices);
+                SendMessage(hWnd, WM_REFRESH_NODELIST, 0, 0); MessageBoxW(hWnd, L"删除完成", L"提示", MB_OK);
             }
             break;
         case WM_SHOWWINDOW: if ((BOOL)wParam == TRUE) SendMessage(hWnd, WM_REFRESH_NODELIST, 0, 0); break;
         case WM_CLOSE: ShowWindow(hWnd, SW_HIDE); return 0;
+        case WM_DESTROY: if (hList && g_oldListBoxProc) SetWindowLongPtr(hList, GWLP_WNDPROC, (LONG_PTR)g_oldListBoxProc); break;
     }
     return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
@@ -951,7 +973,7 @@ void OpenNodeManager() {
         wc.lpfnWndProc = NodeMgrWndProc; wc.hInstance = GetModuleHandle(NULL); wc.lpszClassName = L"NodeMgr"; wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE+1);
         wc.hCursor = LoadCursor(NULL, IDC_ARROW); RegisterClassW(&wc);
     }
-    hMgr = CreateWindowW(L"NodeMgr", L"节点管理", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT, 0, 400, 270, NULL, NULL, GetModuleHandle(NULL), NULL);
+    hMgr = CreateWindowW(L"NodeMgr", L"节点管理 (支持 Ctrl+A 全选/多选)", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT, 0, 400, 270, NULL, NULL, GetModuleHandle(NULL), NULL);
     ShowWindow(hMgr, SW_SHOW);
 }
 
@@ -1000,7 +1022,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hNodeSubMenu, L"切换节点");
         AppendMenuW(hMenu, MF_STRING, ID_TRAY_MANAGE_NODES, L"节点管理");
-        AppendMenuW(hMenu, MF_STRING, ID_TRAY_IMPORT_CLIPBOARD, L"剪贴板导入");
+        AppendMenuW(hMenu, MF_STRING, ID_TRAY_IMPORT_CLIPBOARD, L"剪贴板导入 ");
         AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
         AppendMenuW(hMenu, MF_STRING, ID_TRAY_SETTINGS, L"程序设置");
         AppendMenuW(hMenu, MF_STRING, ID_TRAY_SHOW_CONSOLE, L"查看日志");
@@ -1022,7 +1044,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             int count = ImportFromClipboard(); 
             if (count > 0) {
                 ParseTags();
-                HWND hMgr = FindWindowW(L"NodeMgr", L"节点管理");
+                HWND hMgr = FindWindowW(L"NodeMgr", L"节点管理 (支持 Ctrl+A 全选/多选)");
                 if (hMgr && IsWindow(hMgr)) SendMessage(hMgr, WM_REFRESH_NODELIST, 0, 0);
                 wchar_t msgBuf[128]; wsprintfW(msgBuf, L"成功导入 %d 个节点！", count);
                 MessageBoxW(hWnd, msgBuf, L"导入成功", MB_OK|MB_ICONINFORMATION);
