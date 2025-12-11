@@ -1,13 +1,7 @@
 // =================================================================================
-//  Windows 7 终极修复版代理客户端 (main.c) - Fixed Linker Error
-//  修复内容:
-//  1. [编译修复] 补全了遗漏的 ImportFromClipboard 函数实现
-//  2. [协议修复] 严格消费 SOCKS5 握手响应 (解决 ERR_SSL_PROTOCOL_ERROR)
-//  3. [Win7兼容] 增加 send_all 防丢包
-//  4. [SSL增强] 重写 tls_write/read 处理 WANT_WRITE
+//  Windows 7 终极修复版代理客户端 (main.c) - Final Integrated Version
 // =================================================================================
 
-// 强制定义 Unicode
 #ifndef UNICODE
 #define UNICODE
 #endif
@@ -31,36 +25,19 @@
 #include <wchar.h>
 #include <time.h>
 #include <ctype.h>
-
-// --- OpenSSL ---
 #include <openssl/ssl.h>
 #include <openssl/err.h>
-
-// --- cJSON ---
-// 确保 cJSON.c 在同目录
 #include "cJSON.c" 
 
-// =================================================================================
-//  1. 结构体与全局变量
-// =================================================================================
-
-typedef struct { 
-    SOCKET sock; 
-    SSL *ssl; 
-} TLSContext;
-
+typedef struct { SOCKET sock; SSL *ssl; } TLSContext;
 typedef struct {
-    char host[256];
-    int port;
-    char path[256];
-    char sni[256];
-    char user[128];
-    char pass[128];
+    char host[256]; int port; char path[256];
+    char sni[256]; char user[128]; char pass[128];
 } ProxyConfig;
 
-// GUI ID
 #define WM_TRAY (WM_USER + 1)
 #define WM_LOG_UPDATE (WM_USER + 2)
+#define WM_REFRESH_NODELIST (WM_USER + 50)
 #define ID_TRAY_EXIT 1001
 #define ID_TRAY_AUTORUN 1002
 #define ID_TRAY_SYSTEM_PROXY 1003
@@ -76,17 +53,14 @@ typedef struct {
 #define ID_NODEMGR_DEL 3002
 #define ID_HOTKEY_CTRL 7001 
 #define ID_PORT_EDIT 7002
-
 #define BUFFER_SIZE 131072 
 #define CONFIG_FILE L"config.json"
 
-// 全局变量
 ProxyConfig g_proxyConfig;
 volatile BOOL g_proxyRunning = FALSE;
 SOCKET g_listen_sock = INVALID_SOCKET;
 SSL_CTX *g_ssl_ctx = NULL;
 HANDLE hProxyThread = NULL;
-
 NOTIFYICONDATAW nid;
 HWND hwnd;
 HMENU hMenu, hNodeSubMenu;
@@ -96,7 +70,6 @@ wchar_t** nodeTags = NULL;
 int nodeCount = 0;
 wchar_t currentNode[64] = L"";
 BOOL g_isIconVisible = TRUE;
-
 wchar_t g_iniFilePath[MAX_PATH] = {0};
 UINT g_hotkeyModifiers = MOD_CONTROL | MOD_ALT; 
 UINT g_hotkeyVk = 'H';                          
@@ -109,72 +82,46 @@ static const unsigned char base64_table[256] = {
     0,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51
 };
 
-// =================================================================================
-//  2. 函数前置声明
-// =================================================================================
-
 void log_msg(const char *format, ...);
 void log_wsa_error(const char* context);
-
 char* GetClipboardText(); 
 void TrimString(char* str);
 void UrlDecode(char* dst, const char* src);
 unsigned char* Base64Decode(const char* src, size_t* out_len);
 char* GetQueryParam(const char* query, const char* key);
-
 void LoadSettings();
 void SaveSettings();
 BOOL ReadFileToBuffer(const wchar_t* filename, char** buffer, long* fileSize);
 BOOL WriteBufferToFile(const wchar_t* filename, const char* buffer);
-
-// 核心业务逻辑
 void ParseTags();
 void SwitchNode(const wchar_t* tag);
 void DeleteNode(const wchar_t* tag);
+char* GetUniqueTagName(cJSON* outbounds, const char* type, const char* base_name);
 BOOL AddNodeToConfig(cJSON* newNode);
 void ParseNodeConfigToGlobal(cJSON *node);
-BOOL ImportFromClipboard();
-
-// 代理控制
+int ImportFromClipboard();
 void StartProxyCore();
 void StopProxyCore();
-
-// UI
 void OpenLogViewer(BOOL bShow); 
 void OpenNodeManager();
 void OpenSettingsWindow();
 void ToggleTrayIcon();
 void SetAutorun(BOOL enable);
 BOOL IsAutorun();
-
-// 解析器
 cJSON* ParseSocks(const char* link);
 cJSON* ParseVmess(const char* link);
 cJSON* ParseVlessOrTrojan(const char* link);
 cJSON* ParseShadowsocks(const char* link);
-
-// 网络
-DWORD WINAPI server_thread(LPVOID p);
-DWORD WINAPI client_handler(LPVOID p);
-void init_openssl_global();
-int tls_init_connect(TLSContext *ctx);
-int tls_write(TLSContext *ctx, const char *data, int len);
-int tls_read(TLSContext *ctx, char *out, int max);
-void tls_close(TLSContext *ctx);
-int send_all(SOCKET s, const char *buf, int len); 
-int tls_read_exact(TLSContext *ctx, char *buf, int len);
-int ws_read_payload_exact(TLSContext *tls, char *out_buf, int expected_payload_len);
-
-// =================================================================================
-//  3. 基础工具与日志
-// =================================================================================
+LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+LRESULT CALLBACK NodeMgrWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+LRESULT CALLBACK LogWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 void log_msg(const char *format, ...) {
     char buf[2048]; char time_buf[64]; SYSTEMTIME st; GetLocalTime(&st);
     sprintf(time_buf, "[%02d:%02d:%02d] ", st.wHour, st.wMinute, st.wSecond);
     va_list args; va_start(args, format); vsnprintf(buf, sizeof(buf)-64, format, args); va_end(args);
     char final_msg[2200]; snprintf(final_msg, sizeof(final_msg), "%s%s\r\n", time_buf, buf);
-    
     OutputDebugStringA(final_msg);
     if (hLogViewerWnd && IsWindow(hLogViewerWnd)) {
         int wLen = MultiByteToWideChar(CP_UTF8, 0, final_msg, -1, NULL, 0);
@@ -285,10 +232,6 @@ char* GetQueryParam(const char* query, const char* key) {
     return decoded;
 }
 
-// =================================================================================
-//  4. 配置与节点管理
-// =================================================================================
-
 void LoadSettings() {
     g_hotkeyModifiers = GetPrivateProfileIntW(L"Settings", L"Modifiers", MOD_CONTROL | MOD_ALT, g_iniFilePath);
     g_hotkeyVk = GetPrivateProfileIntW(L"Settings", L"VK", 'H', g_iniFilePath);
@@ -328,12 +271,10 @@ BOOL IsAutorun() {
 void ParseTags() {
     if (nodeTags) { for(int i=0; i<nodeCount; i++) free(nodeTags[i]); free(nodeTags); }
     nodeCount = 0; nodeTags = NULL;
-
     char* buffer = NULL; long size = 0;
     if (!ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) return;
     cJSON* root = cJSON_Parse(buffer); free(buffer);
     if (!root) return;
-
     cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
     cJSON* node;
     cJSON_ArrayForEach(node, outbounds) {
@@ -353,36 +294,30 @@ void ParseNodeConfigToGlobal(cJSON *node) {
     if (!node) return;
     memset(&g_proxyConfig, 0, sizeof(g_proxyConfig));
     strcpy(g_proxyConfig.path, "/"); 
-
     cJSON *server = cJSON_GetObjectItem(node, "server");
     cJSON *port = cJSON_GetObjectItem(node, "server_port");
     cJSON *uuid = cJSON_GetObjectItem(node, "uuid");
     if (!uuid) uuid = cJSON_GetObjectItem(node, "password"); 
-    
     if (server && server->valuestring) strcpy(g_proxyConfig.host, server->valuestring);
     if (port) g_proxyConfig.port = port->valueint;
     if (uuid && uuid->valuestring) {
         strcpy(g_proxyConfig.user, uuid->valuestring); 
         strcpy(g_proxyConfig.pass, uuid->valuestring); 
     }
-    
     cJSON *user = cJSON_GetObjectItem(node, "username");
     cJSON *pass = cJSON_GetObjectItem(node, "password");
     if(user && user->valuestring) strcpy(g_proxyConfig.user, user->valuestring);
     if(pass && pass->valuestring) strcpy(g_proxyConfig.pass, pass->valuestring);
-
     cJSON *tls = cJSON_GetObjectItem(node, "tls");
     if (tls) {
         cJSON *sni = cJSON_GetObjectItem(tls, "server_name");
         if (sni && sni->valuestring) strcpy(g_proxyConfig.sni, sni->valuestring);
     }
-    
     cJSON *trans = cJSON_GetObjectItem(node, "transport");
     if(trans) {
         cJSON *path = cJSON_GetObjectItem(trans, "path");
         if(path && path->valuestring) strcpy(g_proxyConfig.path, path->valuestring);
     }
-    
     if (strlen(g_proxyConfig.sni) == 0) strcpy(g_proxyConfig.sni, g_proxyConfig.host);
     log_msg("Node Config Loaded: %s:%d (SNI: %s)", g_proxyConfig.host, g_proxyConfig.port, g_proxyConfig.sni);
 }
@@ -393,12 +328,10 @@ void SwitchNode(const wchar_t* tag) {
     if (!ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) return;
     cJSON* root = cJSON_Parse(buffer); free(buffer);
     if (!root) return;
-
     cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
     cJSON* targetNode = NULL;
     char tagUtf8[256];
     WideCharToMultiByte(CP_UTF8, 0, tag, -1, tagUtf8, 256, NULL, NULL);
-
     cJSON* node;
     cJSON_ArrayForEach(node, outbounds) {
         cJSON* t = cJSON_GetObjectItem(node, "tag");
@@ -406,12 +339,10 @@ void SwitchNode(const wchar_t* tag) {
             targetNode = node; break;
         }
     }
-
     if (targetNode) {
         StopProxyCore();
         ParseNodeConfigToGlobal(targetNode);
         StartProxyCore();
-        
         wchar_t tip[128]; wsprintfW(tip, L"已切换: %s", tag);
         wcsncpy(nid.szInfo, tip, 127);
         wcsncpy(nid.szInfoTitle, L"SOCKS5 Proxy", 63);
@@ -426,11 +357,9 @@ void DeleteNode(const wchar_t* tag) {
     if (!ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) return;
     cJSON* root = cJSON_Parse(buffer); free(buffer);
     if (!root) return;
-
     cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
     char tagUtf8[256];
     WideCharToMultiByte(CP_UTF8, 0, tag, -1, tagUtf8, 256, NULL, NULL);
-
     int idx = 0;
     cJSON* node;
     cJSON_ArrayForEach(node, outbounds) {
@@ -441,36 +370,56 @@ void DeleteNode(const wchar_t* tag) {
         }
         idx++;
     }
-    
     char* out = cJSON_Print(root);
     WriteBufferToFile(CONFIG_FILE, out);
     free(out); cJSON_Delete(root);
     ParseTags(); 
 }
 
+char* GetUniqueTagName(cJSON* outbounds, const char* type, const char* base_name) {
+    static char final_tag[512];
+    char candidate[450];
+    const char* safe_name = (base_name && strlen(base_name) > 0) ? base_name : "Unnamed";
+    char prefix[64]; snprintf(prefix, sizeof(prefix), "%s-", type);
+    if (_strnicmp(safe_name, prefix, strlen(prefix)) == 0) snprintf(candidate, sizeof(candidate), "%s", safe_name);
+    else snprintf(candidate, sizeof(candidate), "%s-%s", type, safe_name);
+    int index = 0;
+    while (1) {
+        if (index == 0) snprintf(final_tag, sizeof(final_tag), "%s", candidate);
+        else snprintf(final_tag, sizeof(final_tag), "%s (%d)", candidate, index);
+        BOOL exists = FALSE;
+        cJSON* item = NULL;
+        cJSON_ArrayForEach(item, outbounds) {
+            cJSON* t = cJSON_GetObjectItem(item, "tag");
+            if (t && t->valuestring && strcmp(t->valuestring, final_tag) == 0) { exists = TRUE; break; }
+        }
+        if (!exists) break;
+        index++;
+    }
+    return final_tag;
+}
+
 BOOL AddNodeToConfig(cJSON* newNode) {
-    char* buffer = NULL; long size = 0;
-    cJSON* root = NULL;
+    if (!newNode) return FALSE;
+    char* buffer = NULL; long size = 0; cJSON* root = NULL;
     if (ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) { root = cJSON_Parse(buffer); free(buffer); }
     if (!root) { root = cJSON_CreateObject(); cJSON_AddItemToObject(root, "outbounds", cJSON_CreateArray()); }
     cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
     if (!outbounds) { outbounds = cJSON_CreateArray(); cJSON_AddItemToObject(root, "outbounds", outbounds); }
-    cJSON *item = NULL; cJSON *newTag = cJSON_GetObjectItem(newNode, "tag");
-    BOOL dup = FALSE;
-    if(newTag) {
-        cJSON_ArrayForEach(item, outbounds) {
-            cJSON *t = cJSON_GetObjectItem(item, "tag");
-            if(t && strcmp(t->valuestring, newTag->valuestring) == 0) { dup=TRUE; break; }
-        }
-    }
-    if(!dup) cJSON_AddItemToArray(outbounds, newNode);
-    else cJSON_Delete(newNode);
+    cJSON* jsonType = cJSON_GetObjectItem(newNode, "type");
+    const char* typeStr = (jsonType && jsonType->valuestring) ? jsonType->valuestring : "proxy";
+    cJSON* jsonTag = cJSON_GetObjectItem(newNode, "tag");
+    const char* originalTag = (jsonTag && jsonTag->valuestring) ? jsonTag->valuestring : "NewNode";
+    char* uniqueTag = GetUniqueTagName(outbounds, typeStr, originalTag);
+    if (cJSON_HasObjectItem(newNode, "tag")) cJSON_ReplaceItemInObject(newNode, "tag", cJSON_CreateString(uniqueTag));
+    else cJSON_AddStringToObject(newNode, "tag", uniqueTag);
+    cJSON_AddItemToArray(outbounds, newNode);
     char* out = cJSON_Print(root);
     BOOL ret = WriteBufferToFile(CONFIG_FILE, out);
-    free(out); cJSON_Delete(root); return ret;
+    free(out); cJSON_Delete(root);
+    return ret;
 }
 
-// 协议解析器
 cJSON* ParseSocks(const char* link) {
     if (strncmp(link, "socks://", 8) != 0) return NULL;
     const char* p = link + 8; const char* at = strchr(p, '@'); if (!at) return NULL; 
@@ -478,19 +427,16 @@ cJSON* ParseSocks(const char* link) {
     size_t decLen; unsigned char* decoded = Base64Decode(authBase64, &decLen); free(authBase64);
     if (!decoded) return NULL;
     char* user = (char*)decoded; char* pass = strchr(user, ':'); if (pass) { *pass = 0; pass++; } else pass = "";
-
     p = at + 1; const char* colon = strchr(p, ':'); const char* qMark = strchr(p, '?'); const char* hash = strchr(p, '#');
     const char* portStart = colon ? colon + 1 : NULL; const char* hostEnd = colon ? colon : (qMark ? qMark : (hash ? hash : p + strlen(p)));
     int hostLen = (int)(hostEnd - p); char* host = (char*)malloc(hostLen + 1); strncpy(host, p, hostLen); host[hostLen] = 0;
     int portNum = portStart ? atoi(portStart) : 443;
     char* tag = hash ? (char*)malloc(strlen(hash+1)+1) : strdup("Socks-Import");
     if(hash) UrlDecode(tag, hash+1);
-
     const char* query = qMark ? qMark + 1 : NULL;
     char* sni = GetQueryParam(query, "sni");
     char* path = GetQueryParam(query, "path"); 
     char* transport = GetQueryParam(query, "transport");
-
     cJSON* outbound = cJSON_CreateObject();
     cJSON_AddStringToObject(outbound, "type", "socks_tls");
     cJSON_AddStringToObject(outbound, "tag", tag);
@@ -498,7 +444,6 @@ cJSON* ParseSocks(const char* link) {
     cJSON_AddNumberToObject(outbound, "server_port", portNum);
     cJSON_AddStringToObject(outbound, "username", user);
     cJSON_AddStringToObject(outbound, "password", pass);
-
     if (sni) {
         cJSON* tls = cJSON_CreateObject(); cJSON_AddStringToObject(tls, "server_name", sni);
         cJSON_AddItemToObject(outbound, "tls", tls); free(sni);
@@ -527,12 +472,10 @@ cJSON* ParseVmess(const char* link) {
     cJSON* net = cJSON_GetObjectItem(vmessJson, "net"); cJSON* host = cJSON_GetObjectItem(vmessJson, "host");
     cJSON* path = cJSON_GetObjectItem(vmessJson, "path"); cJSON* tls = cJSON_GetObjectItem(vmessJson, "tls");
     cJSON* sni = cJSON_GetObjectItem(vmessJson, "sni");
-
     cJSON_AddStringToObject(outbound, "tag", cJSON_IsString(ps) ? ps->valuestring : "VMess");
     cJSON_AddStringToObject(outbound, "server", cJSON_IsString(add) ? add->valuestring : "");
     cJSON_AddNumberToObject(outbound, "server_port", cJSON_IsNumber(port)?port->valueint:atoi(port->valuestring));
     cJSON_AddStringToObject(outbound, "uuid", cJSON_IsString(id) ? id->valuestring : "");
-
     if (cJSON_IsString(net) && strcmp(net->valuestring, "ws") == 0) {
         cJSON* t = cJSON_CreateObject(); cJSON_AddStringToObject(t, "type", "ws");
         if(cJSON_IsString(path)) cJSON_AddStringToObject(t, "path", path->valuestring);
@@ -564,7 +507,6 @@ cJSON* ParseVlessOrTrojan(const char* link) {
     int portNum = portStart ? atoi(portStart) : 443;
     char* tag = hash ? (char*)malloc(strlen(hash+1)+1) : strdup(protocol);
     if(hash) UrlDecode(tag, hash+1);
-
     cJSON* outbound = cJSON_CreateObject();
     cJSON_AddStringToObject(outbound, "type", protocol);
     cJSON_AddStringToObject(outbound, "tag", tag);
@@ -572,7 +514,6 @@ cJSON* ParseVlessOrTrojan(const char* link) {
     cJSON_AddNumberToObject(outbound, "server_port", portNum);
     if (strcmp(protocol, "vless") == 0) cJSON_AddStringToObject(outbound, "uuid", uuid);
     else cJSON_AddStringToObject(outbound, "password", uuid);
-
     const char* query = qMark ? qMark + 1 : NULL;
     char* type = GetQueryParam(query, "type");
     if (type && strcmp(type, "ws") == 0) {
@@ -636,28 +577,35 @@ cJSON* ParseShadowsocks(const char* link) {
     free(tag); return outbound;
 }
 
-// [修复] 补全 ImportFromClipboard
-BOOL ImportFromClipboard() {
-    char* text = GetClipboardText(); if (!text) return FALSE;
-    cJSON* node = NULL;
-    if (_strnicmp(text, "socks://", 8) == 0) node = ParseSocks(text);
-    else if (_strnicmp(text, "vmess://", 8) == 0) node = ParseVmess(text);
-    else if (_strnicmp(text, "vless://", 8) == 0) node = ParseVlessOrTrojan(text);
-    else if (_strnicmp(text, "trojan://", 9) == 0) node = ParseVlessOrTrojan(text);
-    else if (_strnicmp(text, "ss://", 5) == 0) node = ParseShadowsocks(text);
+int ImportFromClipboard() {
+    char* text = GetClipboardText(); 
+    if (!text) return 0;
+    int successCount = 0;
+    char* context = NULL;
+    char* token = strtok_s(text, " \r\n\t,", &context);
+    while (token != NULL) {
+        TrimString(token);
+        if (strlen(token) > 0) {
+            cJSON* node = NULL;
+            if (_strnicmp(token, "socks://", 8) == 0) node = ParseSocks(token);
+            else if (_strnicmp(token, "vmess://", 8) == 0) node = ParseVmess(token);
+            else if (_strnicmp(token, "vless://", 8) == 0) node = ParseVlessOrTrojan(token);
+            else if (_strnicmp(token, "trojan://", 9) == 0) node = ParseVlessOrTrojan(token);
+            else if (_strnicmp(token, "ss://", 5) == 0) node = ParseShadowsocks(token);
+            if (node) {
+                if (AddNodeToConfig(node)) successCount++;
+            }
+        }
+        token = strtok_s(NULL, " \r\n\t,", &context);
+    }
     free(text);
-    if (node) { return AddNodeToConfig(node); }
-    return FALSE;
+    return successCount;
 }
 
 void ToggleTrayIcon() {
     if (g_isIconVisible) { Shell_NotifyIconW(NIM_DELETE, &nid); g_isIconVisible = FALSE; }
     else { Shell_NotifyIconW(NIM_ADD, &nid); g_isIconVisible = TRUE; }
 }
-
-// =================================================================================
-//  5. 网络与 OpenSSL 核心 (修复所有 IO 问题)
-// =================================================================================
 
 void init_openssl_global() {
     if (g_ssl_ctx) return;
@@ -677,7 +625,6 @@ int tls_init_connect(TLSContext *ctx) {
     return (SSL_connect(ctx->ssl) == 1) ? 0 : -1;
 }
 
-// [增强] 自动处理 WANT_WRITE 重试
 int tls_write(TLSContext *ctx, const char *data, int len) {
     if (!ctx->ssl) return -1;
     int written = 0;
@@ -696,7 +643,6 @@ int tls_write(TLSContext *ctx, const char *data, int len) {
     return written;
 }
 
-// [增强] 区分 WANT_READ(0) 和 Error(-1)
 int tls_read(TLSContext *ctx, char *out, int max) {
     if (!ctx->ssl) return -1;
     int ret = SSL_read(ctx->ssl, out, max);
@@ -709,13 +655,12 @@ int tls_read(TLSContext *ctx, char *out, int max) {
     return ret;
 }
 
-// [新增] 严格读取指定长度的数据（用于握手消费）
 int tls_read_exact(TLSContext *ctx, char *buf, int len) {
     int total = 0;
     while (total < len) {
         int ret = tls_read(ctx, buf + total, len - total);
-        if (ret < 0) return 0; // 错误或断开
-        if (ret == 0) { Sleep(1); continue; } // 等待数据
+        if (ret < 0) return 0; 
+        if (ret == 0) { Sleep(1); continue; } 
         total += ret;
     }
     return 1;
@@ -742,19 +687,14 @@ int check_ws_frame(unsigned char *in, int len, int *head_len, int *payload_len) 
     return hl + pl; 
 }
 
-// [新增] 从 TLS 流中读取完整的 WebSocket 帧负载（用于握手响应处理）
 int ws_read_payload_exact(TLSContext *tls, char *out_buf, int expected_len) {
     char raw_head[16];
-    // 1. 读头 2 字节
     if (!tls_read_exact(tls, raw_head, 2)) return 0;
-    
     int payload_len = raw_head[1] & 0x7F;
     if (payload_len == 126) {
         if (!tls_read_exact(tls, raw_head + 2, 2)) return 0;
         payload_len = (unsigned char)raw_head[2] << 8 | (unsigned char)raw_head[3];
     }
-    
-    // 2. 读 Paylaod
     if (payload_len < expected_len) return 0;
     if (!tls_read_exact(tls, out_buf, payload_len)) return 0;
     return payload_len;
@@ -768,11 +708,8 @@ int recv_timeout(SOCKET s, char *buf, int len, int timeout_sec) {
     return recv(s, buf, len, 0);
 }
 
-// [Win7修复] 循环发送防止丢包
 int send_all(SOCKET s, const char *buf, int len) {
-    int total = 0;
-    int bytesleft = len;
-    int n;
+    int total = 0; int bytesleft = len; int n;
     while(total < len) {
         n = send(s, buf+total, bytesleft, 0);
         if (n == -1) {
@@ -780,39 +717,24 @@ int send_all(SOCKET s, const char *buf, int len) {
             if (err == WSAEWOULDBLOCK) { Sleep(1); continue; }
             return -1;
         }
-        total += n;
-        bytesleft -= n;
+        total += n; bytesleft -= n;
     }
     return total;
 }
 
 DWORD WINAPI client_handler(LPVOID p) {
-    SOCKET c = (SOCKET)(UINT_PTR)p; 
-    TLSContext tls; memset(&tls, 0, sizeof(tls));
+    SOCKET c = (SOCKET)(UINT_PTR)p; TLSContext tls; memset(&tls, 0, sizeof(tls));
     SOCKET r = INVALID_SOCKET;      
-    char *c_buf = (char*)malloc(BUFFER_SIZE); 
-    char *ws_read_buf = (char*)malloc(BUFFER_SIZE); 
-    char *ws_send_buf = (char*)malloc(BUFFER_SIZE);
-    
+    char *c_buf = (char*)malloc(BUFFER_SIZE); char *ws_read_buf = (char*)malloc(BUFFER_SIZE); char *ws_send_buf = (char*)malloc(BUFFER_SIZE);
     if (!c_buf || !ws_read_buf || !ws_send_buf) { goto cl_end; }
-
-    int ws_buf_len = 0; 
-    int flag = 1; 
-    
+    int ws_buf_len = 0; int flag = 1; 
     setsockopt(c, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
-
-    // 1. 读取浏览器请求
     int browser_len = recv_timeout(c, c_buf, BUFFER_SIZE, 10);
     if (browser_len <= 0) goto cl_end;
     c_buf[browser_len] = 0;
-
-    char method[16], host[256]; 
-    int port = 80;
-    int is_connect_method = 0;
-
-    if (c_buf[0] == 0x05) { 
-        send(c, "\x05\x00", 2, 0); goto cl_end; 
-    } else {
+    char method[16], host[256]; int port = 80; int is_connect_method = 0;
+    if (c_buf[0] == 0x05) { send(c, "\x05\x00", 2, 0); goto cl_end; } 
+    else {
         if (sscanf(c_buf, "%15s %255s", method, host) == 2) {
             char *p = strchr(host, ':');
             if (p) { *p = 0; port = atoi(p+1); }
@@ -820,60 +742,37 @@ DWORD WINAPI client_handler(LPVOID p) {
             if (stricmp(method, "CONNECT") == 0) is_connect_method = 1;
         } else { goto cl_end; }
     }
-    
     log_msg("[Access] %s %s:%d", method, host, port);
-
-    // 2. 连接远程服务器
     struct hostent *h = gethostbyname(g_proxyConfig.host);
     if(!h) { log_msg("[DNS] Fail"); goto cl_end; }
-    
     r = socket(AF_INET, SOCK_STREAM, 0);
     if (r == INVALID_SOCKET) goto cl_end;
     setsockopt(r, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
-
     struct sockaddr_in a; memset(&a, 0, sizeof(a)); a.sin_family = AF_INET; a.sin_port = htons((unsigned short)g_proxyConfig.port);
     a.sin_addr = *(struct in_addr*)h->h_addr;
-
     if (connect(r, (struct sockaddr*)&a, sizeof(a)) != 0) { log_wsa_error("TCP Connect"); goto cl_end; }
-
     tls.sock = r;
     if (tls_init_connect(&tls) != 0) goto cl_end;
-
-    // 3. WS 握手
     const char* sni_val = (strlen(g_proxyConfig.sni) > 0) ? g_proxyConfig.sni : g_proxyConfig.host;
-    snprintf(ws_send_buf, BUFFER_SIZE, 
-        "GET %s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-        "User-Agent: Mozilla/5.0\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", 
-        g_proxyConfig.path, sni_val);
+    snprintf(ws_send_buf, BUFFER_SIZE, "GET %s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nUser-Agent: Mozilla/5.0\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", g_proxyConfig.path, sni_val);
     tls_write(&tls, ws_send_buf, (int)strlen(ws_send_buf));
-
     int len = tls_read(&tls, ws_read_buf, BUFFER_SIZE-1);
-    if (len <= 0 || !strstr(ws_read_buf, "101 Switching Protocols")) {
-        log_msg("[WS Error] Handshake failed"); goto cl_end;
-    }
-
-    // 4. SOCKS5 握手 (关键：必须消费响应)
+    if (len <= 0 || !strstr(ws_read_buf, "101 Switching Protocols")) { log_msg("[WS Error] Handshake failed"); goto cl_end; }
     char auth[] = {0x05, 0x01, 0x00};
     if (strlen(g_proxyConfig.user) > 0) auth[2] = 0x02;
     int flen = build_ws_frame(auth, 3, ws_send_buf);
     tls_write(&tls, ws_send_buf, flen);
-
     char resp_buf[256];
     if (ws_read_payload_exact(&tls, resp_buf, 2) < 2) goto cl_end;
-
     if (resp_buf[1] == 0x02) {
         char up[512]; int idx = 0;
-        up[idx++] = 1; 
-        up[idx++] = (char)strlen(g_proxyConfig.user); 
-        memcpy(up+idx, g_proxyConfig.user, strlen(g_proxyConfig.user)); idx += (int)strlen(g_proxyConfig.user);
-        up[idx++] = (char)strlen(g_proxyConfig.pass); 
-        memcpy(up+idx, g_proxyConfig.pass, strlen(g_proxyConfig.pass)); idx += (int)strlen(g_proxyConfig.pass);
+        up[idx++] = 1; up[idx++] = (char)strlen(g_proxyConfig.user); memcpy(up+idx, g_proxyConfig.user, strlen(g_proxyConfig.user)); idx += (int)strlen(g_proxyConfig.user);
+        up[idx++] = (char)strlen(g_proxyConfig.pass); memcpy(up+idx, g_proxyConfig.pass, strlen(g_proxyConfig.pass)); idx += (int)strlen(g_proxyConfig.pass);
         flen = build_ws_frame(up, idx, ws_send_buf);
         tls_write(&tls, ws_send_buf, flen);
         if (ws_read_payload_exact(&tls, resp_buf, 2) < 2) goto cl_end; 
         if (resp_buf[1] != 0x00) goto cl_end;
     }
-
     unsigned char socks_req[512]; int slen = 0;
     socks_req[slen++] = 0x05; socks_req[slen++] = 0x01; socks_req[slen++] = 0x00; socks_req[slen++] = 0x03;
     socks_req[slen++] = (unsigned char)strlen(host);
@@ -881,11 +780,7 @@ DWORD WINAPI client_handler(LPVOID p) {
     socks_req[slen++] = (port >> 8) & 0xFF; socks_req[slen++] = port & 0xFF;
     flen = build_ws_frame((char*)socks_req, slen, ws_send_buf);
     tls_write(&tls, ws_send_buf, flen);
-
-    // [关键] 消费掉远程 Connect 响应
     if (ws_read_payload_exact(&tls, resp_buf, 4) < 4 || resp_buf[1] != 0x00) goto cl_end;
-
-    // 5. 握手完成，回复浏览器
     if (is_connect_method) {
         const char *ok = "HTTP/1.1 200 Connection Established\r\n\r\n";
         send(c, ok, strlen(ok), 0);
@@ -893,25 +788,16 @@ DWORD WINAPI client_handler(LPVOID p) {
         flen = build_ws_frame(c_buf, browser_len, ws_send_buf);
         tls_write(&tls, ws_send_buf, flen);
     }
-
-    // 6. 转发循环
-    fd_set fds; struct timeval tv;
-    u_long mode = 1;
-    ioctlsocket(c, FIONBIO, &mode);
-    ioctlsocket(r, FIONBIO, &mode);
-    ws_buf_len = 0;
-    int hl, pl, frame_total;
-
+    fd_set fds; struct timeval tv; u_long mode = 1;
+    ioctlsocket(c, FIONBIO, &mode); ioctlsocket(r, FIONBIO, &mode);
+    ws_buf_len = 0; int hl, pl, frame_total;
     while(1) {
         FD_ZERO(&fds); FD_SET(c, &fds); FD_SET(r, &fds);
         int pending = SSL_pending(tls.ssl);
-        
         tv.tv_sec = 1; tv.tv_usec = 0;
         if (pending > 0 || ws_buf_len > 0) { tv.tv_sec = 0; tv.tv_usec = 0; }
-
         int n = select(0, &fds, NULL, NULL, &tv);
         if (n < 0) break;
-
         if (FD_ISSET(c, &fds)) {
             len = recv(c, c_buf, BUFFER_SIZE, 0);
             if (len > 0) {
@@ -919,7 +805,6 @@ DWORD WINAPI client_handler(LPVOID p) {
                 if (tls_write(&tls, ws_send_buf, flen) < 0) break;
             } else if (WSAGetLastError() != WSAEWOULDBLOCK) break;
         }
-
         if (FD_ISSET(r, &fds) || pending > 0) {
             if (ws_buf_len < BUFFER_SIZE) {
                 len = tls_read(&tls, ws_read_buf + ws_buf_len, BUFFER_SIZE - ws_buf_len);
@@ -927,7 +812,6 @@ DWORD WINAPI client_handler(LPVOID p) {
                 else if (len == -1) break; 
             }
         }
-        
         while (ws_buf_len > 0) {
             frame_total = check_ws_frame((unsigned char*)ws_read_buf, ws_buf_len, &hl, &pl);
             if (frame_total > 0) {
@@ -944,12 +828,9 @@ DWORD WINAPI client_handler(LPVOID p) {
             }
         }
     }
-
 cl_end:
-    free(c_buf); free(ws_read_buf); free(ws_send_buf);
-    tls_close(&tls);
-    if (r != INVALID_SOCKET) closesocket(r);
-    if (c != INVALID_SOCKET) closesocket(c);
+    free(c_buf); free(ws_read_buf); free(ws_send_buf); tls_close(&tls);
+    if (r != INVALID_SOCKET) closesocket(r); if (c != INVALID_SOCKET) closesocket(c);
     return 0;
 }
 
@@ -959,23 +840,16 @@ DWORD WINAPI server_thread(LPVOID p) {
     struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET; addr.sin_port = htons(g_localPort);
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    
-    int opt = 1;
-    setsockopt(g_listen_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
-
+    int opt = 1; setsockopt(g_listen_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
     if (bind(g_listen_sock, (struct sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
-        log_msg("Port %d bind fail", g_localPort);
-        g_proxyRunning = FALSE;
-        return 0;
+        log_msg("Port %d bind fail", g_localPort); g_proxyRunning = FALSE; return 0;
     }
     listen(g_listen_sock, 100);
     log_msg("Proxy Started: 127.0.0.1:%d", g_localPort);
-    
     while(g_proxyRunning) {
         SOCKET c = accept(g_listen_sock, NULL, NULL);
-        if (c != INVALID_SOCKET) {
-            CloseHandle(CreateThread(NULL, 0, client_handler, (LPVOID)(UINT_PTR)c, 0, NULL));
-        } else break;
+        if (c != INVALID_SOCKET) CloseHandle(CreateThread(NULL, 0, client_handler, (LPVOID)(UINT_PTR)c, 0, NULL));
+        else break;
     }
     return 0;
 }
@@ -984,29 +858,15 @@ void StartProxyCore() {
     if (g_proxyRunning) return;
     g_proxyRunning = TRUE;
     hProxyThread = CreateThread(NULL, 0, server_thread, NULL, 0, NULL);
-    if (!hProxyThread) {
-        log_msg("CreateThread Failed");
-        g_proxyRunning = FALSE;
-    }
+    if (!hProxyThread) { log_msg("CreateThread Failed"); g_proxyRunning = FALSE; }
 }
 
 void StopProxyCore() {
     g_proxyRunning = FALSE;
-    if (g_listen_sock != INVALID_SOCKET) {
-        closesocket(g_listen_sock); 
-        g_listen_sock = INVALID_SOCKET;
-    }
-    if (hProxyThread) {
-        WaitForSingleObject(hProxyThread, 2000); 
-        CloseHandle(hProxyThread);
-        hProxyThread = NULL;
-    }
+    if (g_listen_sock != INVALID_SOCKET) { closesocket(g_listen_sock); g_listen_sock = INVALID_SOCKET; }
+    if (hProxyThread) { WaitForSingleObject(hProxyThread, 2000); CloseHandle(hProxyThread); hProxyThread = NULL; }
     log_msg("Proxy Stopped");
 }
-
-// =================================================================================
-//  6. GUI 界面与主函数
-// =================================================================================
 
 LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     static HWND hHotkey, hPortEdit;
@@ -1049,7 +909,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 
 void OpenSettingsWindow() {
     WNDCLASSW wc = {0}; wc.lpfnWndProc=SettingsWndProc; wc.hInstance=GetModuleHandle(NULL); wc.lpszClassName=L"Settings"; wc.hbrBackground=(HBRUSH)(COLOR_BTNFACE+1);
-    RegisterClassW(&wc);
+    WNDCLASSW temp; if (!GetClassInfoW(GetModuleHandle(NULL), L"Settings", &temp)) RegisterClassW(&wc);
     HWND h = CreateWindowW(L"Settings", L"程序设置", WS_VISIBLE|WS_CAPTION|WS_SYSMENU, CW_USEDEFAULT,0,300,220, hwnd,NULL,wc.hInstance,NULL);
     ShowWindow(h, SW_SHOW);
 }
@@ -1058,30 +918,40 @@ LRESULT CALLBACK NodeMgrWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
     static HWND hList;
     switch(msg) {
         case WM_CREATE:
-            hList = CreateWindowW(L"LISTBOX", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|WS_VSCROLL, 10, 10, 260, 200, hWnd, (HMENU)ID_NODEMGR_LIST, NULL, NULL);
-            CreateWindowW(L"BUTTON", L"删除选中", WS_CHILD|WS_VISIBLE, 280, 10, 80, 30, hWnd, (HMENU)ID_NODEMGR_DEL, NULL, NULL);
+            hList = CreateWindowW(L"LISTBOX", NULL, WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | LBS_NOTIFY, 10, 10, 360, 170, hWnd, (HMENU)ID_NODEMGR_LIST, NULL, NULL);
+            CreateWindowW(L"BUTTON", L"删除选中节点", WS_CHILD | WS_VISIBLE, 10, 185, 120, 30, hWnd, (HMENU)ID_NODEMGR_DEL, NULL, NULL);
+            SendMessage(hWnd, WM_REFRESH_NODELIST, 0, 0); 
+            break;
+        case WM_REFRESH_NODELIST:
+            SendMessage(hList, LB_RESETCONTENT, 0, 0);
             ParseTags();
-            for(int i=0; i<nodeCount; i++) SendMessageW(hList, LB_ADDSTRING, 0, (LPARAM)nodeTags[i]);
+            for(int i = 0; i < nodeCount; i++) SendMessageW(hList, LB_ADDSTRING, 0, (LPARAM)nodeTags[i]);
             break;
         case WM_COMMAND:
             if (LOWORD(wParam) == ID_NODEMGR_DEL) {
                 int idx = SendMessage(hList, LB_GETCURSEL, 0, 0);
                 if (idx != LB_ERR) {
                     wchar_t buf[256]; SendMessageW(hList, LB_GETTEXT, idx, (LPARAM)buf);
-                    DeleteNode(buf); SendMessage(hList, LB_DELETESTRING, idx, 0);
-                }
+                    DeleteNode(buf); SendMessage(hWnd, WM_REFRESH_NODELIST, 0, 0);
+                    MessageBoxW(hWnd, L"节点已删除", L"提示", MB_OK);
+                } else MessageBoxW(hWnd, L"请先在列表中选择一个节点", L"提示", MB_OK);
             }
             break;
+        case WM_SHOWWINDOW: if ((BOOL)wParam == TRUE) SendMessage(hWnd, WM_REFRESH_NODELIST, 0, 0); break;
         case WM_CLOSE: ShowWindow(hWnd, SW_HIDE); return 0;
     }
     return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
 
 void OpenNodeManager() {
-    static HWND hMgr = NULL; if (hMgr) { ShowWindow(hMgr, SW_SHOW); return; }
-    WNDCLASSW wc = {0}; wc.lpfnWndProc=NodeMgrWndProc; wc.hInstance=GetModuleHandle(NULL); wc.lpszClassName=L"NodeMgr"; wc.hbrBackground=(HBRUSH)(COLOR_BTNFACE+1);
-    RegisterClassW(&wc);
-    hMgr = CreateWindowW(L"NodeMgr", L"节点管理", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,0,400,260, NULL,NULL,wc.hInstance,NULL);
+    static HWND hMgr = NULL; 
+    if (hMgr && IsWindow(hMgr)) { ShowWindow(hMgr, SW_SHOW); SetForegroundWindow(hMgr); SendMessage(hMgr, WM_REFRESH_NODELIST, 0, 0); return; }
+    WNDCLASSW wc = {0};
+    if (!GetClassInfoW(GetModuleHandle(NULL), L"NodeMgr", &wc)) {
+        wc.lpfnWndProc = NodeMgrWndProc; wc.hInstance = GetModuleHandle(NULL); wc.lpszClassName = L"NodeMgr"; wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE+1);
+        wc.hCursor = LoadCursor(NULL, IDC_ARROW); RegisterClassW(&wc);
+    }
+    hMgr = CreateWindowW(L"NodeMgr", L"节点管理", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT, 0, 400, 270, NULL, NULL, GetModuleHandle(NULL), NULL);
     ShowWindow(hMgr, SW_SHOW);
 }
 
@@ -1094,11 +964,9 @@ LRESULT CALLBACK LogWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             break;
         case WM_SIZE: MoveWindow(hEdit, 0, 0, LOWORD(lParam), HIWORD(lParam), TRUE); break;
         case WM_LOG_UPDATE: {
-            wchar_t* p = (wchar_t*)lParam;
-            int len = GetWindowTextLength(hEdit);
+            wchar_t* p = (wchar_t*)lParam; int len = GetWindowTextLength(hEdit);
             if (len > 30000) { SendMessage(hEdit, EM_SETSEL, 0, -1); SendMessage(hEdit, WM_CLEAR, 0, 0); }
-            SendMessage(hEdit, EM_SETSEL, 0xffff, 0xffff); SendMessageW(hEdit, EM_REPLACESEL, 0, (LPARAM)p);
-            free(p); break;
+            SendMessage(hEdit, EM_SETSEL, 0xffff, 0xffff); SendMessageW(hEdit, EM_REPLACESEL, 0, (LPARAM)p); free(p); break;
         }
         case WM_CLOSE: ShowWindow(hWnd, SW_HIDE); return 0;
     }
@@ -1107,26 +975,15 @@ LRESULT CALLBACK LogWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
 void OpenLogViewer(BOOL bShow) {
     if (hLogViewerWnd && IsWindow(hLogViewerWnd)) {
-        if (bShow) {
-            ShowWindow(hLogViewerWnd, SW_SHOW);
-            if (IsIconic(hLogViewerWnd)) ShowWindow(hLogViewerWnd, SW_RESTORE);
-            SetForegroundWindow(hLogViewerWnd);
-        }
+        if (bShow) { ShowWindow(hLogViewerWnd, SW_SHOW); if (IsIconic(hLogViewerWnd)) ShowWindow(hLogViewerWnd, SW_RESTORE); SetForegroundWindow(hLogViewerWnd); }
         return;
     }
-
     WNDCLASSW wc = {0}; 
     if (!GetClassInfoW(GetModuleHandle(NULL), L"LogWnd", &wc)) {
-        wc.lpfnWndProc = LogWndProc; 
-        wc.hInstance = GetModuleHandle(NULL); 
-        wc.lpszClassName = L"LogWnd";
-        RegisterClassW(&wc);
+        wc.lpfnWndProc = LogWndProc; wc.hInstance = GetModuleHandle(NULL); wc.lpszClassName = L"LogWnd"; RegisterClassW(&wc);
     }
-    
     hLogViewerWnd = CreateWindowW(L"LogWnd", L"运行日志", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,0,600,400, NULL,NULL,GetModuleHandle(NULL),NULL);
-    
-    if (bShow) ShowWindow(hLogViewerWnd, SW_SHOW);
-    else ShowWindow(hLogViewerWnd, SW_HIDE);
+    if (bShow) ShowWindow(hLogViewerWnd, SW_SHOW); else ShowWindow(hLogViewerWnd, SW_HIDE);
 }
 
 LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -1134,19 +991,23 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         POINT pt; GetCursorPos(&pt); SetForegroundWindow(hWnd);
         ParseTags();
         if (hMenu) DestroyMenu(hMenu); hMenu = CreatePopupMenu(); hNodeSubMenu = CreatePopupMenu();
-        for(int i=0; i<nodeCount; i++) {
-            UINT f = MF_STRING; if(wcscmp(nodeTags[i], currentNode)==0) f|=MF_CHECKED;
-            AppendMenuW(hNodeSubMenu, f, ID_TRAY_NODE_BASE+i, nodeTags[i]);
+        if (nodeCount == 0) AppendMenuW(hNodeSubMenu, MF_STRING|MF_GRAYED, 0, L"(无节点)");
+        else {
+            for(int i=0; i<nodeCount; i++) {
+                UINT f = MF_STRING; if(wcscmp(nodeTags[i], currentNode)==0) f|=MF_CHECKED;
+                AppendMenuW(hNodeSubMenu, f, ID_TRAY_NODE_BASE+i, nodeTags[i]);
+            }
         }
         AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hNodeSubMenu, L"切换节点");
         AppendMenuW(hMenu, MF_STRING, ID_TRAY_MANAGE_NODES, L"节点管理");
         AppendMenuW(hMenu, MF_STRING, ID_TRAY_IMPORT_CLIPBOARD, L"剪贴板导入");
-        AppendMenuW(hMenu, MF_STRING, ID_TRAY_SETTINGS, L"程序设置");
-        AppendMenuW(hMenu, MF_STRING, ID_TRAY_HIDE_ICON, L"隐藏图标");
-        AppendMenuW(hMenu, IsAutorun()?MF_CHECKED:MF_UNCHECKED, ID_TRAY_AUTORUN, L"开机自启");
-        AppendMenuW(hMenu, MF_STRING, ID_TRAY_SHOW_CONSOLE, L"查看日志");
         AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
-        AppendMenuW(hMenu, MF_STRING, ID_TRAY_EXIT, L"退出");
+        AppendMenuW(hMenu, MF_STRING, ID_TRAY_SETTINGS, L"程序设置");
+        AppendMenuW(hMenu, MF_STRING, ID_TRAY_SHOW_CONSOLE, L"查看日志");
+        AppendMenuW(hMenu, IsAutorun()?MF_CHECKED:MF_UNCHECKED, ID_TRAY_AUTORUN, L"开机自启");
+        AppendMenuW(hMenu, MF_STRING, ID_TRAY_HIDE_ICON, L"隐藏图标");
+        AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+        AppendMenuW(hMenu, MF_STRING, ID_TRAY_EXIT, L"退出程序");
         TrackPopupMenu(hMenu, TPM_RIGHTALIGN|TPM_BOTTOMALIGN, pt.x, pt.y, 0, hWnd, NULL);
     }
     else if (msg == WM_COMMAND) {
@@ -1158,11 +1019,20 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         else if (id == ID_TRAY_HIDE_ICON) ToggleTrayIcon();
         else if (id == ID_TRAY_AUTORUN) SetAutorun(!IsAutorun());
         else if (id == ID_TRAY_IMPORT_CLIPBOARD) {
-            if (ImportFromClipboard()) {
-                ParseTags(); MessageBoxW(hWnd, L"节点导入成功！", L"成功", MB_OK);
-            } else MessageBoxW(hWnd, L"未识别到有效链接 (socks://, vmess://, ...)", L"导入失败", MB_OK|MB_ICONWARNING);
+            int count = ImportFromClipboard(); 
+            if (count > 0) {
+                ParseTags();
+                HWND hMgr = FindWindowW(L"NodeMgr", L"节点管理");
+                if (hMgr && IsWindow(hMgr)) SendMessage(hMgr, WM_REFRESH_NODELIST, 0, 0);
+                wchar_t msgBuf[128]; wsprintfW(msgBuf, L"成功导入 %d 个节点！", count);
+                MessageBoxW(hWnd, msgBuf, L"导入成功", MB_OK|MB_ICONINFORMATION);
+                if (wcslen(currentNode) == 0 && nodeCount > 0) SwitchNode(nodeTags[0]);
+            } else MessageBoxW(hWnd, L"剪贴板中未发现支持的链接 (vmess/vless/ss/trojan)", L"导入失败", MB_OK|MB_ICONWARNING);
         }
-        else if (id >= ID_TRAY_NODE_BASE) SwitchNode(nodeTags[id-ID_TRAY_NODE_BASE]);
+        else if (id >= ID_TRAY_NODE_BASE && id < ID_TRAY_NODE_BASE + 1000) {
+            int idx = id - ID_TRAY_NODE_BASE;
+            if (idx >= 0 && idx < nodeCount) SwitchNode(nodeTags[idx]);
+        }
     }
     else if (msg == WM_HOTKEY && wParam == ID_GLOBAL_HOTKEY) ToggleTrayIcon();
     return DefWindowProcW(hWnd, msg, wParam, lParam);
@@ -1171,33 +1041,22 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nShow) {
     WSADATA wsa; WSAStartup(MAKEWORD(2,2), &wsa);
     INITCOMMONCONTROLSEX ic = {sizeof(INITCOMMONCONTROLSEX), ICC_HOTKEY_CLASS}; InitCommonControlsEx(&ic);
-    
-    // 初始化日志和字体
     hLogFont = CreateFontW(14,0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,0,0,0,0,L"Consolas");
     OpenLogViewer(FALSE); 
-
     GetModuleFileNameW(NULL, g_iniFilePath, MAX_PATH);
     wchar_t* p = wcsrchr(g_iniFilePath, L'\\'); if (p) { *p = 0; wcscat(g_iniFilePath, L"\\set.ini"); } 
     else wcscpy(g_iniFilePath, L"set.ini");
     LoadSettings();
-
-    // 注册主窗口
     WNDCLASSW wc = {0}; wc.lpfnWndProc = WndProc; wc.hInstance = hInst; wc.lpszClassName = L"TrayProxyClass";
     wc.hIcon = LoadIcon(hInst, MAKEINTRESOURCE(1)); if (!wc.hIcon) wc.hIcon = LoadIcon(NULL, IDI_APPLICATION);
     RegisterClassW(&wc);
     hwnd = CreateWindowW(L"TrayProxyClass", L"App", 0, 0,0,0,0, NULL,NULL,hInst,NULL);
-    
     RegisterHotKey(hwnd, ID_GLOBAL_HOTKEY, g_hotkeyModifiers, g_hotkeyVk);
-    nid.cbSize = sizeof(nid); nid.hWnd = hwnd; nid.uID = 1;
-    nid.uFlags = NIF_ICON|NIF_MESSAGE|NIF_TIP;
-    nid.uCallbackMessage = WM_TRAY;
-    nid.hIcon = wc.hIcon;
-    wcscpy(nid.szTip, L"Proxy Client");
+    nid.cbSize = sizeof(nid); nid.hWnd = hwnd; nid.uID = 1; nid.uFlags = NIF_ICON|NIF_MESSAGE|NIF_TIP;
+    nid.uCallbackMessage = WM_TRAY; nid.hIcon = wc.hIcon; wcscpy(nid.szTip, L"Proxy Client");
     Shell_NotifyIconW(NIM_ADD, &nid);
-    
     ParseTags();
     if (nodeCount > 0) SwitchNode(nodeTags[0]);
-    
     MSG msg; while(GetMessage(&msg, NULL, 0, 0)) { TranslateMessage(&msg); DispatchMessage(&msg); }
     return 0;
 }
