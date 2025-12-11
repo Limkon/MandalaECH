@@ -1,1 +1,1 @@
-gcc gui_client.c "C:\Program Files\OpenSSL-Win64\lib\VC\x64\MD\libssl.lib" "C:\Program Files\OpenSSL-Win64\lib\VC\x64\MD\libcrypto.lib" -o proxy_client.exe -I"C:\Program Files\OpenSSL-Win64\include" -lws2_32 -lgdi32 -lcomctl32 -mwindows>log.txt 2>&1
+gcc main.c resource.res -o limbox.exe -I"C:\Program Files\OpenSSL-Win64\include" -L"C:\Program Files\OpenSSL-Win64\lib\VC\x64\MD" -lws2_32 -lgdi32 -lcomctl32 -lwininet -lcrypt32 -llibssl -llibcrypto -mwindows -municode -finput-charset=UTF-8

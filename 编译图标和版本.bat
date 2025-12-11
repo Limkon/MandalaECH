@@ -1,0 +1,1 @@
+windres -i resource.rc -o resource.res  --target=pe-x86-64 -O coff >log.txt 2>&1

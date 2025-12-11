@@ -1,0 +1,31 @@
+/* * resource.rc (Minimal, UTF-8)
+ */
+#include <winver.h>
+
+1 ICON "Limbox.ico" 
+
+1 VERSIONINFO
+FILEVERSION     1,0,0,0
+PRODUCTVERSION  1,0,0,0
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_APP
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        /* 080404b0 = Chinese Simplified, Unicode */
+        BLOCK "080404b0" 
+        BEGIN
+            VALUE "ProductName", "LimboxÕ–≈Ã≥Ã–Ú\0"
+            VALUE "FileDescription", "Limbox Õ–≈Ã≥Ã–Ú \0"
+            VALUE "InternalName", "Limbox.exe\0"
+            VALUE "LegalCopyright", "Copyright (C) 2025\0"
+            VALUE "OriginalFilename", "Limbox.exe\0"
+            VALUE "FileVersion", "1.0.0.0\0"
+            VALUE "ProductVersion", "1.0.0.0\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x804, 1200 
+    END
+END
