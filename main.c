@@ -1,5 +1,5 @@
 // =================================================================================
-//  Windows 7 终极修复版代理客户端 (main.c) - Final Integrated Version
+//  Windows 7 Ultimate Proxy Client - Hidden Tray Persistence
 // =================================================================================
 #ifndef UNICODE
 #define UNICODE
@@ -39,7 +39,6 @@ typedef struct {
 #define WM_REFRESH_NODELIST (WM_USER + 50)
 #define ID_TRAY_EXIT 1001
 #define ID_TRAY_AUTORUN 1002
-#define ID_TRAY_SYSTEM_PROXY 1003
 #define ID_TRAY_MANAGE_NODES 1006
 #define ID_TRAY_SHOW_CONSOLE 1007
 #define ID_TRAY_IMPORT_CLIPBOARD 1008
@@ -50,8 +49,21 @@ typedef struct {
 #define ID_LOGVIEWER_EDIT 6001
 #define ID_NODEMGR_LIST 3001
 #define ID_NODEMGR_DEL 3002
+#define ID_NODEMGR_EDIT 3003 
 #define ID_HOTKEY_CTRL 7001 
 #define ID_PORT_EDIT 7002
+
+#define ID_EDIT_TAG      8001
+#define ID_EDIT_ADDR     8002
+#define ID_EDIT_PORT     8003
+#define ID_EDIT_USER     8004
+#define ID_EDIT_PASS     8005
+#define ID_EDIT_NET      8006
+#define ID_EDIT_TYPE     8007
+#define ID_EDIT_HOST     8008
+#define ID_EDIT_PATH     8009
+#define ID_EDIT_TLS      8010
+
 #define BUFFER_SIZE 131072 
 #define CONFIG_FILE L"config.json"
 
@@ -65,15 +77,20 @@ HWND hwnd;
 HMENU hMenu, hNodeSubMenu;
 HWND hLogViewerWnd = NULL;
 HFONT hLogFont = NULL;
+HFONT hAppFont = NULL;
 wchar_t** nodeTags = NULL;
 int nodeCount = 0;
 wchar_t currentNode[64] = L"";
+wchar_t g_editingTag[256] = {0};
 BOOL g_isIconVisible = TRUE;
 wchar_t g_iniFilePath[MAX_PATH] = {0};
 UINT g_hotkeyModifiers = MOD_CONTROL | MOD_ALT; 
 UINT g_hotkeyVk = 'H';                          
 int g_localPort = 1080;
+int g_hideTrayStart = 0; // 新增：保存托盘隐藏状态 (0=显示, 1=隐藏)
 WNDPROC g_oldListBoxProc = NULL;
+int g_nEditScrollPos = 0;
+int g_nEditContentHeight = 0;
 
 static const unsigned char base64_table[256] = {
     0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
@@ -104,6 +121,7 @@ void StartProxyCore();
 void StopProxyCore();
 void OpenLogViewer(BOOL bShow); 
 void OpenNodeManager();
+void OpenNodeEditWindow(const wchar_t* tag);
 void OpenSettingsWindow();
 void ToggleTrayIcon();
 void SetAutorun(BOOL enable);
@@ -112,8 +130,12 @@ cJSON* ParseSocks(const char* link);
 cJSON* ParseVmess(const char* link);
 cJSON* ParseVlessOrTrojan(const char* link);
 cJSON* ParseShadowsocks(const char* link);
+void AddComboItem(HWND hCombo, const wchar_t* text, BOOL select);
+void LoadNodeToEdit(HWND hWnd, const wchar_t* tag);
+void SaveEditedNode(HWND hWnd);
 LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 LRESULT CALLBACK NodeMgrWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+LRESULT CALLBACK NodeEditWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 LRESULT CALLBACK LogWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
@@ -236,6 +258,8 @@ void LoadSettings() {
     g_hotkeyModifiers = GetPrivateProfileIntW(L"Settings", L"Modifiers", MOD_CONTROL | MOD_ALT, g_iniFilePath);
     g_hotkeyVk = GetPrivateProfileIntW(L"Settings", L"VK", 'H', g_iniFilePath);
     g_localPort = GetPrivateProfileIntW(L"Settings", L"LocalPort", 1080, g_iniFilePath);
+    // 加载托盘隐藏状态，默认为0 (显示)
+    g_hideTrayStart = GetPrivateProfileIntW(L"Settings", L"HideTray", 0, g_iniFilePath);
 }
 
 void SaveSettings() {
@@ -246,6 +270,9 @@ void SaveSettings() {
     WritePrivateProfileStringW(L"Settings", L"VK", buffer, g_iniFilePath);
     wsprintfW(buffer, L"%d", g_localPort);
     WritePrivateProfileStringW(L"Settings", L"LocalPort", buffer, g_iniFilePath);
+    // 保存托盘隐藏状态
+    wsprintfW(buffer, L"%d", g_hideTrayStart);
+    WritePrivateProfileStringW(L"Settings", L"HideTray", buffer, g_iniFilePath);
 }
 
 void SetAutorun(BOOL enable) {
@@ -374,6 +401,144 @@ void DeleteNode(const wchar_t* tag) {
     WriteBufferToFile(CONFIG_FILE, out);
     free(out); cJSON_Delete(root);
     ParseTags(); 
+}
+
+void AddComboItem(HWND hCombo, const wchar_t* text, BOOL select) {
+    int idx = SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)text);
+    if (select) SendMessage(hCombo, CB_SETCURSEL, idx, 0);
+}
+
+void LoadNodeToEdit(HWND hWnd, const wchar_t* tag) {
+    char* buffer = NULL; long size = 0;
+    if (!ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) return;
+    cJSON* root = cJSON_Parse(buffer); free(buffer);
+    if (!root) return;
+    
+    char tagUtf8[256];
+    WideCharToMultiByte(CP_UTF8, 0, tag, -1, tagUtf8, 256, NULL, NULL);
+    cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
+    cJSON* target = NULL;
+    cJSON* node;
+    cJSON_ArrayForEach(node, outbounds) {
+        cJSON* t = cJSON_GetObjectItem(node, "tag");
+        if (t && strcmp(t->valuestring, tagUtf8) == 0) { target = node; break; }
+    }
+    if (target) {
+        SetDlgItemTextW(hWnd, ID_EDIT_TAG, tag);
+        cJSON* server = cJSON_GetObjectItem(target, "server");
+        if(server) SetDlgItemTextA(hWnd, ID_EDIT_ADDR, server->valuestring);
+        cJSON* port = cJSON_GetObjectItem(target, "server_port");
+        if(port) SetDlgItemInt(hWnd, ID_EDIT_PORT, port->valueint, FALSE);
+        cJSON* user = cJSON_GetObjectItem(target, "username");
+        if(!user) user = cJSON_GetObjectItem(target, "uuid");
+        if(user) SetDlgItemTextA(hWnd, ID_EDIT_USER, user->valuestring);
+        cJSON* pass = cJSON_GetObjectItem(target, "password");
+        if(pass) SetDlgItemTextA(hWnd, ID_EDIT_PASS, pass->valuestring);
+        cJSON* trans = cJSON_GetObjectItem(target, "transport"); 
+        if (!trans) trans = cJSON_GetObjectItem(target, "streamSettings");
+        HWND hNet = GetDlgItem(hWnd, ID_EDIT_NET);
+        SendMessage(hNet, CB_SETCURSEL, 0, 0); 
+        cJSON* netType = NULL;
+        if (trans) netType = cJSON_GetObjectItem(trans, "type");
+        if (!netType) netType = cJSON_GetObjectItem(target, "network");
+        if (netType && strcmp(netType->valuestring, "ws") == 0) SendMessage(hNet, CB_SETCURSEL, 1, 0);
+        cJSON* wsSettings = NULL;
+        if (trans) wsSettings = cJSON_GetObjectItem(trans, "wsSettings");
+        if (!wsSettings && trans && netType && strcmp(netType->valuestring, "ws") == 0) wsSettings = trans;
+        if (wsSettings) {
+             cJSON* path = cJSON_GetObjectItem(wsSettings, "path");
+             if (path) SetDlgItemTextA(hWnd, ID_EDIT_PATH, path->valuestring);
+             cJSON* headers = cJSON_GetObjectItem(wsSettings, "headers");
+             if (headers) {
+                 cJSON* host = cJSON_GetObjectItem(headers, "Host");
+                 if (host) SetDlgItemTextA(hWnd, ID_EDIT_HOST, host->valuestring);
+             }
+        }
+        HWND hTls = GetDlgItem(hWnd, ID_EDIT_TLS);
+        SendMessage(hTls, CB_SETCURSEL, 0, 0); 
+        cJSON* tls = cJSON_GetObjectItem(target, "tls");
+        cJSON* security = cJSON_GetObjectItem(target, "security");
+        if (tls || (security && strcmp(security->valuestring, "tls") == 0)) {
+             SendMessage(hTls, CB_SETCURSEL, 1, 0);
+             cJSON* sni = NULL;
+             if (tls) sni = cJSON_GetObjectItem(tls, "server_name");
+             if (sni) SetDlgItemTextA(hWnd, ID_EDIT_HOST, sni->valuestring);
+        }
+    }
+    cJSON_Delete(root);
+}
+
+void SaveEditedNode(HWND hWnd) {
+    wchar_t wTag[256], wAddr[256], wUser[256], wPass[256], wHost[256], wPath[256];
+    char tag[256], addr[256], user[256], pass[256], host[256], path[256];
+    int port = GetDlgItemInt(hWnd, ID_EDIT_PORT, NULL, FALSE);
+    GetDlgItemTextW(hWnd, ID_EDIT_TAG, wTag, 256);
+    GetDlgItemTextW(hWnd, ID_EDIT_ADDR, wAddr, 256);
+    GetDlgItemTextW(hWnd, ID_EDIT_USER, wUser, 256);
+    GetDlgItemTextW(hWnd, ID_EDIT_PASS, wPass, 256);
+    GetDlgItemTextW(hWnd, ID_EDIT_HOST, wHost, 256);
+    GetDlgItemTextW(hWnd, ID_EDIT_PATH, wPath, 256);
+    WideCharToMultiByte(CP_UTF8, 0, wTag, -1, tag, 256, NULL, NULL);
+    WideCharToMultiByte(CP_UTF8, 0, wAddr, -1, addr, 256, NULL, NULL);
+    WideCharToMultiByte(CP_UTF8, 0, wUser, -1, user, 256, NULL, NULL);
+    WideCharToMultiByte(CP_UTF8, 0, wPass, -1, pass, 256, NULL, NULL);
+    WideCharToMultiByte(CP_UTF8, 0, wHost, -1, host, 256, NULL, NULL);
+    WideCharToMultiByte(CP_UTF8, 0, wPath, -1, path, 256, NULL, NULL);
+    int netIdx = SendMessage(GetDlgItem(hWnd, ID_EDIT_NET), CB_GETCURSEL, 0, 0);
+    int tlsIdx = SendMessage(GetDlgItem(hWnd, ID_EDIT_TLS), CB_GETCURSEL, 0, 0);
+    cJSON* newNode = cJSON_CreateObject();
+    cJSON_AddStringToObject(newNode, "tag", tag);
+    cJSON_AddStringToObject(newNode, "server", addr);
+    cJSON_AddNumberToObject(newNode, "server_port", port);
+    BOOL isVmess = (strlen(user) > 20); 
+    if (isVmess) {
+        cJSON_AddStringToObject(newNode, "type", "vmess");
+        cJSON_AddStringToObject(newNode, "uuid", user);
+    } else {
+        cJSON_AddStringToObject(newNode, "type", "socks");
+        if (strlen(user)>0) cJSON_AddStringToObject(newNode, "username", user);
+        if (strlen(pass)>0) cJSON_AddStringToObject(newNode, "password", pass);
+    }
+    if (netIdx == 1) { 
+        cJSON* trans = cJSON_CreateObject();
+        cJSON_AddStringToObject(trans, "type", "ws");
+        if (strlen(path) > 0) cJSON_AddStringToObject(trans, "path", path);
+        if (strlen(host) > 0) {
+            cJSON* h = cJSON_CreateObject();
+            cJSON_AddStringToObject(h, "Host", host);
+            cJSON_AddItemToObject(trans, "headers", h);
+        }
+        cJSON_AddItemToObject(newNode, "transport", trans);
+    } else { cJSON_AddStringToObject(newNode, "network", "tcp"); }
+    if (tlsIdx == 1) {
+        cJSON* tlsObj = cJSON_CreateObject();
+        cJSON_AddBoolToObject(tlsObj, "enabled", cJSON_True);
+        if (strlen(host) > 0) cJSON_AddStringToObject(tlsObj, "server_name", host);
+        cJSON_AddItemToObject(newNode, "tls", tlsObj);
+    }
+    char* buffer = NULL; long size = 0;
+    if (ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) {
+        cJSON* root = cJSON_Parse(buffer); free(buffer);
+        if (root) {
+            cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
+            int count = cJSON_GetArraySize(outbounds);
+            int idxToReplace = -1;
+            char oldTagUtf8[256];
+            WideCharToMultiByte(CP_UTF8, 0, g_editingTag, -1, oldTagUtf8, 256, NULL, NULL);
+            for (int i=0; i<count; i++) {
+                cJSON* item = cJSON_GetArrayItem(outbounds, i);
+                cJSON* t = cJSON_GetObjectItem(item, "tag");
+                if (t && strcmp(t->valuestring, oldTagUtf8) == 0) {
+                    idxToReplace = i; break;
+                }
+            }
+            if (idxToReplace != -1) cJSON_ReplaceItemInArray(outbounds, idxToReplace, newNode);
+            else cJSON_AddItemToArray(outbounds, newNode);
+            char* out = cJSON_Print(root);
+            WriteBufferToFile(CONFIG_FILE, out);
+            free(out); cJSON_Delete(root);
+        } else cJSON_Delete(newNode);
+    } else cJSON_Delete(newNode);
 }
 
 char* GetUniqueTagName(cJSON* outbounds, const char* type, const char* base_name) {
@@ -603,46 +768,49 @@ int ImportFromClipboard() {
 }
 
 void ToggleTrayIcon() {
-    if (g_isIconVisible) { Shell_NotifyIconW(NIM_DELETE, &nid); g_isIconVisible = FALSE; }
-    else { Shell_NotifyIconW(NIM_ADD, &nid); g_isIconVisible = TRUE; }
+    if (g_isIconVisible) { 
+        Shell_NotifyIconW(NIM_DELETE, &nid); 
+        g_isIconVisible = FALSE; 
+        g_hideTrayStart = 1; // 标记为隐藏
+    }
+    else { 
+        nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+        Shell_NotifyIconW(NIM_ADD, &nid); 
+        g_isIconVisible = TRUE; 
+        g_hideTrayStart = 0; // 标记为显示
+    }
+    SaveSettings(); // 立即保存状态
 }
 
 void init_openssl_global() {
     if (g_ssl_ctx) return;
-
     SSL_library_init(); 
     OpenSSL_add_all_algorithms(); 
     SSL_load_error_strings();
-    
     g_ssl_ctx = SSL_CTX_new(TLS_client_method());
     if (!g_ssl_ctx) return;
-
     SSL_CTX_set_min_proto_version(g_ssl_ctx, TLS1_2_VERSION);
     SSL_CTX_set_max_proto_version(g_ssl_ctx, TLS1_3_VERSION);
-
     wchar_t pemPath[MAX_PATH];
     GetModuleFileNameW(NULL, pemPath, MAX_PATH);
     wchar_t* p = wcsrchr(pemPath, L'\\'); 
     if (p) { *p = 0; wcscat(pemPath, L"\\cacert.pem"); }
     else wcscpy(pemPath, L"cacert.pem");
-
     char pemPathA[MAX_PATH];
     WideCharToMultiByte(CP_ACP, 0, pemPath, -1, pemPathA, MAX_PATH, NULL, NULL);
-
     FILE* f = fopen(pemPathA, "rb");
     if (f) {
         fclose(f);
         if (SSL_CTX_load_verify_locations(g_ssl_ctx, pemPathA, NULL)) {
             SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_PEER, NULL);
-            log_msg("[Security] 证书库 cacert.pem 加载成功，已开启严格验证模式。");
+            log_msg("[Security] CA loaded, strict mode.");
         } else {
             SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, NULL);
-            log_msg("[Security] cacert.pem 加载失败，回退到不安全模式。");
+            log_msg("[Security] CA load failed, insecure mode.");
         }
     } else {
         SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, NULL);
-        log_msg("[Warning] 未找到 cacert.pem，已禁用证书验证 (存在中间人攻击风险)。");
-        log_msg("建议下载 https://curl.se/ca/cacert.pem 到程序目录以提升安全性。");
+        log_msg("[Warning] cacert.pem not found. Insecure mode.");
     }
 }
 
@@ -659,13 +827,10 @@ int tls_write(TLSContext *ctx, const char *data, int len) {
     int written = 0;
     while (written < len) {
         int ret = SSL_write(ctx->ssl, data + written, len - written);
-        if (ret > 0) {
-            written += ret;
-        } else {
+        if (ret > 0) { written += ret; } 
+        else {
             int err = SSL_get_error(ctx->ssl, ret);
-            if (err == SSL_ERROR_WANT_WRITE || err == SSL_ERROR_WANT_READ) {
-                Sleep(1); continue; 
-            }
+            if (err == SSL_ERROR_WANT_WRITE || err == SSL_ERROR_WANT_READ) { Sleep(1); continue; }
             return -1; 
         }
     }
@@ -912,6 +1077,8 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             SetDlgItemInt(hWnd, ID_PORT_EDIT, g_localPort, FALSE);
             CreateWindowW(L"BUTTON", L"确定", WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON, 60,145,80,25, hWnd, (HMENU)IDOK, NULL,NULL);
             CreateWindowW(L"BUTTON", L"取消", WS_CHILD|WS_VISIBLE, 160,145,80,25, hWnd, (HMENU)IDCANCEL, NULL,NULL);
+            EnumChildWindows(hWnd, (WNDENUMPROC)(void*)SendMessageW, (LPARAM)hAppFont);
+            SendMessage(hWnd, WM_SETFONT, (WPARAM)hAppFont, TRUE);
             break;
         case WM_COMMAND:
             if (LOWORD(wParam) == IDOK) {
@@ -959,7 +1126,10 @@ LRESULT CALLBACK NodeMgrWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         case WM_CREATE:
             hList = CreateWindowW(L"LISTBOX", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|WS_VSCROLL|LBS_NOTIFY|LBS_EXTENDEDSEL, 10, 10, 360, 170, hWnd, (HMENU)ID_NODEMGR_LIST, NULL, NULL);
             g_oldListBoxProc = (WNDPROC)SetWindowLongPtr(hList, GWLP_WNDPROC, (LONG_PTR)ListBox_Proc);
-            CreateWindowW(L"BUTTON", L"删除选中节点", WS_CHILD | WS_VISIBLE, 10, 185, 120, 30, hWnd, (HMENU)ID_NODEMGR_DEL, NULL, NULL);
+            CreateWindowW(L"BUTTON", L"编辑选中节点", WS_CHILD | WS_VISIBLE, 10, 185, 120, 30, hWnd, (HMENU)ID_NODEMGR_EDIT, NULL, NULL);
+            CreateWindowW(L"BUTTON", L"删除选中节点", WS_CHILD | WS_VISIBLE, 140, 185, 120, 30, hWnd, (HMENU)ID_NODEMGR_DEL, NULL, NULL);
+            EnumChildWindows(hWnd, (WNDENUMPROC)(void*)SendMessageW, (LPARAM)hAppFont);
+            SendMessage(hWnd, WM_SETFONT, (WPARAM)hAppFont, TRUE);
             SendMessage(hWnd, WM_REFRESH_NODELIST, 0, 0); 
             break;
         case WM_REFRESH_NODELIST:
@@ -968,7 +1138,23 @@ LRESULT CALLBACK NodeMgrWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             for(int i = 0; i < nodeCount; i++) SendMessageW(hList, LB_ADDSTRING, 0, (LPARAM)nodeTags[i]);
             break;
         case WM_COMMAND:
-            if (LOWORD(wParam) == ID_NODEMGR_DEL) {
+            if (LOWORD(wParam) == ID_NODEMGR_EDIT) {
+                int selCount = SendMessage(hList, LB_GETSELCOUNT, 0, 0);
+                if (selCount <= 0) {
+                    MessageBoxW(hWnd, L"请先选择一个需要编辑的节点！", L"提示", MB_OK|MB_ICONWARNING);
+                    break;
+                }
+                int selIndex = 0;
+                if (SendMessage(hList, LB_GETSELITEMS, 1, (LPARAM)&selIndex) == LB_ERR) break; 
+                int len = SendMessage(hList, LB_GETTEXTLEN, selIndex, 0);
+                if (len > 0) {
+                    wchar_t* tag = (wchar_t*)malloc((len + 1) * sizeof(wchar_t));
+                    SendMessageW(hList, LB_GETTEXT, selIndex, (LPARAM)tag);
+                    OpenNodeEditWindow(tag);
+                    free(tag);
+                }
+            }
+            else if (LOWORD(wParam) == ID_NODEMGR_DEL) {
                 int selCount = SendMessage(hList, LB_GETSELCOUNT, 0, 0);
                 if (selCount <= 0) { MessageBoxW(hWnd, L"请先选择至少一个节点", L"提示", MB_OK); break; }
                 wchar_t confirmMsg[64]; wsprintfW(confirmMsg, L"确定要删除选中的 %d 个节点吗？", selCount);
@@ -1004,6 +1190,169 @@ void OpenNodeManager() {
     }
     hMgr = CreateWindowW(L"NodeMgr", L"节点管理 (支持 Ctrl+A 全选/多选)", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT, 0, 400, 270, NULL, NULL, GetModuleHandle(NULL), NULL);
     ShowWindow(hMgr, SW_SHOW);
+}
+
+LRESULT CALLBACK NodeEditWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch(msg) {
+        case WM_CREATE: {
+            int x = 25, w_lbl = 110, w_edit = 300, h = 24, gap = 40; 
+            int y = 20;
+
+            #define CREATE_LABEL(txt) CreateWindowW(L"STATIC", txt, WS_CHILD|WS_VISIBLE, x, y, w_lbl, h, hWnd, NULL, NULL, NULL)
+            #define CREATE_EDIT(id, styles) CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|styles, x+w_lbl, y-2, w_edit, h+4, hWnd, (HMENU)id, NULL, NULL)
+            #define CREATE_COMBO(id) CreateWindowW(L"COMBOBOX", NULL, WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL, x+w_lbl, y-2, 140, 200, hWnd, (HMENU)id, NULL, NULL)
+
+            CREATE_LABEL(L"别名 (Tag):");
+            CREATE_EDIT(ID_EDIT_TAG, ES_AUTOHSCROLL);
+            y += gap;
+
+            CREATE_LABEL(L"地址 (Address):");
+            CREATE_EDIT(ID_EDIT_ADDR, ES_AUTOHSCROLL);
+            y += gap;
+
+            CREATE_LABEL(L"端口 (Port):");
+            CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER, x+w_lbl, y-2, 80, h+4, hWnd, (HMENU)ID_EDIT_PORT, NULL, NULL);
+            y += gap + 10;
+
+            CreateWindowW(L"STATIC", L"用户验证 (Auth)", WS_CHILD|WS_VISIBLE|SS_GRAYFRAME, x, y+5, 420, 1, hWnd, NULL, NULL, NULL);
+            y += 25;
+
+            CREATE_LABEL(L"用户 (User/UUID):");
+            CREATE_EDIT(ID_EDIT_USER, ES_AUTOHSCROLL);
+            y += gap;
+
+            CREATE_LABEL(L"密码 (Pass):");
+            CREATE_EDIT(ID_EDIT_PASS, ES_AUTOHSCROLL);
+            y += gap + 10;
+
+            CreateWindowW(L"STATIC", L"底层传输 (Transport)", WS_CHILD|WS_VISIBLE|SS_GRAYFRAME, x, y+5, 420, 1, hWnd, NULL, NULL, NULL);
+            y += 25;
+
+            CREATE_LABEL(L"传输协议:");
+            HWND hNet = CREATE_COMBO(ID_EDIT_NET);
+            AddComboItem(hNet, L"tcp", TRUE); AddComboItem(hNet, L"ws", FALSE);
+            y += gap;
+
+            CREATE_LABEL(L"伪装类型:");
+            HWND hType = CREATE_COMBO(ID_EDIT_TYPE);
+            AddComboItem(hType, L"none", TRUE);
+            y += gap;
+
+            CREATE_LABEL(L"伪装域名 (Host):");
+            CREATE_EDIT(ID_EDIT_HOST, ES_AUTOHSCROLL);
+            y += gap;
+
+            CREATE_LABEL(L"路径 (Path):");
+            CREATE_EDIT(ID_EDIT_PATH, ES_AUTOHSCROLL);
+            y += gap;
+
+            CREATE_LABEL(L"传输安全 (TLS):");
+            HWND hTls = CREATE_COMBO(ID_EDIT_TLS);
+            AddComboItem(hTls, L"none", TRUE); AddComboItem(hTls, L"tls", FALSE);
+            y += gap + 30;
+
+            CreateWindowW(L"BUTTON", L"确定", WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON, 120, y, 100, 32, hWnd, (HMENU)IDOK, NULL, NULL);
+            CreateWindowW(L"BUTTON", L"取消", WS_CHILD|WS_VISIBLE, 260, y, 100, 32, hWnd, (HMENU)IDCANCEL, NULL, NULL);
+            
+            y += 80; 
+            g_nEditContentHeight = y; 
+            g_nEditScrollPos = 0;
+
+            EnumChildWindows(hWnd, (WNDENUMPROC)(void*)SendMessageW, (LPARAM)hAppFont);
+            if (hAppFont) SendMessage(hWnd, WM_SETFONT, (WPARAM)hAppFont, TRUE);
+
+            LoadNodeToEdit(hWnd, g_editingTag);
+            
+            SCROLLINFO si;
+            si.cbSize = sizeof(si);
+            si.fMask = SIF_RANGE | SIF_PAGE;
+            si.nMin = 0;
+            si.nMax = g_nEditContentHeight;
+            si.nPage = 680; 
+            SetScrollInfo(hWnd, SB_VERT, &si, TRUE);
+            break;
+        }
+
+        case WM_SIZE: {
+            RECT rc; GetClientRect(hWnd, &rc);
+            int clientHeight = rc.bottom - rc.top;
+            SCROLLINFO si;
+            si.cbSize = sizeof(si);
+            si.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+            si.nMin = 0;
+            si.nMax = g_nEditContentHeight;
+            si.nPage = clientHeight;
+            si.nPos = g_nEditScrollPos;
+            SetScrollInfo(hWnd, SB_VERT, &si, TRUE);
+            break;
+        }
+
+        case WM_VSCROLL: {
+            SCROLLINFO si;
+            si.cbSize = sizeof(si);
+            si.fMask = SIF_ALL;
+            GetScrollInfo(hWnd, SB_VERT, &si);
+            int oldPos = si.nPos;
+            int newPos = oldPos;
+
+            switch (LOWORD(wParam)) {
+                case SB_TOP: newPos = si.nMin; break;
+                case SB_BOTTOM: newPos = si.nMax; break;
+                case SB_LINEUP: newPos -= 20; break;
+                case SB_LINEDOWN: newPos += 20; break;
+                case SB_PAGEUP: newPos -= si.nPage; break;
+                case SB_PAGEDOWN: newPos += si.nPage; break;
+                case SB_THUMBTRACK: newPos = si.nTrackPos; break;
+            }
+
+            if (newPos < 0) newPos = 0;
+            if (newPos > (int)(si.nMax - si.nPage + 1)) newPos = si.nMax - si.nPage + 1;
+            
+            if (newPos != oldPos) {
+                ScrollWindow(hWnd, 0, oldPos - newPos, NULL, NULL);
+                si.fMask = SIF_POS;
+                si.nPos = newPos;
+                SetScrollInfo(hWnd, SB_VERT, &si, TRUE);
+                UpdateWindow(hWnd);
+                g_nEditScrollPos = newPos;
+            }
+            break;
+        }
+
+        case WM_MOUSEWHEEL: {
+            int zDelta = GET_WHEEL_DELTA_WPARAM(wParam);
+            int scrollLines = 3; 
+            SystemParametersInfo(SPI_GETWHEELSCROLLLINES, 0, &scrollLines, 0);
+            for(int i=0; i<scrollLines; i++) {
+                SendMessage(hWnd, WM_VSCROLL, zDelta > 0 ? SB_LINEUP : SB_LINEDOWN, 0);
+            }
+            break;
+        }
+
+        case WM_COMMAND:
+            if (LOWORD(wParam) == IDOK) {
+                SaveEditedNode(hWnd);
+                MessageBoxW(hWnd, L"节点已更新", L"成功", MB_OK);
+                DestroyWindow(hWnd);
+                HWND hMgr = FindWindowW(L"NodeMgr", NULL);
+                if (hMgr) SendMessage(hMgr, WM_REFRESH_NODELIST, 0, 0);
+            } else if (LOWORD(wParam) == IDCANCEL) DestroyWindow(hWnd);
+            break;
+        case WM_CLOSE: DestroyWindow(hWnd); break;
+    }
+    return DefWindowProcW(hWnd, msg, wParam, lParam);
+}
+
+void OpenNodeEditWindow(const wchar_t* tag) {
+    if (!tag || wcslen(tag) == 0) return;
+    wcsncpy(g_editingTag, tag, 255); 
+    WNDCLASSW wc = {0};
+    if (!GetClassInfoW(GetModuleHandle(NULL), L"NodeEdit", &wc)) {
+        wc.lpfnWndProc = NodeEditWndProc; wc.hInstance = GetModuleHandle(NULL); wc.lpszClassName = L"NodeEdit"; wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE+1);
+        wc.hCursor = LoadCursor(NULL, IDC_ARROW); RegisterClassW(&wc);
+    }
+    HWND h = CreateWindowW(L"NodeEdit", L"配置节点", WS_VISIBLE|WS_CAPTION|WS_SYSMENU|WS_VSCROLL|WS_THICKFRAME|WS_MINIMIZEBOX, CW_USEDEFAULT, 0, 500, 720, NULL, NULL, GetModuleHandle(NULL), NULL);
+    if(h) { ShowWindow(h, SW_SHOW); UpdateWindow(h); }
 }
 
 LRESULT CALLBACK LogWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -1056,7 +1405,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         AppendMenuW(hMenu, MF_STRING, ID_TRAY_SETTINGS, L"程序设置");
         AppendMenuW(hMenu, MF_STRING, ID_TRAY_SHOW_CONSOLE, L"查看日志");
         AppendMenuW(hMenu, IsAutorun()?MF_CHECKED:MF_UNCHECKED, ID_TRAY_AUTORUN, L"开机自启");
-        AppendMenuW(hMenu, MF_STRING, ID_TRAY_HIDE_ICON, L"隐藏图标");
+        // 根据当前状态显示菜单项
+        if (g_isIconVisible) AppendMenuW(hMenu, MF_STRING, ID_TRAY_HIDE_ICON, L"隐藏图标");
+        else AppendMenuW(hMenu, MF_STRING, ID_TRAY_HIDE_ICON, L"显示图标"); // 理论上隐藏时点不到菜单，保留逻辑一致性
         AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
         AppendMenuW(hMenu, MF_STRING, ID_TRAY_EXIT, L"退出程序");
         TrackPopupMenu(hMenu, TPM_RIGHTALIGN|TPM_BOTTOMALIGN, pt.x, pt.y, 0, hWnd, NULL);
@@ -1092,7 +1443,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nShow) {
     WSADATA wsa; WSAStartup(MAKEWORD(2,2), &wsa);
     INITCOMMONCONTROLSEX ic = {sizeof(INITCOMMONCONTROLSEX), ICC_HOTKEY_CLASS}; InitCommonControlsEx(&ic);
+    
+    hAppFont = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                           OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
+                           DEFAULT_PITCH | FF_SWISS, L"Microsoft YaHei");
     hLogFont = CreateFontW(14,0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,0,0,0,0,L"Consolas");
+    
     OpenLogViewer(FALSE); 
     GetModuleFileNameW(NULL, g_iniFilePath, MAX_PATH);
     wchar_t* p = wcsrchr(g_iniFilePath, L'\\'); if (p) { *p = 0; wcscat(g_iniFilePath, L"\\set.ini"); } 
@@ -1105,7 +1461,15 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nSho
     RegisterHotKey(hwnd, ID_GLOBAL_HOTKEY, g_hotkeyModifiers, g_hotkeyVk);
     nid.cbSize = sizeof(nid); nid.hWnd = hwnd; nid.uID = 1; nid.uFlags = NIF_ICON|NIF_MESSAGE|NIF_TIP;
     nid.uCallbackMessage = WM_TRAY; nid.hIcon = wc.hIcon; wcscpy(nid.szTip, L"Proxy Client");
-    Shell_NotifyIconW(NIM_ADD, &nid);
+    
+    // 如果配置为隐藏，启动时不添加托盘图标，并更新状态变量
+    if (g_hideTrayStart == 1) {
+        g_isIconVisible = FALSE;
+    } else {
+        Shell_NotifyIconW(NIM_ADD, &nid);
+        g_isIconVisible = TRUE;
+    }
+
     ParseTags();
     if (nodeCount > 0) SwitchNode(nodeTags[0]);
     MSG msg; while(GetMessage(&msg, NULL, 0, 0)) { TranslateMessage(&msg); DispatchMessage(&msg); }
