@@ -522,7 +522,7 @@ void SwitchNode(const wchar_t* tag) {
         StartProxyCore();
         wchar_t tip[128]; wsprintfW(tip, L"已切换: %s", tag);
         wcsncpy(nid.szInfo, tip, 127);
-        wcsncpy(nid.szInfoTitle, L"SOCKS5 Proxy", 63);
+        wcsncpy(nid.szInfoTitle, L"Proxy Client", 63);
         nid.uFlags |= NIF_INFO;
         Shell_NotifyIconW(NIM_MODIFY, &nid);
     }
