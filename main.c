@@ -609,12 +609,41 @@ void ToggleTrayIcon() {
 
 void init_openssl_global() {
     if (g_ssl_ctx) return;
-    SSL_library_init(); OpenSSL_add_all_algorithms(); SSL_load_error_strings();
+
+    SSL_library_init(); 
+    OpenSSL_add_all_algorithms(); 
+    SSL_load_error_strings();
+    
     g_ssl_ctx = SSL_CTX_new(TLS_client_method());
     if (!g_ssl_ctx) return;
-    SSL_CTX_set_min_proto_version(g_ssl_ctx, TLS1_1_VERSION);
+
+    SSL_CTX_set_min_proto_version(g_ssl_ctx, TLS1_2_VERSION);
     SSL_CTX_set_max_proto_version(g_ssl_ctx, TLS1_3_VERSION);
-    SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, NULL);
+
+    wchar_t pemPath[MAX_PATH];
+    GetModuleFileNameW(NULL, pemPath, MAX_PATH);
+    wchar_t* p = wcsrchr(pemPath, L'\\'); 
+    if (p) { *p = 0; wcscat(pemPath, L"\\cacert.pem"); }
+    else wcscpy(pemPath, L"cacert.pem");
+
+    char pemPathA[MAX_PATH];
+    WideCharToMultiByte(CP_ACP, 0, pemPath, -1, pemPathA, MAX_PATH, NULL, NULL);
+
+    FILE* f = fopen(pemPathA, "rb");
+    if (f) {
+        fclose(f);
+        if (SSL_CTX_load_verify_locations(g_ssl_ctx, pemPathA, NULL)) {
+            SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_PEER, NULL);
+            log_msg("[Security] 证书库 cacert.pem 加载成功，已开启严格验证模式。");
+        } else {
+            SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, NULL);
+            log_msg("[Security] cacert.pem 加载失败，回退到不安全模式。");
+        }
+    } else {
+        SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, NULL);
+        log_msg("[Warning] 未找到 cacert.pem，已禁用证书验证 (存在中间人攻击风险)。");
+        log_msg("建议下载 https://curl.se/ca/cacert.pem 到程序目录以提升安全性。");
+    }
 }
 
 int tls_init_connect(TLSContext *ctx) {
