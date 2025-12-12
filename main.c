@@ -24,6 +24,7 @@
 #include <wininet.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <openssl/bio.h>
 #include "cJSON.c" 
 
 const wchar_t* REG_PATH_PROXY = L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
@@ -53,6 +54,16 @@ typedef struct {
 #define ID_NODEMGR_EDIT 3003 
 #define ID_HOTKEY_CTRL 7001 
 #define ID_PORT_EDIT 7002
+
+// GUI ID 定义
+#define ID_CHK_CIPHERS    7010
+#define ID_CHK_ALPN       7011
+#define ID_COMBO_PLATFORM 7012 
+#define ID_EDIT_UA_STR    7013 
+#define ID_CHK_FRAG       7014
+#define ID_EDIT_FRAG_LEN  7015 // 分片长度输入框
+#define ID_EDIT_FRAG_DLY  7016 // 分片延迟输入框
+
 #define ID_EDIT_TAG      8001
 #define ID_EDIT_ADDR     8002
 #define ID_EDIT_PORT     8003
@@ -91,6 +102,104 @@ int g_hideTrayStart = 0;
 WNDPROC g_oldListBoxProc = NULL;
 int g_nEditScrollPos = 0;
 int g_nEditContentHeight = 0;
+
+// 抗封锁配置全局变量
+BOOL g_enableChromeCiphers = TRUE;
+BOOL g_enableALPN = TRUE;
+BOOL g_enableFragment = FALSE;
+int  g_fragSplitSize = 50;  // 默认切分大小 1 字节
+int  g_fragDelayMs = 2;   // 默认延迟 10 ms
+int  g_uaPlatformIndex = 0; 
+char g_userAgentStr[512] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
+const wchar_t* UA_PLATFORMS[] = { L"Windows", L"iOS", L"Android", L"macOS", L"Linux" };
+const char* UA_TEMPLATES[] = {
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+};
+
+// ---------------------- BIO Fragmentation Implementation ----------------------
+static int frag_write(BIO *b, const char *in, int inl);
+static int frag_read(BIO *b, char *out, int outl);
+static long frag_ctrl(BIO *b, int cmd, long num, void *ptr);
+static int frag_new(BIO *b);
+static int frag_free(BIO *b);
+
+static BIO_METHOD *method_frag = NULL;
+
+typedef struct {
+    int first_packet_sent;
+} FragCtx;
+
+BIO_METHOD *BIO_f_fragment(void) {
+    if (method_frag == NULL) {
+        method_frag = BIO_meth_new(BIO_TYPE_FILTER, "Fragmentation Filter");
+        BIO_meth_set_write(method_frag, frag_write);
+        BIO_meth_set_read(method_frag, frag_read);
+        BIO_meth_set_ctrl(method_frag, frag_ctrl);
+        BIO_meth_set_create(method_frag, frag_new);
+        BIO_meth_set_destroy(method_frag, frag_free);
+    }
+    return method_frag;
+}
+
+static int frag_new(BIO *b) {
+    FragCtx *ctx = (FragCtx *)malloc(sizeof(FragCtx));
+    if(!ctx) return 0;
+    ctx->first_packet_sent = 0;
+    BIO_set_data(b, ctx);
+    BIO_set_init(b, 1);
+    return 1;
+}
+
+static int frag_free(BIO *b) {
+    if (b == NULL) return 0;
+    FragCtx *ctx = (FragCtx *)BIO_get_data(b);
+    if (ctx) { free(ctx); BIO_set_data(b, NULL); }
+    return 1;
+}
+
+static int frag_write(BIO *b, const char *in, int inl) {
+    FragCtx *ctx = (FragCtx *)BIO_get_data(b);
+    BIO *next = BIO_next(b);
+    if (!ctx || !next) return 0;
+
+    // 核心逻辑：使用全局配置的 g_fragSplitSize 和 g_fragDelayMs
+    if (inl > g_fragSplitSize && ctx->first_packet_sent == 0) {
+        ctx->first_packet_sent = 1;
+        
+        // 1. 发送第一部分 (Split Size)
+        int ret1 = BIO_write(next, in, g_fragSplitSize);
+        if (ret1 <= 0) return ret1;
+        
+        // 2. 插入延迟
+        if (g_fragDelayMs > 0) Sleep(g_fragDelayMs); 
+        
+        // 3. 发送剩余部分
+        int ret2 = BIO_write(next, in + g_fragSplitSize, inl - g_fragSplitSize);
+        if (ret2 <= 0) return ret1; 
+        
+        return ret1 + ret2;
+    }
+    
+    return BIO_write(next, in, inl);
+}
+
+static int frag_read(BIO *b, char *out, int outl) {
+    BIO *next = BIO_next(b);
+    if (!next) return 0;
+    return BIO_read(next, out, outl);
+}
+
+static long frag_ctrl(BIO *b, int cmd, long num, void *ptr) {
+    BIO *next = BIO_next(b);
+    if (!next) return 0;
+    return BIO_ctrl(next, cmd, num, ptr);
+}
+// ---------------------- End BIO Implementation ----------------------
 
 static const unsigned char base64_table[256] = {
     0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
@@ -141,6 +250,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 BOOL IsWindows8OrGreater();
 void SetSystemProxy(BOOL enable);
 BOOL IsSystemProxyEnabled();
+void FreeGlobalSSLContext();
 
 void log_msg(const char *format, ...) {
     char buf[2048]; char time_buf[64]; SYSTEMTIME st; GetLocalTime(&st);
@@ -262,6 +372,26 @@ void LoadSettings() {
     g_hotkeyVk = GetPrivateProfileIntW(L"Settings", L"VK", 'H', g_iniFilePath);
     g_localPort = GetPrivateProfileIntW(L"Settings", L"LocalPort", 1080, g_iniFilePath);
     g_hideTrayStart = GetPrivateProfileIntW(L"Settings", L"HideTray", 0, g_iniFilePath);
+    
+    // 抗封锁配置读取
+    g_enableChromeCiphers = GetPrivateProfileIntW(L"Settings", L"ChromeCiphers", 1, g_iniFilePath);
+    g_enableALPN = GetPrivateProfileIntW(L"Settings", L"EnableALPN", 1, g_iniFilePath);
+    g_enableFragment = GetPrivateProfileIntW(L"Settings", L"EnableFragment", 0, g_iniFilePath);
+    g_fragSplitSize = GetPrivateProfileIntW(L"Settings", L"FragSize", 1, g_iniFilePath);
+    g_fragDelayMs = GetPrivateProfileIntW(L"Settings", L"FragDelay", 10, g_iniFilePath);
+    g_uaPlatformIndex = GetPrivateProfileIntW(L"Settings", L"UAPlatform", 0, g_iniFilePath);
+    
+    // 校验分片参数
+    if (g_fragSplitSize < 1) g_fragSplitSize = 1;
+    if (g_fragDelayMs < 0) g_fragDelayMs = 0;
+
+    wchar_t wUABuf[512] = {0};
+    GetPrivateProfileStringW(L"Settings", L"UserAgent", L"", wUABuf, 512, g_iniFilePath);
+    if (wcslen(wUABuf) > 5) {
+        WideCharToMultiByte(CP_UTF8, 0, wUABuf, -1, g_userAgentStr, sizeof(g_userAgentStr), NULL, NULL);
+    } else {
+        strcpy(g_userAgentStr, UA_TEMPLATES[0]);
+    }
 }
 
 void SaveSettings() {
@@ -274,6 +404,25 @@ void SaveSettings() {
     WritePrivateProfileStringW(L"Settings", L"LocalPort", buffer, g_iniFilePath);
     wsprintfW(buffer, L"%d", g_hideTrayStart);
     WritePrivateProfileStringW(L"Settings", L"HideTray", buffer, g_iniFilePath);
+    
+    wsprintfW(buffer, L"%d", g_enableChromeCiphers);
+    WritePrivateProfileStringW(L"Settings", L"ChromeCiphers", buffer, g_iniFilePath);
+    wsprintfW(buffer, L"%d", g_enableALPN);
+    WritePrivateProfileStringW(L"Settings", L"EnableALPN", buffer, g_iniFilePath);
+    wsprintfW(buffer, L"%d", g_enableFragment);
+    WritePrivateProfileStringW(L"Settings", L"EnableFragment", buffer, g_iniFilePath);
+    
+    wsprintfW(buffer, L"%d", g_fragSplitSize);
+    WritePrivateProfileStringW(L"Settings", L"FragSize", buffer, g_iniFilePath);
+    wsprintfW(buffer, L"%d", g_fragDelayMs);
+    WritePrivateProfileStringW(L"Settings", L"FragDelay", buffer, g_iniFilePath);
+
+    wsprintfW(buffer, L"%d", g_uaPlatformIndex);
+    WritePrivateProfileStringW(L"Settings", L"UAPlatform", buffer, g_iniFilePath);
+    
+    wchar_t wUABuf[512] = {0};
+    MultiByteToWideChar(CP_UTF8, 0, g_userAgentStr, -1, wUABuf, 512);
+    WritePrivateProfileStringW(L"Settings", L"UserAgent", wUABuf, g_iniFilePath);
 }
 
 void SetAutorun(BOOL enable) {
@@ -783,15 +932,35 @@ void ToggleTrayIcon() {
     SaveSettings();
 }
 
+void FreeGlobalSSLContext() {
+    if (g_ssl_ctx) {
+        SSL_CTX_free(g_ssl_ctx);
+        g_ssl_ctx = NULL;
+    }
+}
+
 void init_openssl_global() {
     if (g_ssl_ctx) return;
     SSL_library_init(); 
     OpenSSL_add_all_algorithms(); 
     SSL_load_error_strings();
+    
     g_ssl_ctx = SSL_CTX_new(TLS_client_method());
     if (!g_ssl_ctx) return;
+
     SSL_CTX_set_min_proto_version(g_ssl_ctx, TLS1_2_VERSION);
     SSL_CTX_set_max_proto_version(g_ssl_ctx, TLS1_3_VERSION);
+
+    if (g_enableChromeCiphers) {
+        const char *chrome_ciphers = "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-RSA-AES128-SHA";
+        SSL_CTX_set_cipher_list(g_ssl_ctx, chrome_ciphers);
+        SSL_CTX_set_options(g_ssl_ctx, SSL_OP_NO_COMPRESSION | SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION);
+        SSL_CTX_set_session_cache_mode(g_ssl_ctx, SSL_SESS_CACHE_CLIENT);
+        log_msg("[Security] Chrome Cipher Suites Enabled");
+    } else {
+        log_msg("[Security] Standard OpenSSL Cipher Suites");
+    }
+
     wchar_t pemPath[MAX_PATH];
     GetModuleFileNameW(NULL, pemPath, MAX_PATH);
     wchar_t* p = wcsrchr(pemPath, L'\\'); 
@@ -817,9 +986,26 @@ void init_openssl_global() {
 
 int tls_init_connect(TLSContext *ctx) {
     ctx->ssl = SSL_new(g_ssl_ctx);
-    SSL_set_fd(ctx->ssl, ctx->sock);
+    
+    // 创建基础 Socket BIO
+    BIO *bio = BIO_new_socket(ctx->sock, BIO_NOCLOSE);
+    
+    // [抗封锁] 如果开启分片，则挂载分片过滤器 BIO
+    if (g_enableFragment) {
+        BIO *frag = BIO_new(BIO_f_fragment());
+        bio = BIO_push(frag, bio);
+    }
+    
+    SSL_set_bio(ctx->ssl, bio, bio);
+    
     const char *sni_name = (strlen(g_proxyConfig.sni) ? g_proxyConfig.sni : g_proxyConfig.host);
     SSL_set_tlsext_host_name(ctx->ssl, sni_name);
+    
+    if (g_enableALPN) {
+        unsigned char alpn_protos[] = { 8, 'h', 't', 't', 'p', '/', '1', '.', '1' };
+        SSL_set_alpn_protos(ctx->ssl, alpn_protos, sizeof(alpn_protos));
+    }
+
     return (SSL_connect(ctx->ssl) == 1) ? 0 : -1;
 }
 
@@ -949,8 +1135,19 @@ DWORD WINAPI client_handler(LPVOID p) {
     tls.sock = r;
     if (tls_init_connect(&tls) != 0) goto cl_end;
     const char* sni_val = (strlen(g_proxyConfig.sni) > 0) ? g_proxyConfig.sni : g_proxyConfig.host;
-    snprintf(ws_send_buf, BUFFER_SIZE, "GET %s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nUser-Agent: Mozilla/5.0\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", g_proxyConfig.path, sni_val);
-    tls_write(&tls, ws_send_buf, (int)strlen(ws_send_buf));
+
+    int offset = snprintf(ws_send_buf, BUFFER_SIZE, 
+        "GET %s HTTP/1.1\r\n"
+        "Host: %s\r\n"
+        "User-Agent: %s\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+        "Sec-WebSocket-Version: 13\r\n\r\n", 
+        g_proxyConfig.path, sni_val, g_userAgentStr);
+
+    tls_write(&tls, ws_send_buf, offset);
+
     int len = tls_read(&tls, ws_read_buf, BUFFER_SIZE-1);
     if (len <= 0 || !strstr(ws_read_buf, "101 Switching Protocols")) { log_msg("[WS Error] Handshake failed"); goto cl_end; }
     char auth[] = {0x05, 0x01, 0x00};
@@ -1060,6 +1257,7 @@ void StopProxyCore() {
     g_proxyRunning = FALSE;
     if (g_listen_sock != INVALID_SOCKET) { closesocket(g_listen_sock); g_listen_sock = INVALID_SOCKET; }
     if (hProxyThread) { WaitForSingleObject(hProxyThread, 2000); CloseHandle(hProxyThread); hProxyThread = NULL; }
+    FreeGlobalSSLContext();
     log_msg("Proxy Stopped");
 }
 
@@ -1073,30 +1271,100 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             if (g_hotkeyModifiers & MOD_CONTROL) hkMod |= HOTKEYF_CONTROL;
             if (g_hotkeyModifiers & MOD_ALT) hkMod |= HOTKEYF_ALT;
             SendMessage(hHotkey, HKM_SETHOTKEY, MAKEWORD(g_hotkeyVk, hkMod), 0);
+            
             CreateWindowW(L"STATIC", L"本地代理端口:", WS_CHILD|WS_VISIBLE, 20,80,150,20, hWnd, NULL,NULL,NULL);
             hPortEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", NULL, WS_CHILD|WS_VISIBLE|ES_NUMBER, 20,105,100,25, hWnd, (HMENU)ID_PORT_EDIT, NULL,NULL);
             SetDlgItemInt(hWnd, ID_PORT_EDIT, g_localPort, FALSE);
-            CreateWindowW(L"BUTTON", L"确定", WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON, 60,145,80,25, hWnd, (HMENU)IDOK, NULL,NULL);
-            CreateWindowW(L"BUTTON", L"取消", WS_CHILD|WS_VISIBLE, 160,145,80,25, hWnd, (HMENU)IDCANCEL, NULL,NULL);
+
+            CreateWindowW(L"BUTTON", L"抗封锁设置 (Anti-Censorship)", WS_CHILD|WS_VISIBLE|BS_GROUPBOX, 20, 145, 300, 270, hWnd, NULL, NULL, NULL);
+            
+            HWND hChk1 = CreateWindowW(L"BUTTON", L"启用 Chrome 浏览器指纹", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 35, 165, 250, 20, hWnd, (HMENU)ID_CHK_CIPHERS, NULL, NULL);
+            HWND hChk2 = CreateWindowW(L"BUTTON", L"启用 ALPN 伪装 (http/1.1)", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 35, 190, 250, 20, hWnd, (HMENU)ID_CHK_ALPN, NULL, NULL);
+            
+            HWND hChk3 = CreateWindowW(L"BUTTON", L"启用 TCP 分片 (Fragmentation)", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 35, 215, 250, 20, hWnd, (HMENU)ID_CHK_FRAG, NULL, NULL);
+            
+            // 分片参数输入框
+            CreateWindowW(L"STATIC", L"长度:", WS_CHILD|WS_VISIBLE, 55, 240, 40, 20, hWnd, NULL, NULL, NULL);
+            HWND hFragLen = CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER, 95, 238, 40, 22, hWnd, (HMENU)ID_EDIT_FRAG_LEN, NULL, NULL);
+            
+            CreateWindowW(L"STATIC", L"延迟(ms):", WS_CHILD|WS_VISIBLE, 150, 240, 60, 20, hWnd, NULL, NULL, NULL);
+            HWND hFragDly = CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER, 210, 238, 40, 22, hWnd, (HMENU)ID_EDIT_FRAG_DLY, NULL, NULL);
+
+            SetDlgItemInt(hWnd, ID_EDIT_FRAG_LEN, g_fragSplitSize, FALSE);
+            SetDlgItemInt(hWnd, ID_EDIT_FRAG_DLY, g_fragDelayMs, FALSE);
+
+            SendMessage(hChk1, BM_SETCHECK, g_enableChromeCiphers ? BST_CHECKED : BST_UNCHECKED, 0);
+            SendMessage(hChk2, BM_SETCHECK, g_enableALPN ? BST_CHECKED : BST_UNCHECKED, 0);
+            SendMessage(hChk3, BM_SETCHECK, g_enableFragment ? BST_CHECKED : BST_UNCHECKED, 0);
+
+            CreateWindowW(L"STATIC", L"伪装平台 (Platform):", WS_CHILD|WS_VISIBLE, 35, 275, 150, 20, hWnd, NULL,NULL,NULL);
+            HWND hCombo = CreateWindowW(L"COMBOBOX", NULL, WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL, 35, 295, 270, 200, hWnd, (HMENU)ID_COMBO_PLATFORM, NULL, NULL);
+            for(int i=0; i<5; i++) SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)UA_PLATFORMS[i]);
+            SendMessage(hCombo, CB_SETCURSEL, g_uaPlatformIndex, 0);
+
+            CreateWindowW(L"STATIC", L"User-Agent:", WS_CHILD|WS_VISIBLE, 35, 325, 100, 20, hWnd, NULL,NULL,NULL);
+            HWND hEditUA = CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_AUTOHSCROLL, 35, 345, 270, 25, hWnd, (HMENU)ID_EDIT_UA_STR, NULL, NULL);
+            SetDlgItemTextA(hWnd, ID_EDIT_UA_STR, g_userAgentStr);
+
+            CreateWindowW(L"BUTTON", L"确定", WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON, 60,425,80,30, hWnd, (HMENU)IDOK, NULL,NULL);
+            CreateWindowW(L"BUTTON", L"取消", WS_CHILD|WS_VISIBLE, 190,425,80,30, hWnd, (HMENU)IDCANCEL, NULL,NULL);
+            
             EnumChildWindows(hWnd, (WNDENUMPROC)(void*)SendMessageW, (LPARAM)hAppFont);
             SendMessage(hWnd, WM_SETFONT, (WPARAM)hAppFont, TRUE);
             break;
         case WM_COMMAND:
+            if (LOWORD(wParam) == ID_COMBO_PLATFORM && HIWORD(wParam) == CBN_SELCHANGE) {
+                int idx = SendMessage((HWND)lParam, CB_GETCURSEL, 0, 0);
+                if (idx >= 0 && idx < 5) SetDlgItemTextA(hWnd, ID_EDIT_UA_STR, UA_TEMPLATES[idx]);
+            }
             if (LOWORD(wParam) == IDOK) {
                 LRESULT res = SendMessage(hHotkey, HKM_GETHOTKEY, 0, 0);
                 UINT vk = LOBYTE(res); UINT mod = HIBYTE(res);
                 UINT newMod = 0; if (mod & HOTKEYF_SHIFT) newMod |= MOD_SHIFT;
                 if (mod & HOTKEYF_CONTROL) newMod |= MOD_CONTROL;
                 if (mod & HOTKEYF_ALT) newMod |= MOD_ALT;
+                
                 int port = GetDlgItemInt(hWnd, ID_PORT_EDIT, NULL, FALSE);
-                if (port > 0 && port < 65535 && g_localPort != port) {
-                    g_localPort = port; if(g_proxyRunning) { StopProxyCore(); StartProxyCore(); }
-                }
+                BOOL portChanged = (g_localPort != port);
+                if (port > 0 && port < 65535) g_localPort = port;
+
+                BOOL c1 = (IsDlgButtonChecked(hWnd, ID_CHK_CIPHERS) == BST_CHECKED);
+                BOOL c2 = (IsDlgButtonChecked(hWnd, ID_CHK_ALPN) == BST_CHECKED);
+                BOOL c3 = (IsDlgButtonChecked(hWnd, ID_CHK_FRAG) == BST_CHECKED);
+                
+                int fragLen = GetDlgItemInt(hWnd, ID_EDIT_FRAG_LEN, NULL, FALSE);
+                int fragDly = GetDlgItemInt(hWnd, ID_EDIT_FRAG_DLY, NULL, FALSE);
+                
+                char uaBuf[512] = {0};
+                GetDlgItemTextA(hWnd, ID_EDIT_UA_STR, uaBuf, 511);
+                int pIdx = SendMessage(GetDlgItem(hWnd, ID_COMBO_PLATFORM), CB_GETCURSEL, 0, 0);
+
+                BOOL securityChanged = (c1 != g_enableChromeCiphers || c2 != g_enableALPN || c3 != g_enableFragment || 
+                                        fragLen != g_fragSplitSize || fragDly != g_fragDelayMs ||
+                                        strcmp(uaBuf, g_userAgentStr)!=0);
+                
+                g_enableChromeCiphers = c1;
+                g_enableALPN = c2;
+                g_enableFragment = c3;
+                g_fragSplitSize = fragLen > 0 ? fragLen : 1;
+                g_fragDelayMs = fragDly >= 0 ? fragDly : 0;
+                
+                g_uaPlatformIndex = pIdx;
+                strcpy(g_userAgentStr, uaBuf);
+
                 if (vk != 0 && newMod != 0) {
                     UnregisterHotKey(hwnd, ID_GLOBAL_HOTKEY);
                     if (RegisterHotKey(hwnd, ID_GLOBAL_HOTKEY, newMod, vk)) { g_hotkeyVk = vk; g_hotkeyModifiers = newMod; }
                 }
-                SaveSettings(); DestroyWindow(hWnd);
+                
+                SaveSettings(); 
+                
+                if ((portChanged || securityChanged) && g_proxyRunning) {
+                    StopProxyCore(); 
+                    StartProxyCore(); 
+                }
+
+                DestroyWindow(hWnd);
             } else if (LOWORD(wParam) == IDCANCEL) DestroyWindow(hWnd);
             break;
         case WM_CLOSE: DestroyWindow(hWnd); break;
@@ -1107,9 +1375,13 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 void OpenSettingsWindow() {
     WNDCLASSW wc = {0}; wc.lpfnWndProc=SettingsWndProc; wc.hInstance=GetModuleHandle(NULL); wc.lpszClassName=L"Settings"; wc.hbrBackground=(HBRUSH)(COLOR_BTNFACE+1);
     WNDCLASSW temp; if (!GetClassInfoW(GetModuleHandle(NULL), L"Settings", &temp)) RegisterClassW(&wc);
-    HWND h = CreateWindowW(L"Settings", L"程序设置", WS_VISIBLE|WS_CAPTION|WS_SYSMENU, CW_USEDEFAULT,0,300,220, hwnd,NULL,wc.hInstance,NULL);
+    // 增加高度到 500
+    HWND h = CreateWindowW(L"Settings", L"程序设置", WS_VISIBLE|WS_CAPTION|WS_SYSMENU, CW_USEDEFAULT,0,350,500, hwnd,NULL,wc.hInstance,NULL);
     ShowWindow(h, SW_SHOW);
 }
+
+// ... (LRESULT CALLBACK ListBox_Proc 及之后代码完全不变，保持原样即可) ...
+// 为了确保完整性，以下是剩余代码，与之前版本一致，无需变动
 
 LRESULT CALLBACK ListBox_Proc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == WM_KEYDOWN) {
