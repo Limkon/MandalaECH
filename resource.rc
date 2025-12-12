@@ -15,8 +15,8 @@ BEGIN
         /* 080404b0 = Chinese Simplified, Unicode */
         BLOCK "080404b0" 
         BEGIN
-            VALUE "ProductName", "LimboxÕ–≈Ã≥Ã–Ú\0"
-            VALUE "FileDescription", "Limbox Õ–≈Ã≥Ã–Ú \0"
+            VALUE "ProductName", "Limbox\0"
+            VALUE "FileDescription", "Limbox  \0"
             VALUE "InternalName", "Limbox.exe\0"
             VALUE "LegalCopyright", "Copyright (C) 2025\0"
             VALUE "OriginalFilename", "Limbox.exe\0"
@@ -28,4 +28,5 @@ BEGIN
     BEGIN
         VALUE "Translation", 0x804, 1200 
     END
+
 END
