@@ -1,0 +1,44 @@
+name: Windows Manual Build
+
+# 这里配置为手动触发
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup MSYS2
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: MINGW64
+        install: >-
+          mingw-w64-x86_64-gcc
+          mingw-w64-x86_64-openssl
+          mingw-w64-x86_64-make
+        update: true
+
+    - name: Compile Resources
+      shell: msys2 {0}
+      run: |
+        # 对应本地的 "编译图标和版本.bat"
+        windres -i resource.rc -o resource.res --target=pe-x86-64 -O coff
+
+    - name: Compile Executable
+      shell: msys2 {0}
+      run: |
+        # 对应本地的 "run.bat"，已适配 GitHub 环境路径
+        # 使用 MSYS2 环境的标准库 (-lssl -lcrypto) 替代本地绝对路径
+        gcc main.c resource.res -o limbox.exe \
+          -lssl -lcrypto -lws2_32 -lgdi32 -lcomctl32 -lwininet -lcrypt32 -luser32 \
+          -mwindows -municode -finput-charset=UTF-8 -static
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: limbox-executable
+        path: limbox.exe
