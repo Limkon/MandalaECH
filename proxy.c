@@ -2,7 +2,7 @@
 #include "crypto.h"
 #include "utils.h"
 
-// [优化] 增大缓冲区以支持高速下载和稳定连接
+// 缓冲区保持 64KB 以应对下载
 #define PROXY_BUF_SIZE 65536 
 
 int recv_timeout(SOCKET s, char *buf, int len, int timeout_sec) {
@@ -28,19 +28,19 @@ int send_all(SOCKET s, const char *buf, int len) {
 }
 
 DWORD WINAPI client_handler(LPVOID p) {
-    SOCKET c = (SOCKET)(UINT_PTR)p; TLSContext tls; memset(&tls, 0, sizeof(tls));
+    SOCKET c = (SOCKET)(UINT_PTR)p; 
+    TLSContext tls; memset(&tls, 0, sizeof(tls));
     SOCKET r = INVALID_SOCKET;      
     
-    // [优化] 使用更大的缓冲区
     char *c_buf = (char*)malloc(PROXY_BUF_SIZE); 
     char *ws_read_buf = (char*)malloc(PROXY_BUF_SIZE); 
-    char *ws_send_buf = (char*)malloc(PROXY_BUF_SIZE + 128); // 额外空间留给 WS 头
+    char *ws_send_buf = (char*)malloc(PROXY_BUF_SIZE + 128);
 
     if (!c_buf || !ws_read_buf || !ws_send_buf) { goto cl_end; }
     int ws_buf_len = 0; int flag = 1; 
     setsockopt(c, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
     
-    // 读取浏览器请求
+    // 1. 读取浏览器请求 (Connect or Get)
     int browser_len = recv_timeout(c, c_buf, PROXY_BUF_SIZE, 10);
     if (browser_len <= 0) goto cl_end;
     c_buf[browser_len] = 0;
@@ -60,17 +60,52 @@ DWORD WINAPI client_handler(LPVOID p) {
     struct hostent *h = gethostbyname(g_proxyConfig.host);
     if(!h) { log_msg("[DNS] Fail"); goto cl_end; }
     
-    r = socket(AF_INET, SOCK_STREAM, 0);
-    if (r == INVALID_SOCKET) goto cl_end;
-    setsockopt(r, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
+    // --- 智能重试循环 (Smart Retry Loop) ---
+    // 默认尝试 1 次。如果开启了分片功能，允许最多 2 次尝试。
+    // 第 1 次：温和模式 (Config)
+    // 第 2 次：强力模式 (Aggressive)
+    int max_retries = g_enableFragment ? 2 : 1;
+    int connect_success = 0;
+
+    for (int try_count = 0; try_count < max_retries; try_count++) {
+        // 创建新 Socket
+        r = socket(AF_INET, SOCK_STREAM, 0);
+        if (r == INVALID_SOCKET) break;
+        setsockopt(r, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
+        
+        struct sockaddr_in a; memset(&a, 0, sizeof(a)); a.sin_family = AF_INET; a.sin_port = htons((unsigned short)g_proxyConfig.port);
+        a.sin_addr = *(struct in_addr*)h->h_addr;
+        
+        // TCP 连接
+        if (connect(r, (struct sockaddr*)&a, sizeof(a)) != 0) { 
+            // 如果 TCP 都连不上，通常是 IP 被封或网络问题，重试分片没意义
+            log_wsa_error("TCP Connect"); 
+            closesocket(r); r = INVALID_SOCKET;
+            break; 
+        }
+        
+        tls.sock = r;
+        
+        // TLS 握手 (传入当前的重试次数作为 mode)
+        // try_count 0 = 温和, try_count 1 = 强力
+        if (tls_init_connect(&tls, try_count) == 0) {
+            connect_success = 1;
+            break; // 握手成功，跳出循环
+        } else {
+            // 握手失败
+            log_msg("[TLS] Handshake failed (Mode %d). Retrying...", try_count);
+            tls_close(&tls);
+            closesocket(r); r = INVALID_SOCKET;
+            // 继续下一次循环
+        }
+    }
+
+    if (!connect_success) {
+        log_msg("[Error] All connection attempts failed.");
+        goto cl_end;
+    }
     
-    struct sockaddr_in a; memset(&a, 0, sizeof(a)); a.sin_family = AF_INET; a.sin_port = htons((unsigned short)g_proxyConfig.port);
-    a.sin_addr = *(struct in_addr*)h->h_addr;
-    
-    if (connect(r, (struct sockaddr*)&a, sizeof(a)) != 0) { log_wsa_error("TCP Connect"); goto cl_end; }
-    tls.sock = r;
-    
-    if (tls_init_connect(&tls) != 0) goto cl_end;
+    // --- 连接建立成功，后续逻辑保持不变 ---
     
     const char* sni_val = (strlen(g_proxyConfig.sni) > 0) ? g_proxyConfig.sni : g_proxyConfig.host;
 
