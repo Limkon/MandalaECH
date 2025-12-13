@@ -4,16 +4,16 @@
 
 // ---------------------- BIO Fragmentation Implementation ----------------------
 
-// 定义 BIO 控制命令
+// 定义 BIO 控制命令，用于传递分片参数
 #define BIO_C_SET_FRAG_CONFIG 101
 
-// 分片配置结构体
+// 分片配置上下文结构体
 typedef struct {
-    int max_splits;    // 最大分片次数
-    int min_size;      // 最小包大小
-    int max_size;      // 最大包大小
-    int delay_ms;      // 延时
-    int first_packet_sent; // 状态标记
+    int max_splits;        // 最大分片次数 (超过此次数后不再分片)
+    int min_size;          // 最小包大小
+    int max_size;          // 最大包大小
+    int delay_ms;          // 延时 (毫秒)
+    int first_packet_sent; // 状态标记：是否是第一个包 (ClientHello)
 } FragCtx;
 
 static int frag_write(BIO *b, const char *in, int inl);
@@ -39,12 +39,14 @@ BIO_METHOD *BIO_f_fragment(void) {
 static int frag_new(BIO *b) {
     FragCtx *ctx = (FragCtx *)malloc(sizeof(FragCtx));
     if(!ctx) return 0;
-    // 默认初始化 (防止未配置时崩溃)
+    
+    // 初始化默认值 (防止未配置时出错)
     ctx->first_packet_sent = 0;
     ctx->max_splits = 7;
     ctx->min_size = 1;
     ctx->max_size = 20;
     ctx->delay_ms = 1;
+    
     BIO_set_data(b, ctx);
     BIO_set_init(b, 1);
     return 1;
@@ -57,13 +59,13 @@ static int frag_free(BIO *b) {
     return 1;
 }
 
-// [核心逻辑] 根据 Context 中的配置进行分片
+// [核心逻辑] 根据 Context 中的配置执行分片写入
 static int frag_write(BIO *b, const char *in, int inl) {
     FragCtx *ctx = (FragCtx *)BIO_get_data(b);
     BIO *next = BIO_next(b);
     if (!ctx || !next) return 0;
 
-    // 仅针对握手阶段 (TLS ClientHello)
+    // 仅针对 TLS 握手阶段的第一个包 (ClientHello) 进行分片处理
     if (inl > 0 && ctx->first_packet_sent == 0) {
         ctx->first_packet_sent = 1; 
 
@@ -72,23 +74,27 @@ static int frag_write(BIO *b, const char *in, int inl) {
         int split_count = 0;
 
         while (remaining > 0) {
-            // 达到最大切分次数后，剩余数据一次性发送
+            // 策略：达到最大切分次数后，停止分片，剩余数据一次性发送
+            // 这既能打乱 SNI 特征，又能防止产生过多小包导致连接不稳定
             if (split_count >= ctx->max_splits) {
                 int ret = BIO_write(next, in + bytes_sent, remaining);
                 if (ret <= 0) return (bytes_sent > 0 ? bytes_sent : ret);
                 bytes_sent += ret;
-                break; // 完成
+                break; // 完成发送
             }
 
-            // 动态计算包大小
+            // 动态计算本次包大小
             int chunk_size;
             int range = ctx->max_size - ctx->min_size;
             if (range < 0) range = 0;
             
             chunk_size = ctx->min_size + (range > 0 ? (rand() % (range + 1)) : 0);
+            
+            // 边界检查
             if (chunk_size < 1) chunk_size = 1;
             if (chunk_size > remaining) chunk_size = remaining;
 
+            // 执行底层写入
             int ret = BIO_write(next, in + bytes_sent, chunk_size);
             if (ret <= 0) return (bytes_sent > 0 ? bytes_sent : ret);
 
@@ -96,8 +102,7 @@ static int frag_write(BIO *b, const char *in, int inl) {
             remaining -= ret;
             split_count++;
 
-            // 延时策略：仅在前几次且有剩余数据时延时
-            // 对于强力模式，我们允许更多次的延时
+            // 延时策略：仅在还有剩余数据时延时
             if (remaining > 0 && ctx->delay_ms > 0) {
                  Sleep(rand() % (ctx->delay_ms + 1));
             }
@@ -105,6 +110,7 @@ static int frag_write(BIO *b, const char *in, int inl) {
         return bytes_sent;
     }
     
+    // 握手完成后的普通数据，直接透传，不影响速度
     return BIO_write(next, in, inl);
 }
 
@@ -118,7 +124,7 @@ static long frag_ctrl(BIO *b, int cmd, long num, void *ptr) {
     BIO *next = BIO_next(b);
     if (!next) return 0;
     
-    // 处理自定义配置命令
+    // 处理自定义配置命令：设置分片参数
     if (cmd == BIO_C_SET_FRAG_CONFIG) {
         FragCtx *ctx = (FragCtx *)BIO_get_data(b);
         FragCtx *new_cfg = (FragCtx *)ptr;
@@ -137,14 +143,21 @@ static long frag_ctrl(BIO *b, int cmd, long num, void *ptr) {
 // ---------------------- End BIO Implementation ----------------------
 
 void FreeGlobalSSLContext() {
-    if (g_ssl_ctx) { SSL_CTX_free(g_ssl_ctx); g_ssl_ctx = NULL; }
+    if (g_ssl_ctx) {
+        SSL_CTX_free(g_ssl_ctx);
+        g_ssl_ctx = NULL;
+    }
 }
 
 void init_openssl_global() {
     if (g_ssl_ctx) return;
-    SSL_library_init(); OpenSSL_add_all_algorithms(); SSL_load_error_strings();
+    SSL_library_init(); 
+    OpenSSL_add_all_algorithms(); 
+    SSL_load_error_strings();
+    
     g_ssl_ctx = SSL_CTX_new(TLS_client_method());
     if (!g_ssl_ctx) return;
+
     SSL_CTX_set_min_proto_version(g_ssl_ctx, TLS1_2_VERSION);
     SSL_CTX_set_max_proto_version(g_ssl_ctx, TLS1_3_VERSION);
 
@@ -157,47 +170,102 @@ void init_openssl_global() {
     } else {
         log_msg("[Security] Standard OpenSSL Cipher Suites");
     }
-    // (省略 CA 加载代码，保持原样即可)
-    SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, NULL); 
+
+    HRSRC hRes = FindResourceW(NULL, MAKEINTRESOURCEW(2), RT_RCDATA);
+    if (hRes) {
+        HGLOBAL hData = LoadResource(NULL, hRes);
+        void* pData = LockResource(hData);
+        DWORD dataSize = SizeofResource(NULL, hRes);
+        if (pData && dataSize > 0) {
+            BIO *cbio = BIO_new_mem_buf(pData, dataSize);
+            if (cbio) {
+                X509_STORE *cts = SSL_CTX_get_cert_store(g_ssl_ctx);
+                X509 *x = NULL;
+                int count = 0;
+                while ((x = PEM_read_bio_X509(cbio, NULL, 0, NULL)) != NULL) {
+                    if (X509_STORE_add_cert(cts, x)) count++;
+                    X509_free(x);
+                }
+                BIO_free(cbio);
+                if (count > 0) {
+                    SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_PEER, NULL);
+                    log_msg("[Security] Embedded CA loaded (%d certs). Strict mode.", count);
+                } else {
+                    SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, NULL);
+                    log_msg("[Warning] Embedded CA data invalid. Insecure mode.");
+                }
+            } else {
+                SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, NULL);
+                log_msg("[Warning] Failed to create BIO for CA. Insecure mode.");
+            }
+        } else {
+            SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, NULL);
+            log_msg("[Warning] Empty CA resource. Insecure mode.");
+        }
+    } else {
+        SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, NULL);
+        log_msg("[Warning] cacert.pem resource not found in exe. Insecure mode.");
+    }
 }
 
-// [修改] 支持 mode 参数
-// mode 0: 使用 set.ini 中的配置 (温和)
-// mode 1: 强制使用强力配置 (智能重试)
+// [修改] 支持 mode 参数的智能连接初始化
+// mode 0: 温和模式 (基于 set.ini)
+// mode 1: 强力模式 (自动重试，更强的混淆)
 int tls_init_connect(TLSContext *ctx, int mode) {
     ctx->ssl = SSL_new(g_ssl_ctx);
     
+    // --- Padding 逻辑 (限制最大块大小以防 MTU 溢出) ---
     if (g_enablePadding) {
         int range = g_padSizeMax - g_padSizeMin;
         if (range < 0) range = 0;
+        
         int blockSize = g_padSizeMin + (range > 0 ? (rand() % (range + 1)) : 0);
+        
+        // 强制限制最大 Padding，防止 IP 分片导致握手失败
         if (blockSize > 200) blockSize = 200; 
-        if (blockSize > 0) SSL_set_block_padding(ctx->ssl, blockSize);
+
+        if (blockSize > 0) {
+            SSL_set_block_padding(ctx->ssl, blockSize);
+        }
     }
 
     BIO *bio = BIO_new_socket(ctx->sock, BIO_NOCLOSE);
     
+    // --- 分片逻辑 ---
     if (g_enableFragment) {
         BIO *frag = BIO_new(BIO_f_fragment());
         
-        // 配置分片参数
+        // 配置结构体
         FragCtx cfg;
+        
         if (mode == 0) {
-            // Mode 0: 温和策略 (日常使用，稳定)
-            cfg.max_splits = 7;           // 切 7 刀
-            cfg.min_size = g_fragSizeMin; // 读取配置
+            // Mode 0: 默认温和模式 (听从 set.ini，速度优先)
+            // 限制切分次数为 7，通常足够覆盖 SNI
+            cfg.max_splits = 7;           
+            cfg.min_size = g_fragSizeMin; 
             cfg.max_size = g_fragSizeMax;
-            cfg.delay_ms = g_fragDelayMs; // 读取配置 (通常 1-2ms)
+            cfg.delay_ms = g_fragDelayMs; 
         } else {
-            // Mode 1: 强力策略 (突破封锁，仅在重试时使用)
-            cfg.max_splits = 40;          // 切 40 刀，足够碎
-            cfg.min_size = 1;             // 极小包
-            cfg.max_size = 3;             // 1-3 字节
-            cfg.delay_ms = 3;             // 稍微增加延时确保乱序效果
-            log_msg("[Smart-Frag] Applying Aggressive Strategy!");
+            // Mode 1: 智能强力模式 (突破封锁优先)
+            
+            // 1. 切分次数大幅增加，确保即使是大包也能被切碎
+            cfg.max_splits = 40;          
+            
+            // 2. 强制使用极小包 (1-3字节)，无视 set.ini 设定
+            cfg.min_size = 1;             
+            cfg.max_size = 3;             
+            
+            // 3. 智能延时增强：确保延时至少为 3ms，或者比用户设定值更大
+            int base_delay = g_fragDelayMs;
+            if (base_delay < 3) base_delay = 3; 
+            else base_delay += 2;
+            
+            cfg.delay_ms = base_delay;
+            
+            log_msg("[Smart-Frag] Retry with Aggressive Mode: delay=%dms, splits=%d", cfg.delay_ms, cfg.max_splits);
         }
         
-        // 发送配置给 BIO
+        // 将配置应用到 BIO
         BIO_ctrl(frag, BIO_C_SET_FRAG_CONFIG, 0, &cfg);
         
         bio = BIO_push(frag, bio);
@@ -216,7 +284,6 @@ int tls_init_connect(TLSContext *ctx, int mode) {
     return (SSL_connect(ctx->ssl) == 1) ? 0 : -1;
 }
 
-// (其余 tls_write, tls_read 等函数保持原样)
 int tls_write(TLSContext *ctx, const char *data, int len) {
     if (!ctx->ssl) return -1;
     int written = 0;
