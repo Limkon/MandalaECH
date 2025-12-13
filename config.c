@@ -2,72 +2,22 @@
 #include "utils.h"
 #include "proxy.h" 
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 // --- 全局变量声明 ---
-// 注意：g_localPort, g_iniFilePath 等变量定义在 globals.c 中
-// 这里只定义新增的订阅相关变量
 Subscription g_subs[MAX_SUBS];
 int g_subCount = 0;
 
-// 辅助：清空所有节点
-void ClearAllNodes() {
-    char* buffer = NULL; long size = 0;
-    if (!ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) return;
-    
-    cJSON* root = cJSON_Parse(buffer); free(buffer);
-    if (!root) return;
+// --- 内部辅助函数声明 ---
+// 核心函数：解析文本并将生成的节点直接添加到内存中的 JSON 数组
+int Internal_BatchAddNodesFromText(const char* text, cJSON* outbounds);
+// 核心函数：为新节点生成唯一 Tag
+char* GetUniqueTagName(cJSON* outbounds, const char* type, const char* base_name);
 
-    cJSON_DeleteItemFromObject(root, "outbounds");
-    cJSON_AddItemToObject(root, "outbounds", cJSON_CreateArray());
-    
-    char* out = cJSON_Print(root);
-    WriteBufferToFile(CONFIG_FILE, out);
-    free(out); cJSON_Delete(root);
-}
-
-// 辅助：解析单个订阅数据
-int ParseAndAppendSubscriptionData(const char* data) {
-    if (!data) return 0;
-    
-    size_t decLen = 0;
-    unsigned char* decoded = Base64Decode(data, &decLen);
-    
-    char* sourceText = NULL;
-    if (decoded && decLen > 0) {
-        sourceText = (char*)decoded;
-    } else {
-        sourceText = strdup(data); 
-        if (decoded) free(decoded);
-    }
-    
-    if (!sourceText) return 0;
-
-    int count = 0;
-    char* context = NULL;
-    char* line = strtok_s(sourceText, "\r\n ", &context);
-    while (line) {
-        TrimString(line);
-        if (strlen(line) > 0) {
-            cJSON* node = NULL;
-            if (_strnicmp(line, "vmess://", 8) == 0) node = ParseVmess(line);
-            else if (_strnicmp(line, "ss://", 5) == 0) node = ParseShadowsocks(line);
-            else if (_strnicmp(line, "vless://", 8) == 0) node = ParseVlessOrTrojan(line);
-            else if (_strnicmp(line, "trojan://", 9) == 0) node = ParseVlessOrTrojan(line);
-            else if (_strnicmp(line, "socks://", 8) == 0) node = ParseSocks(line);
-            
-            if (node) {
-                if (AddNodeToConfig(node)) count++;
-                else cJSON_Delete(node);
-            }
-        }
-        line = strtok_s(NULL, "\r\n ", &context);
-    }
-    free(sourceText);
-    return count;
-}
+// --- 配置文件基础操作 ---
 
 void LoadSettings() {
-    // 读取原有配置
     g_hotkeyModifiers = GetPrivateProfileIntW(L"Settings", L"Modifiers", MOD_CONTROL | MOD_ALT, g_iniFilePath);
     g_hotkeyVk = GetPrivateProfileIntW(L"Settings", L"VK", 'H', g_iniFilePath);
     g_localPort = GetPrivateProfileIntW(L"Settings", L"LocalPort", 10809, g_iniFilePath);
@@ -85,6 +35,7 @@ void LoadSettings() {
     g_padSizeMin = GetPrivateProfileIntW(L"Settings", L"PadMin", 100, g_iniFilePath);
     g_padSizeMax = GetPrivateProfileIntW(L"Settings", L"PadMax", 500, g_iniFilePath);
 
+    // 边界检查
     if (g_fragSizeMin < 1) g_fragSizeMin = 1;
     if (g_fragSizeMax < g_fragSizeMin) g_fragSizeMax = g_fragSizeMin;
     if (g_fragDelayMs < 0) g_fragDelayMs = 0;
@@ -155,11 +106,8 @@ void SaveSettings() {
     MultiByteToWideChar(CP_UTF8, 0, g_userAgentStr, -1, wUABuf, 512);
     WritePrivateProfileStringW(L"Settings", L"UserAgent", wUABuf, g_iniFilePath);
 
-    // --- [修复] 保存订阅列表 ---
-    // 1. 先清空整个 [Subscriptions] Section，防止残留旧的、被删除的 key
-    WritePrivateProfileStringW(L"Subscriptions", NULL, NULL, g_iniFilePath);
-
-    // 2. 重新写入所有数据
+    // 保存订阅列表
+    WritePrivateProfileStringW(L"Subscriptions", NULL, NULL, g_iniFilePath); // 清空 Section
     wsprintfW(buffer, L"%d", g_subCount);
     WritePrivateProfileStringW(L"Subscriptions", L"Count", buffer, g_iniFilePath);
     
@@ -196,6 +144,8 @@ BOOL IsAutorun() {
     return FALSE;
 }
 
+// --- 节点 Tag 管理 ---
+
 void ParseTags() {
     if (nodeTags) { for(int i=0; i<nodeCount; i++) free(nodeTags[i]); free(nodeTags); }
     nodeCount = 0; nodeTags = NULL;
@@ -217,6 +167,36 @@ void ParseTags() {
     }
     cJSON_Delete(root);
 }
+
+// 生成唯一 Tag (辅助函数)
+char* GetUniqueTagName(cJSON* outbounds, const char* type, const char* base_name) {
+    static char final_tag[512];
+    char candidate[450];
+    const char* safe_name = (base_name && strlen(base_name) > 0) ? base_name : "Unnamed";
+    char prefix[64]; snprintf(prefix, sizeof(prefix), "%s-", type);
+    
+    // 如果名字已经包含了类型前缀，就不再重复添加
+    if (_strnicmp(safe_name, prefix, strlen(prefix)) == 0) snprintf(candidate, sizeof(candidate), "%s", safe_name);
+    else snprintf(candidate, sizeof(candidate), "%s-%s", type, safe_name);
+    
+    int index = 0;
+    while (1) {
+        if (index == 0) snprintf(final_tag, sizeof(final_tag), "%s", candidate);
+        else snprintf(final_tag, sizeof(final_tag), "%s (%d)", candidate, index);
+        
+        BOOL exists = FALSE;
+        cJSON* item = NULL;
+        cJSON_ArrayForEach(item, outbounds) {
+            cJSON* t = cJSON_GetObjectItem(item, "tag");
+            if (t && t->valuestring && strcmp(t->valuestring, final_tag) == 0) { exists = TRUE; break; }
+        }
+        if (!exists) break;
+        index++;
+    }
+    return final_tag;
+}
+
+// --- 节点切换与配置 ---
 
 void ParseNodeConfigToGlobal(cJSON *node) {
     if (!node) return;
@@ -305,50 +285,214 @@ void DeleteNode(const wchar_t* tag) {
     ParseTags(); 
 }
 
-char* GetUniqueTagName(cJSON* outbounds, const char* type, const char* base_name) {
-    static char final_tag[512];
-    char candidate[450];
-    const char* safe_name = (base_name && strlen(base_name) > 0) ? base_name : "Unnamed";
-    char prefix[64]; snprintf(prefix, sizeof(prefix), "%s-", type);
-    if (_strnicmp(safe_name, prefix, strlen(prefix)) == 0) snprintf(candidate, sizeof(candidate), "%s", safe_name);
-    else snprintf(candidate, sizeof(candidate), "%s-%s", type, safe_name);
-    int index = 0;
-    while (1) {
-        if (index == 0) snprintf(final_tag, sizeof(final_tag), "%s", candidate);
-        else snprintf(final_tag, sizeof(final_tag), "%s (%d)", candidate, index);
-        BOOL exists = FALSE;
-        cJSON* item = NULL;
-        cJSON_ArrayForEach(item, outbounds) {
-            cJSON* t = cJSON_GetObjectItem(item, "tag");
-            if (t && t->valuestring && strcmp(t->valuestring, final_tag) == 0) { exists = TRUE; break; }
-        }
-        if (!exists) break;
-        index++;
-    }
-    return final_tag;
-}
-
+// --- 单个节点添加 (现在调用内部批量函数，虽然只加一个，但复用了逻辑) ---
 BOOL AddNodeToConfig(cJSON* newNode) {
     if (!newNode) return FALSE;
     char* buffer = NULL; long size = 0; cJSON* root = NULL;
+    
+    // 读取
     if (ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) { root = cJSON_Parse(buffer); free(buffer); }
     if (!root) { root = cJSON_CreateObject(); cJSON_AddItemToObject(root, "outbounds", cJSON_CreateArray()); }
+    
     cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
     if (!outbounds) { outbounds = cJSON_CreateArray(); cJSON_AddItemToObject(root, "outbounds", outbounds); }
+    
+    // 处理 Tag 唯一性
     cJSON* jsonType = cJSON_GetObjectItem(newNode, "type");
     const char* typeStr = (jsonType && jsonType->valuestring) ? jsonType->valuestring : "proxy";
     cJSON* jsonTag = cJSON_GetObjectItem(newNode, "tag");
     const char* originalTag = (jsonTag && jsonTag->valuestring) ? jsonTag->valuestring : "NewNode";
     char* uniqueTag = GetUniqueTagName(outbounds, typeStr, originalTag);
+    
     if (cJSON_HasObjectItem(newNode, "tag")) cJSON_ReplaceItemInObject(newNode, "tag", cJSON_CreateString(uniqueTag));
     else cJSON_AddStringToObject(newNode, "tag", uniqueTag);
+    
+    // 添加
     cJSON_AddItemToArray(outbounds, newNode);
+    
+    // 写入
     char* out = cJSON_Print(root);
     BOOL ret = WriteBufferToFile(CONFIG_FILE, out);
     free(out); cJSON_Delete(root);
     return ret;
 }
 
+// --- 批量导入核心逻辑 (内存操作，无 IO) ---
+// 返回值：添加成功的节点数量
+int Internal_BatchAddNodesFromText(const char* text, cJSON* outbounds) {
+    if (!text || !outbounds) return 0;
+    
+    int count = 0;
+    // 尝试 Base64 解码，因为订阅链接内容通常是 Base64 编码的
+    size_t decLen = 0;
+    unsigned char* decoded = Base64Decode(text, &decLen);
+    
+    char* sourceText = NULL;
+    if (decoded && decLen > 0) {
+        sourceText = (char*)decoded;
+    } else {
+        sourceText = strdup(text); 
+        if (decoded) free(decoded);
+    }
+    
+    if (!sourceText) return 0;
+
+    char* context = NULL;
+    // 使用统一的分隔符：换行、空格、逗号
+    char* line = strtok_s(sourceText, "\r\n ,", &context);
+    while (line) {
+        TrimString(line);
+        if (strlen(line) > 0) {
+            cJSON* node = NULL;
+            // 根据前缀判断协议
+            if (_strnicmp(line, "vmess://", 8) == 0) node = ParseVmess(line);
+            else if (_strnicmp(line, "ss://", 5) == 0) node = ParseShadowsocks(line);
+            else if (_strnicmp(line, "vless://", 8) == 0) node = ParseVlessOrTrojan(line);
+            else if (_strnicmp(line, "trojan://", 9) == 0) node = ParseVlessOrTrojan(line);
+            else if (_strnicmp(line, "socks://", 8) == 0) node = ParseSocks(line);
+            
+            if (node) {
+                // 处理 Tag 唯一性
+                cJSON* jsonType = cJSON_GetObjectItem(node, "type");
+                const char* typeStr = (jsonType && jsonType->valuestring) ? jsonType->valuestring : "proxy";
+                cJSON* jsonTag = cJSON_GetObjectItem(node, "tag");
+                const char* originalTag = (jsonTag && jsonTag->valuestring) ? jsonTag->valuestring : "Auto";
+                
+                char* uniqueTag = GetUniqueTagName(outbounds, typeStr, originalTag);
+                
+                if (cJSON_HasObjectItem(node, "tag")) cJSON_ReplaceItemInObject(node, "tag", cJSON_CreateString(uniqueTag));
+                else cJSON_AddStringToObject(node, "tag", uniqueTag);
+
+                cJSON_AddItemToArray(outbounds, node);
+                count++;
+            }
+        }
+        line = strtok_s(NULL, "\r\n ,", &context);
+    }
+    free(sourceText);
+    return count;
+}
+
+// --- 外部接口：从剪贴板导入 (重构后使用批量逻辑) ---
+int ImportFromClipboard() {
+    char* text = GetClipboardText(); 
+    if (!text) return 0;
+
+    // 1. 读取当前配置
+    char* buffer = NULL; long size = 0; cJSON* root = NULL;
+    if (ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) { root = cJSON_Parse(buffer); free(buffer); }
+    if (!root) { root = cJSON_CreateObject(); cJSON_AddItemToObject(root, "outbounds", cJSON_CreateArray()); }
+    
+    cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
+    if (!outbounds) { outbounds = cJSON_CreateArray(); cJSON_AddItemToObject(root, "outbounds", outbounds); }
+
+    // 2. 批量处理内存数据
+    int successCount = Internal_BatchAddNodesFromText(text, outbounds);
+
+    // 3. 一次性写入
+    if (successCount > 0) {
+        char* out = cJSON_Print(root);
+        WriteBufferToFile(CONFIG_FILE, out);
+        free(out);
+        ParseTags(); // 刷新全局 Tag 列表
+    }
+    
+    cJSON_Delete(root);
+    free(text);
+    return successCount;
+}
+
+// --- 外部接口：更新所有订阅 (重构后解决 IO 性能问题) ---
+int UpdateAllSubscriptions(BOOL forceMsg) {
+    int activeSubs = 0;
+    for(int i=0; i<g_subCount; i++) {
+        if(g_subs[i].enabled && strlen(g_subs[i].url) > 4) activeSubs++;
+    }
+
+    if (activeSubs == 0) {
+        if (forceMsg) log_msg("[Sub] No active subscriptions found.");
+        return 0;
+    }
+
+    log_msg("[Sub] Starting update for %d subscriptions...", activeSubs);
+
+    // 1. 下载所有订阅内容 (IO 操作，网络)
+    // 为了避免下载时间过长阻塞 UI，实际生产环境建议用线程，这里先保持同步但优化逻辑
+    char* rawData[MAX_SUBS] = {0};
+    int downloadSuccess = 0;
+
+    for (int i = 0; i < g_subCount; i++) {
+        if (g_subs[i].enabled && strlen(g_subs[i].url) > 4) {
+            log_msg("[Sub] Downloading (%d/%d): %s", i+1, g_subCount, g_subs[i].url);
+            char* data = Utils_HttpGet(g_subs[i].url);
+            if (data) {
+                rawData[i] = data;
+                downloadSuccess++;
+            } else {
+                log_msg("[Sub] Download failed: %s", g_subs[i].url);
+            }
+        }
+    }
+
+    if (downloadSuccess == 0) {
+        log_msg("[Error] All downloads failed. Config not updated.");
+        return 0;
+    }
+
+    // 2. 准备配置文件 (IO 操作，文件读取 - 仅一次)
+    char* buffer = NULL; long size = 0; cJSON* root = NULL;
+    if (ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) { root = cJSON_Parse(buffer); free(buffer); }
+    if (!root) { root = cJSON_CreateObject(); }
+
+    // 3. 清空旧节点 (按照原逻辑，更新订阅会覆盖旧节点)
+    // 注意：如果想保留手动添加的节点，逻辑会复杂很多，这里暂时保持“更新即重置”的原有逻辑
+    if (cJSON_HasObjectItem(root, "outbounds")) {
+        cJSON_DeleteItemFromObject(root, "outbounds");
+    }
+    cJSON* outbounds = cJSON_CreateArray();
+    cJSON_AddItemToObject(root, "outbounds", outbounds);
+
+    // 4. 批量添加节点 (内存操作)
+    int totalNewNodes = 0;
+    for (int i = 0; i < g_subCount; i++) {
+        if (rawData[i]) {
+            int count = Internal_BatchAddNodesFromText(rawData[i], outbounds);
+            totalNewNodes += count;
+            free(rawData[i]); // 释放下载的文本
+            rawData[i] = NULL;
+        }
+    }
+
+    // 5. 保存文件 (IO 操作，文件写入 - 仅一次)
+    log_msg("[Sub] Total nodes parsed: %d. Saving config...", totalNewNodes);
+    char* out = cJSON_Print(root);
+    WriteBufferToFile(CONFIG_FILE, out);
+    free(out);
+    cJSON_Delete(root);
+
+    // 6. 刷新界面用的 Tag 列表
+    ParseTags();
+    
+    log_msg("[Sub] Update complete.");
+    return totalNewNodes;
+}
+
+void ToggleTrayIcon() {
+    if (g_isIconVisible) { 
+        Shell_NotifyIconW(NIM_DELETE, &nid); 
+        g_isIconVisible = FALSE; 
+        g_hideTrayStart = 1;
+    }
+    else { 
+        nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+        Shell_NotifyIconW(NIM_ADD, &nid); 
+        g_isIconVisible = TRUE; 
+        g_hideTrayStart = 0;
+    }
+    SaveSettings();
+}
+
+// --- 协议解析函数 (保持不变) ---
 cJSON* ParseSocks(const char* link) {
     if (strncmp(link, "socks://", 8) != 0) return NULL;
     const char* p = link + 8; const char* at = strchr(p, '@'); if (!at) return NULL; 
@@ -504,100 +648,4 @@ cJSON* ParseShadowsocks(const char* link) {
     cJSON_AddStringToObject(outbound, "method", methodPass);
     cJSON_AddStringToObject(outbound, "password", pass);
     free(tag); return outbound;
-}
-
-int ImportFromClipboard() {
-    char* text = GetClipboardText(); 
-    if (!text) return 0;
-    int successCount = 0;
-    char* context = NULL;
-    char* token = strtok_s(text, " \r\n\t,", &context);
-    while (token != NULL) {
-        TrimString(token);
-        if (strlen(token) > 0) {
-            cJSON* node = NULL;
-            if (_strnicmp(token, "socks://", 8) == 0) node = ParseSocks(token);
-            else if (_strnicmp(token, "vmess://", 8) == 0) node = ParseVmess(token);
-            else if (_strnicmp(token, "vless://", 8) == 0) node = ParseVlessOrTrojan(token);
-            else if (_strnicmp(token, "trojan://", 9) == 0) node = ParseVlessOrTrojan(token);
-            else if (_strnicmp(token, "ss://", 5) == 0) node = ParseShadowsocks(token);
-            if (node) {
-                if (AddNodeToConfig(node)) successCount++;
-            }
-        }
-        token = strtok_s(NULL, " \r\n\t,", &context);
-    }
-    free(text);
-    return successCount;
-
-}
-
-void ToggleTrayIcon() {
-    if (g_isIconVisible) { 
-        Shell_NotifyIconW(NIM_DELETE, &nid); 
-        g_isIconVisible = FALSE; 
-        g_hideTrayStart = 1;
-    }
-    else { 
-        nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
-        Shell_NotifyIconW(NIM_ADD, &nid); 
-        g_isIconVisible = TRUE; 
-        g_hideTrayStart = 0;
-    }
-    SaveSettings();
-}
-
-// --- 更新所有订阅逻辑 (使用 Utils_HttpGet) ---
-int UpdateAllSubscriptions(BOOL forceMsg) {
-    int activeSubs = 0;
-    for(int i=0; i<g_subCount; i++) {
-        if(g_subs[i].enabled && strlen(g_subs[i].url) > 4) activeSubs++;
-    }
-
-    if (activeSubs == 0) {
-        if (forceMsg) log_msg("[Sub] No active subscriptions found.");
-        return 0;
-    }
-
-    log_msg("[Sub] Starting update for %d subscriptions...", activeSubs);
-
-    char* rawData[MAX_SUBS] = {0};
-    int successCount = 0;
-
-    for (int i = 0; i < g_subCount; i++) {
-        if (g_subs[i].enabled && strlen(g_subs[i].url) > 4) {
-            log_msg("[Sub] Downloading (%d/%d): %s", i+1, g_subCount, g_subs[i].url);
-            
-            char* data = Utils_HttpGet(g_subs[i].url);
-            
-            if (data) {
-                rawData[i] = data;
-                successCount++;
-                log_msg("[Sub] Download success.");
-            } else {
-                log_msg("[Sub] Download failed: %s", g_subs[i].url);
-            }
-        }
-    }
-
-    int totalNewNodes = 0;
-    if (successCount > 0) {
-        log_msg("[Sub] %d subscriptions downloaded successfully. Updating config...", successCount);
-        
-        ClearAllNodes(); 
-
-        for (int i = 0; i < g_subCount; i++) {
-            if (rawData[i]) {
-                int count = ParseAndAppendSubscriptionData(rawData[i]);
-                totalNewNodes += count;
-                free(rawData[i]); 
-            }
-        }
-        ParseTags(); 
-    } else {
-        log_msg("[Error] All subscription downloads failed. Configuration NOT updated.");
-        for(int i=0; i<MAX_SUBS; i++) if(rawData[i]) free(rawData[i]);
-    }
-
-    return totalNewNodes;
 }
