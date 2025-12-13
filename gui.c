@@ -7,6 +7,148 @@
 // 宣告 ListBox 的舊視窗程序變數
 WNDPROC g_oldListBoxProc = NULL;
 
+// --- 补全缺失的辅助函数 ---
+
+void AddComboItem(HWND hCombo, const wchar_t* text, BOOL select) {
+    int idx = SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)text);
+    if (select) SendMessage(hCombo, CB_SETCURSEL, idx, 0);
+}
+
+void LoadNodeToEdit(HWND hWnd, const wchar_t* tag) {
+    char* buffer = NULL; long size = 0;
+    if (!ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) return;
+    cJSON* root = cJSON_Parse(buffer); free(buffer);
+    if (!root) return;
+    
+    char tagUtf8[256];
+    WideCharToMultiByte(CP_UTF8, 0, tag, -1, tagUtf8, 256, NULL, NULL);
+    cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
+    cJSON* target = NULL;
+    cJSON* node;
+    cJSON_ArrayForEach(node, outbounds) {
+        cJSON* t = cJSON_GetObjectItem(node, "tag");
+        if (t && strcmp(t->valuestring, tagUtf8) == 0) { target = node; break; }
+    }
+    if (target) {
+        SetDlgItemTextW(hWnd, ID_EDIT_TAG, tag);
+        cJSON* server = cJSON_GetObjectItem(target, "server");
+        if(server) SetDlgItemTextA(hWnd, ID_EDIT_ADDR, server->valuestring);
+        cJSON* port = cJSON_GetObjectItem(target, "server_port");
+        if(port) SetDlgItemInt(hWnd, ID_EDIT_PORT, port->valueint, FALSE);
+        cJSON* user = cJSON_GetObjectItem(target, "username");
+        if(!user) user = cJSON_GetObjectItem(target, "uuid");
+        if(user) SetDlgItemTextA(hWnd, ID_EDIT_USER, user->valuestring);
+        cJSON* pass = cJSON_GetObjectItem(target, "password");
+        if(pass) SetDlgItemTextA(hWnd, ID_EDIT_PASS, pass->valuestring);
+        cJSON* trans = cJSON_GetObjectItem(target, "transport"); 
+        if (!trans) trans = cJSON_GetObjectItem(target, "streamSettings");
+        HWND hNet = GetDlgItem(hWnd, ID_EDIT_NET);
+        SendMessage(hNet, CB_SETCURSEL, 0, 0); 
+        cJSON* netType = NULL;
+        if (trans) netType = cJSON_GetObjectItem(trans, "type");
+        if (!netType) netType = cJSON_GetObjectItem(target, "network");
+        if (netType && strcmp(netType->valuestring, "ws") == 0) SendMessage(hNet, CB_SETCURSEL, 1, 0);
+        cJSON* wsSettings = NULL;
+        if (trans) wsSettings = cJSON_GetObjectItem(trans, "wsSettings");
+        if (!wsSettings && trans && netType && strcmp(netType->valuestring, "ws") == 0) wsSettings = trans;
+        if (wsSettings) {
+             cJSON* path = cJSON_GetObjectItem(wsSettings, "path");
+             if (path) SetDlgItemTextA(hWnd, ID_EDIT_PATH, path->valuestring);
+             cJSON* headers = cJSON_GetObjectItem(wsSettings, "headers");
+             if (headers) {
+                 cJSON* host = cJSON_GetObjectItem(headers, "Host");
+                 if (host) SetDlgItemTextA(hWnd, ID_EDIT_HOST, host->valuestring);
+             }
+        }
+        HWND hTls = GetDlgItem(hWnd, ID_EDIT_TLS);
+        SendMessage(hTls, CB_SETCURSEL, 0, 0); 
+        cJSON* tls = cJSON_GetObjectItem(target, "tls");
+        cJSON* security = cJSON_GetObjectItem(target, "security");
+        if (tls || (security && strcmp(security->valuestring, "tls") == 0)) {
+             SendMessage(hTls, CB_SETCURSEL, 1, 0);
+             cJSON* sni = NULL;
+             if (tls) sni = cJSON_GetObjectItem(tls, "server_name");
+             if (sni) SetDlgItemTextA(hWnd, ID_EDIT_HOST, sni->valuestring);
+        }
+    }
+    cJSON_Delete(root);
+}
+
+void SaveEditedNode(HWND hWnd) {
+    wchar_t wTag[256], wAddr[256], wUser[256], wPass[256], wHost[256], wPath[256];
+    char tag[256], addr[256], user[256], pass[256], host[256], path[256];
+    int port = GetDlgItemInt(hWnd, ID_EDIT_PORT, NULL, FALSE);
+    GetDlgItemTextW(hWnd, ID_EDIT_TAG, wTag, 256);
+    GetDlgItemTextW(hWnd, ID_EDIT_ADDR, wAddr, 256);
+    GetDlgItemTextW(hWnd, ID_EDIT_USER, wUser, 256);
+    GetDlgItemTextW(hWnd, ID_EDIT_PASS, wPass, 256);
+    GetDlgItemTextW(hWnd, ID_EDIT_HOST, wHost, 256);
+    GetDlgItemTextW(hWnd, ID_EDIT_PATH, wPath, 256);
+    WideCharToMultiByte(CP_UTF8, 0, wTag, -1, tag, 256, NULL, NULL);
+    WideCharToMultiByte(CP_UTF8, 0, wAddr, -1, addr, 256, NULL, NULL);
+    WideCharToMultiByte(CP_UTF8, 0, wUser, -1, user, 256, NULL, NULL);
+    WideCharToMultiByte(CP_UTF8, 0, wPass, -1, pass, 256, NULL, NULL);
+    WideCharToMultiByte(CP_UTF8, 0, wHost, -1, host, 256, NULL, NULL);
+    WideCharToMultiByte(CP_UTF8, 0, wPath, -1, path, 256, NULL, NULL);
+    int netIdx = SendMessage(GetDlgItem(hWnd, ID_EDIT_NET), CB_GETCURSEL, 0, 0);
+    int tlsIdx = SendMessage(GetDlgItem(hWnd, ID_EDIT_TLS), CB_GETCURSEL, 0, 0);
+    cJSON* newNode = cJSON_CreateObject();
+    cJSON_AddStringToObject(newNode, "tag", tag);
+    cJSON_AddStringToObject(newNode, "server", addr);
+    cJSON_AddNumberToObject(newNode, "server_port", port);
+    BOOL isVmess = (strlen(user) > 20); 
+    if (isVmess) {
+        cJSON_AddStringToObject(newNode, "type", "vmess");
+        cJSON_AddStringToObject(newNode, "uuid", user);
+    } else {
+        cJSON_AddStringToObject(newNode, "type", "socks");
+        if (strlen(user)>0) cJSON_AddStringToObject(newNode, "username", user);
+        if (strlen(pass)>0) cJSON_AddStringToObject(newNode, "password", pass);
+    }
+    if (netIdx == 1) { 
+        cJSON* trans = cJSON_CreateObject();
+        cJSON_AddStringToObject(trans, "type", "ws");
+        if (strlen(path) > 0) cJSON_AddStringToObject(trans, "path", path);
+        if (strlen(host) > 0) {
+            cJSON* h = cJSON_CreateObject();
+            cJSON_AddStringToObject(h, "Host", host);
+            cJSON_AddItemToObject(trans, "headers", h);
+        }
+        cJSON_AddItemToObject(newNode, "transport", trans);
+    } else { cJSON_AddStringToObject(newNode, "network", "tcp"); }
+    if (tlsIdx == 1) {
+        cJSON* tlsObj = cJSON_CreateObject();
+        cJSON_AddBoolToObject(tlsObj, "enabled", cJSON_True);
+        if (strlen(host) > 0) cJSON_AddStringToObject(tlsObj, "server_name", host);
+        cJSON_AddItemToObject(newNode, "tls", tlsObj);
+    }
+    char* buffer = NULL; long size = 0;
+    if (ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) {
+        cJSON* root = cJSON_Parse(buffer); free(buffer);
+        if (root) {
+            cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
+            int count = cJSON_GetArraySize(outbounds);
+            int idxToReplace = -1;
+            char oldTagUtf8[256];
+            WideCharToMultiByte(CP_UTF8, 0, g_editingTag, -1, oldTagUtf8, 256, NULL, NULL);
+            for (int i=0; i<count; i++) {
+                cJSON* item = cJSON_GetArrayItem(outbounds, i);
+                cJSON* t = cJSON_GetObjectItem(item, "tag");
+                if (t && strcmp(t->valuestring, oldTagUtf8) == 0) {
+                    idxToReplace = i; break;
+                }
+            }
+            if (idxToReplace != -1) cJSON_ReplaceItemInArray(outbounds, idxToReplace, newNode);
+            else cJSON_AddItemToArray(outbounds, newNode);
+            char* out = cJSON_Print(root);
+            WriteBufferToFile(CONFIG_FILE, out);
+            free(out); cJSON_Delete(root);
+        } else cJSON_Delete(newNode);
+    } else cJSON_Delete(newNode);
+}
+
+// --- End of missing functions ---
+
 LRESULT CALLBACK ListBox_Proc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == WM_KEYDOWN) {
         if (wParam == 'A' && (GetKeyState(VK_CONTROL) & 0x8000)) {
