@@ -13,7 +13,8 @@ char* GetQueryParam(const char* query, const char* key);
 BOOL ReadFileToBuffer(const wchar_t* filename, char** buffer, long* fileSize);
 BOOL WriteBufferToFile(const wchar_t* filename, const char* buffer);
 
-// --- 网络功能 ---
+// --- 网络功能 (新增) ---
+// 下载指定 URL 内容，超时时间固定为 10 秒
 char* Utils_HttpGet(const char* url);
 
 // --- 系统代理功能 ---
