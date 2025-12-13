@@ -47,34 +47,55 @@ static int frag_write(BIO *b, const char *in, int inl) {
     BIO *next = BIO_next(b);
     if (!ctx || !next) return 0;
 
-    // 隨機分片邏輯：僅針對握手階段 (第一次發送)
+    // 随机分片逻辑：仅针对握手阶段 (TLS ClientHello)
+    // 修复：增加最大分片数限制，防止分片过多导致握手超时
     if (inl > 0 && ctx->first_packet_sent == 0) {
         ctx->first_packet_sent = 1; 
 
         int bytes_sent = 0;
         int remaining = inl;
-        
+        int frag_count = 0;
+        const int MAX_FRAGS = 50; // 安全限制：最多切分 50 个包，避免握手太慢
+
         while (remaining > 0) {
-            int range = g_fragSizeMax - g_fragSizeMin;
-            if (range < 0) range = 0;
-            int chunk_size = g_fragSizeMin + (range > 0 ? (rand() % (range + 1)) : 0);
+            int chunk_size;
+
+            // 策略：如果已经切了太多包，或者剩余数据量很大，则停止切分直接发送剩余部分
+            // 这样既能混淆 SNI (通常在前几百字节)，又能保证握手完成
+            if (frag_count >= MAX_FRAGS) {
+                chunk_size = remaining;
+            } else {
+                int range = g_fragSizeMax - g_fragSizeMin;
+                if (range < 0) range = 0;
+                chunk_size = g_fragSizeMin + (range > 0 ? (rand() % (range + 1)) : 0);
+            }
             
             if (chunk_size < 1) chunk_size = 1;
             if (chunk_size > remaining) chunk_size = remaining;
 
             int ret = BIO_write(next, in + bytes_sent, chunk_size);
-            if (ret <= 0) return (bytes_sent > 0) ? bytes_sent : ret;
+            
+            // 错误处理：如果底层写入失败
+            if (ret <= 0) {
+                // 如果之前已经成功发送了一些数据，则返回已发送量，让 OpenSSL 稍后重试剩余部分
+                if (bytes_sent > 0) return bytes_sent;
+                return ret;
+            }
 
             bytes_sent += ret;
             remaining -= ret;
+            frag_count++;
 
-            if (g_fragDelayMs > 0) {
+            // 仅在还有剩余数据时延时
+            if (remaining > 0 && g_fragDelayMs > 0) {
+                 // 使用随机延时，增加混淆
                  Sleep(rand() % (g_fragDelayMs + 1));
             }
         }
         return bytes_sent;
     }
     
+    // 非握手阶段或后续数据，直接透传
     return BIO_write(next, in, inl);
 }
 
@@ -120,7 +141,7 @@ void init_openssl_global() {
         log_msg("[Security] Standard OpenSSL Cipher Suites");
     }
 
-    // 從資源載入證書 (ID: 2, Type: RT_RCDATA)
+    // 从资源载入证书 (ID: 2, Type: RT_RCDATA)
     HRSRC hRes = FindResourceW(NULL, MAKEINTRESOURCEW(2), RT_RCDATA);
     if (hRes) {
         HGLOBAL hData = LoadResource(NULL, hRes);
@@ -163,7 +184,7 @@ void init_openssl_global() {
 int tls_init_connect(TLSContext *ctx) {
     ctx->ssl = SSL_new(g_ssl_ctx);
     
-    // Padding 設置
+    // Padding 设置
     if (g_enablePadding) {
         int range = g_padSizeMax - g_padSizeMin;
         if (range < 0) range = 0;
@@ -175,7 +196,7 @@ int tls_init_connect(TLSContext *ctx) {
 
     BIO *bio = BIO_new_socket(ctx->sock, BIO_NOCLOSE);
     
-    // 掛載分片 BIO
+    // 挂载分片 BIO
     if (g_enableFragment) {
         BIO *frag = BIO_new(BIO_f_fragment());
         bio = BIO_push(frag, bio);
