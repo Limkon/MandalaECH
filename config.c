@@ -547,12 +547,9 @@ void ToggleTrayIcon() {
     SaveSettings();
 }
 
-// --- 新增：更新所有订阅逻辑 ---
+// --- 新增：更新所有订阅逻辑 (安全版：下载成功后再覆盖) ---
 int UpdateAllSubscriptions(BOOL forceMsg) {
-    int totalNewNodes = 0;
     int activeSubs = 0;
-
-    // 统计有效订阅
     for(int i=0; i<g_subCount; i++) {
         if(g_subs[i].enabled && strlen(g_subs[i].url) > 4) activeSubs++;
     }
@@ -564,29 +561,47 @@ int UpdateAllSubscriptions(BOOL forceMsg) {
 
     log_msg("[Sub] Starting update for %d subscriptions...", activeSubs);
 
-    // 1. 清空旧节点 (策略：更新 = 全量覆盖)
-    ClearAllNodes();
+    // 1. 临时存储下载内容，防止直接清空导致配置丢失
+    char* rawData[MAX_SUBS] = {0};
+    int successCount = 0;
 
-    // 2. 遍历下载并解析
     for (int i = 0; i < g_subCount; i++) {
         if (g_subs[i].enabled && strlen(g_subs[i].url) > 4) {
             log_msg("[Sub] Downloading (%d/%d): %s", i+1, g_subCount, g_subs[i].url);
             
-            // 使用带超时功能的下载函数
+            // 使用 Utils_HttpGet (已包含超时和TLS修复)
             char* data = Utils_HttpGet(g_subs[i].url);
             
             if (data) {
-                int count = ParseAndAppendSubscriptionData(data);
-                log_msg("[Sub] Parsed %d nodes from %s", count, g_subs[i].url);
-                totalNewNodes += count;
-                free(data);
+                rawData[i] = data;
+                successCount++;
+                log_msg("[Sub] Download success.");
             } else {
-                log_msg("[Sub] Download failed (timeout or network error): %s", g_subs[i].url);
+                log_msg("[Sub] Download failed: %s", g_subs[i].url);
             }
         }
     }
 
-    // 3. 刷新内存
-    ParseTags();
+    // 2. 如果至少有一个成功，则执行清空和解析
+    int totalNewNodes = 0;
+    if (successCount > 0) {
+        log_msg("[Sub] %d subscriptions downloaded successfully. Updating config...", successCount);
+        
+        ClearAllNodes(); // 现在安全了，可以清空旧配置
+
+        for (int i = 0; i < g_subCount; i++) {
+            if (rawData[i]) {
+                int count = ParseAndAppendSubscriptionData(rawData[i]);
+                totalNewNodes += count;
+                free(rawData[i]); // 释放内存
+            }
+        }
+        ParseTags(); // 刷新标签
+    } else {
+        log_msg("[Error] All subscription downloads failed. Configuration NOT updated.");
+        // 如果失败，确保释放已分配的内存(虽然这里 count=0 应该没有，但为了严谨)
+        for(int i=0; i<MAX_SUBS; i++) if(rawData[i]) free(rawData[i]);
+    }
+
     return totalNewNodes;
 }
