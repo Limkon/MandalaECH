@@ -42,13 +42,13 @@ static int frag_free(BIO *b) {
     return 1;
 }
 
+// 核心优化：智能分片写入逻辑
 static int frag_write(BIO *b, const char *in, int inl) {
     FragCtx *ctx = (FragCtx *)BIO_get_data(b);
     BIO *next = BIO_next(b);
     if (!ctx || !next) return 0;
 
     // 随机分片逻辑：仅针对握手阶段 (TLS ClientHello)
-    // 优化：引入智能分片策略，避免过度切分导致丢包或握手超时
     if (inl > 0 && ctx->first_packet_sent == 0) {
         ctx->first_packet_sent = 1; 
 
@@ -56,22 +56,21 @@ static int frag_write(BIO *b, const char *in, int inl) {
         int remaining = inl;
         int frag_count = 0;
         
-        // --- 优化核心：限制最大分片数量和范围 ---
-        // 1. MAX_FRAG_BYTES: 512 字节通常足以覆盖 TLS ClientHello 中的 SNI 扩展和 Session Ticket。
-        //    只要覆盖了这一段，核心的域名混淆目标就达成了，后续数据不分片也是安全的。
-        // 2. MAX_FRAG_COUNT: 提高到 100，允许用户设置较小的分片大小 (如 1-5 字节) 
-        //    而不至于在 SNI 发送完之前就耗尽次数停止分片。
+        // --- 硬编码最佳安全阈值 ---
+        // 1. MAX_FRAG_BYTES (512): 覆盖绝大多数 SNI 扩展位置，确保关键信息被切分。
+        //    超过此范围后的数据（如长 Padding 或后续扩展）不切分，以提升速度。
+        // 2. MAX_FRAG_COUNT (100): 防止因配置错误（如 1 字节切片）产生数千个小包导致被防火墙丢弃。
         const int MAX_FRAG_COUNT = 100;   
         const int MAX_FRAG_BYTES = 512; 
 
         while (remaining > 0) {
             int chunk_size;
 
-            // 策略：只有当 "超过最大包数" 或 "已覆盖 SNI 范围" 时，才停止分片，将剩余数据一次性发送
+            // 策略：如果超过了最大包数限制，或已经覆盖了关键的 SNI 区域，则停止切分
             if (frag_count >= MAX_FRAG_COUNT || bytes_sent >= MAX_FRAG_BYTES) {
-                chunk_size = remaining; 
+                chunk_size = remaining; // 剩余部分一次性发送
             } else {
-                // 正常分片：完全尊重用户的 FragMin / FragMax 配置
+                // 正常切分：尊重用户的 FragMin/Max 配置
                 int range = g_fragSizeMax - g_fragSizeMin;
                 if (range < 0) range = 0;
                 chunk_size = g_fragSizeMin + (range > 0 ? (rand() % (range + 1)) : 0);
@@ -84,8 +83,7 @@ static int frag_write(BIO *b, const char *in, int inl) {
             
             // 错误处理：如果底层写入失败
             if (ret <= 0) {
-                // 如果之前已经成功发送了一些数据，则返回已发送量。
-                // OpenSSL 会再次调用此函数写入剩余部分（此时 first_packet_sent 已为 1，将直接透传）。
+                // 如果之前已经成功发送了一些数据，则返回已发送量，让 OpenSSL 稍后重试
                 if (bytes_sent > 0) return bytes_sent;
                 return ret;
             }
@@ -94,8 +92,7 @@ static int frag_write(BIO *b, const char *in, int inl) {
             remaining -= ret;
             frag_count++;
 
-            // 延时处理：仅在确实进行了切分（非最后的大块传输）且用户配置了延时时才 Sleep
-            // 避免握手最后阶段无意义的等待
+            // 智能延时：仅在确实进行了切分（非最后的大块直传）且用户开启了延时时 Sleep
             if (remaining > 0 && chunk_size < remaining && g_fragDelayMs > 0) {
                  Sleep(rand() % (g_fragDelayMs + 1));
             }
@@ -189,14 +186,26 @@ void init_openssl_global() {
     }
 }
 
+// 核心优化：Padding 设置逻辑
 int tls_init_connect(TLSContext *ctx) {
     ctx->ssl = SSL_new(g_ssl_ctx);
     
-    // Padding 设置
     if (g_enablePadding) {
         int range = g_padSizeMax - g_padSizeMin;
         if (range < 0) range = 0;
+        
         int blockSize = g_padSizeMin + (range > 0 ? (rand() % (range + 1)) : 0);
+        
+        // --- 硬编码最小安全块大小 ---
+        // 防止计算出的 blockSize 过小（如 1），导致 Padding 无效或无法掩盖特征
+        const int MIN_SAFE_BLOCK = 16; 
+        if (blockSize < MIN_SAFE_BLOCK) {
+            blockSize = MIN_SAFE_BLOCK;
+        }
+        
+        // OpenSSL 限制
+        if (blockSize > 16384) blockSize = 16384;
+
         if (blockSize > 0) {
             SSL_set_block_padding(ctx->ssl, blockSize);
         }
