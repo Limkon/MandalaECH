@@ -251,29 +251,39 @@ void SetSystemProxy(BOOL enable) {
 
     wchar_t proxyServerString[256] = {0};
     wchar_t proxyBypassString[64] = {0};
+
     if (enable) {
-        wsprintfW(proxyServerString, L"http=127.0.0.1:%d;socks=127.0.0.1:%d", g_localPort, g_localPort);
-        wcscpy(proxyBypassString, L"<local>");
+        // [修复] 优化代理字符串格式
+        // 之前使用 "http=...;socks=..." 导致 Win10/11 设置界面解析失败显示空白
+        // 改为直接使用 "IP:端口" 格式，兼容性最好
+        wsprintfW(proxyServerString, L"127.0.0.1:%d", g_localPort);
+        wcsncpy(proxyBypassString, L"<local>", 63);
     }
 
     if (IsWindows8OrGreater()) {
         HKEY hKey;
-        if (RegCreateKeyExW(HKEY_CURRENT_USER, REG_PATH_PROXY, 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
+        // 使用 KEY_SET_VALUE 权限打开注册表
+        if (RegCreateKeyExW(HKEY_CURRENT_USER, REG_PATH_PROXY, 0, NULL, REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
             if (enable) {
                 DWORD dwEnable = 1;
                 RegSetValueExW(hKey, L"ProxyEnable", 0, REG_DWORD, (const BYTE*)&dwEnable, sizeof(dwEnable));
                 RegSetValueExW(hKey, L"ProxyOverride", 0, REG_SZ, (const BYTE*)proxyBypassString, (wcslen(proxyBypassString) + 1) * sizeof(wchar_t));
                 RegSetValueExW(hKey, L"ProxyServer", 0, REG_SZ, (const BYTE*)proxyServerString, (wcslen(proxyServerString) + 1) * sizeof(wchar_t));
+                
+                // 清理可能导致冲突的旧键值，防止干扰
                 RegDeleteValueW(hKey, L"SocksProxyServer"); 
+                RegDeleteValueW(hKey, L"AutoConfigURL"); 
             } else {
                 DWORD dwEnable = 0;
                 RegSetValueExW(hKey, L"ProxyEnable", 0, REG_DWORD, (const BYTE*)&dwEnable, sizeof(dwEnable));
+                // 关闭时清空代理服务器设置，保持界面整洁
                 RegSetValueExW(hKey, L"ProxyServer", 0, REG_SZ, (const BYTE*)L"", sizeof(wchar_t));
                 RegDeleteValueW(hKey, L"SocksProxyServer");
             }
             RegCloseKey(hKey);
         }
     } else {
+        // Win7 及更早系统的兼容代码
         INTERNET_PER_CONN_OPTION_LISTW list;
         INTERNET_PER_CONN_OPTIONW options[3];
         DWORD dwBufSize = sizeof(list);
@@ -296,6 +306,7 @@ void SetSystemProxy(BOOL enable) {
         list.pOptions = options;
         InternetSetOptionW(NULL, INTERNET_OPTION_PER_CONNECTION_OPTION, &list, dwBufSize);
     }
+    // 立即刷新系统代理设置
     InternetSetOptionW(NULL, INTERNET_OPTION_SETTINGS_CHANGED, NULL, 0);
     InternetSetOptionW(NULL, INTERNET_OPTION_REFRESH, NULL, 0);
 }
