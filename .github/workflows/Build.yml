@@ -49,5 +49,5 @@ jobs:
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: limbox-executable
-        path: limbox.exe
+        name: Mandala-executable
+        path: Mandala.exe
