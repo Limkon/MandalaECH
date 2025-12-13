@@ -457,8 +457,13 @@ LRESULT CALLBACK SubWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 MessageBoxW(hWnd, L"订阅设置已保存", L"成功", MB_OK);
             }
             else if (id == ID_SUB_UPD_BTN) { // 立即更新
-                // 先自动保存当前状态
-                SendMessage(hWnd, WM_COMMAND, ID_SUB_SAVE_BTN, 0); 
+                // [修复] 1. 手动同步界面状态到内存，确保 enabled 状态最新
+                for(int i=0; i<g_subCount; i++) {
+                    g_subs[i].enabled = ListView_GetCheckState(hSubList, i);
+                }
+                
+                // [修复] 2. 静默保存到文件，替代原先的 SendMessage 调用，避免弹窗
+                SaveSettings(); 
 
                 SetWindowTextW(hWnd, L"正在更新 (超时10s)...");
                 EnableWindow(GetDlgItem(hWnd, ID_SUB_UPD_BTN), FALSE); // 禁用按钮防止重复点击
@@ -466,7 +471,7 @@ LRESULT CALLBACK SubWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 
                 HCURSOR hOld = SetCursor(LoadCursor(NULL, IDC_WAIT));
                 
-                // 执行更新 (TRUE = 强制记录日志，如果需要弹窗提示也可在 UpdateAllSubscriptions 修改，但这里我们在 UI 层弹窗)
+                // 执行更新 (TRUE = 强制记录日志)
                 int count = UpdateAllSubscriptions(TRUE);
                 
                 SetCursor(hOld);
