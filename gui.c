@@ -162,69 +162,68 @@ LRESULT CALLBACK ListBox_Proc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
     return CallWindowProc(g_oldListBoxProc, hWnd, msg, wParam, lParam);
 }
 
-// 设置窗口过程：单例模式，界面已扩容并优化布局
 LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     static HWND hHotkey, hPortEdit;
     switch(msg) {
         case WM_CREATE: {
-            int y = 20;
+            int y = 25;
             // 基础设置区域
-            CreateWindowW(L"STATIC", L"全局快捷键:", WS_CHILD|WS_VISIBLE, 25, y, 100, 20, hWnd, NULL,NULL,NULL);
-            hHotkey = CreateWindowExW(0, HOTKEY_CLASSW, NULL, WS_CHILD|WS_VISIBLE|WS_BORDER, 130, y-3, 280, 25, hWnd, (HMENU)ID_HOTKEY_CTRL, NULL,NULL);
+            CreateWindowW(L"STATIC", L"全局快捷键:", WS_CHILD|WS_VISIBLE, 25, y, 140, 20, hWnd, NULL,NULL,NULL);
+            hHotkey = CreateWindowExW(0, HOTKEY_CLASSW, NULL, WS_CHILD|WS_VISIBLE|WS_BORDER, 160, y-3, 270, 25, hWnd, (HMENU)ID_HOTKEY_CTRL, NULL,NULL);
             UINT hkMod = 0; if (g_hotkeyModifiers & MOD_SHIFT) hkMod |= HOTKEYF_SHIFT;
             if (g_hotkeyModifiers & MOD_CONTROL) hkMod |= HOTKEYF_CONTROL;
             if (g_hotkeyModifiers & MOD_ALT) hkMod |= HOTKEYF_ALT;
             SendMessage(hHotkey, HKM_SETHOTKEY, MAKEWORD(g_hotkeyVk, hkMod), 0);
             
-            y += 35;
-            CreateWindowW(L"STATIC", L"本地代理端口:", WS_CHILD|WS_VISIBLE, 25, y, 100, 20, hWnd, NULL,NULL,NULL);
-            hPortEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", NULL, WS_CHILD|WS_VISIBLE|ES_NUMBER, 130, y-3, 100, 25, hWnd, (HMENU)ID_PORT_EDIT, NULL,NULL);
+            y += 40;
+            CreateWindowW(L"STATIC", L"本地代理端口:", WS_CHILD|WS_VISIBLE, 25, y, 140, 20, hWnd, NULL,NULL,NULL);
+            hPortEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", NULL, WS_CHILD|WS_VISIBLE|ES_NUMBER, 160, y-3, 100, 25, hWnd, (HMENU)ID_PORT_EDIT, NULL,NULL);
             SetDlgItemInt(hWnd, ID_PORT_EDIT, g_localPort, FALSE);
 
             // 抗封锁设置 GroupBox (扩容)
-            y += 45;
-            CreateWindowW(L"BUTTON", L"抗封锁策略", WS_CHILD|WS_VISIBLE|BS_GROUPBOX, 20, y, 405, 330, hWnd, NULL, NULL, NULL);
+            y += 50;
+            CreateWindowW(L"BUTTON", L"抗封锁策略配置", WS_CHILD|WS_VISIBLE|BS_GROUPBOX, 20, y, 420, 340, hWnd, NULL, NULL, NULL);
             
-            y += 25;
-            HWND hChk1 = CreateWindowW(L"BUTTON", L"启用 Chrome 浏览器指纹模拟", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 35, y, 350, 22, hWnd, (HMENU)ID_CHK_CIPHERS, NULL, NULL);
             y += 30;
-            HWND hChk2 = CreateWindowW(L"BUTTON", L"启用 ALPN 协议伪装 (http/1.1)", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 35, y, 350, 22, hWnd, (HMENU)ID_CHK_ALPN, NULL, NULL);
+            HWND hChk1 = CreateWindowW(L"BUTTON", L"启用 Chrome 浏览器指纹模拟", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 35, y, 380, 22, hWnd, (HMENU)ID_CHK_CIPHERS, NULL, NULL);
+            y += 30;
+            HWND hChk2 = CreateWindowW(L"BUTTON", L"启用 ALPN 协议伪装 (http/1.1)", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 35, y, 380, 22, hWnd, (HMENU)ID_CHK_ALPN, NULL, NULL);
             
             // --- 分片设置 ---
-            y += 30;
-            HWND hChk3 = CreateWindowW(L"BUTTON", L"启用 TCP 随机分片 (对抗 SNI 阻断)", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 35, y, 350, 22, hWnd, (HMENU)ID_CHK_FRAG, NULL, NULL);
+            y += 35;
+            HWND hChk3 = CreateWindowW(L"BUTTON", L"启用 TCP 随机分片 (对抗 SNI 阻断)", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 35, y, 380, 22, hWnd, (HMENU)ID_CHK_FRAG, NULL, NULL);
             
             y += 30;
-            CreateWindowW(L"STATIC", L"分片长度范围:", WS_CHILD|WS_VISIBLE, 55, y+2, 90, 20, hWnd, NULL,NULL,NULL);
-            HWND hFMin = CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER|ES_CENTER, 150, y, 40, 22, hWnd, (HMENU)ID_EDIT_FRAG_MIN, NULL, NULL);
-            CreateWindowW(L"STATIC", L"-", WS_CHILD|WS_VISIBLE, 195, y+2, 10, 20, hWnd, NULL,NULL,NULL);
-            HWND hFMax = CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER|ES_CENTER, 210, y, 40, 22, hWnd, (HMENU)ID_EDIT_FRAG_MAX, NULL, NULL);
+            CreateWindowW(L"STATIC", L"分片长度(字节):", WS_CHILD|WS_VISIBLE, 55, y+2, 110, 20, hWnd, NULL,NULL,NULL);
+            HWND hFMin = CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER|ES_CENTER, 170, y, 40, 22, hWnd, (HMENU)ID_EDIT_FRAG_MIN, NULL, NULL);
+            CreateWindowW(L"STATIC", L"-", WS_CHILD|WS_VISIBLE, 215, y+2, 10, 20, hWnd, NULL,NULL,NULL);
+            HWND hFMax = CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER|ES_CENTER, 230, y, 40, 22, hWnd, (HMENU)ID_EDIT_FRAG_MAX, NULL, NULL);
             
-            CreateWindowW(L"STATIC", L"延迟(ms):", WS_CHILD|WS_VISIBLE, 270, y+2, 60, 20, hWnd, NULL,NULL,NULL);
-            HWND hDly = CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER|ES_CENTER, 335, y, 40, 22, hWnd, (HMENU)ID_EDIT_FRAG_DLY, NULL, NULL);
+            CreateWindowW(L"STATIC", L"延迟(ms):", WS_CHILD|WS_VISIBLE, 290, y+2, 60, 20, hWnd, NULL,NULL,NULL);
+            HWND hDly = CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER|ES_CENTER, 355, y, 40, 22, hWnd, (HMENU)ID_EDIT_FRAG_DLY, NULL, NULL);
 
             // --- Padding 设置 ---
-            y += 35;
-            HWND hChkPad = CreateWindowW(L"BUTTON", L"启用 TLS 流量填充 (随机包长度)", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 35, y, 350, 22, hWnd, (HMENU)ID_CHK_PADDING, NULL, NULL);
+            y += 40;
+            HWND hChkPad = CreateWindowW(L"BUTTON", L"启用 TLS 流量填充 (随机包长度)", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 35, y, 380, 22, hWnd, (HMENU)ID_CHK_PADDING, NULL, NULL);
             
             y += 30;
-            CreateWindowW(L"STATIC", L"随机填充范围:", WS_CHILD|WS_VISIBLE, 55, y+2, 90, 20, hWnd, NULL,NULL,NULL);
-            HWND hPMin = CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER|ES_CENTER, 150, y, 40, 22, hWnd, (HMENU)ID_EDIT_PAD_MIN, NULL, NULL);
-            CreateWindowW(L"STATIC", L"-", WS_CHILD|WS_VISIBLE, 195, y+2, 10, 20, hWnd, NULL,NULL,NULL);
-            HWND hPMax = CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER|ES_CENTER, 210, y, 40, 22, hWnd, (HMENU)ID_EDIT_PAD_MAX, NULL, NULL);
+            CreateWindowW(L"STATIC", L"随机填充(块):", WS_CHILD|WS_VISIBLE, 55, y+2, 110, 20, hWnd, NULL,NULL,NULL);
+            HWND hPMin = CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER|ES_CENTER, 170, y, 40, 22, hWnd, (HMENU)ID_EDIT_PAD_MIN, NULL, NULL);
+            CreateWindowW(L"STATIC", L"-", WS_CHILD|WS_VISIBLE, 215, y+2, 10, 20, hWnd, NULL,NULL,NULL);
+            HWND hPMax = CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER|ES_CENTER, 230, y, 40, 22, hWnd, (HMENU)ID_EDIT_PAD_MAX, NULL, NULL);
 
             // --- UA 设置 ---
-            y += 40;
-            CreateWindowW(L"STATIC", L"伪装平台:", WS_CHILD|WS_VISIBLE, 35, y+3, 60, 20, hWnd, NULL,NULL,NULL);
-            HWND hCombo = CreateWindowW(L"COMBOBOX", NULL, WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL, 105, y, 300, 200, hWnd, (HMENU)ID_COMBO_PLATFORM, NULL, NULL);
+            y += 45;
+            CreateWindowW(L"STATIC", L"伪装平台:", WS_CHILD|WS_VISIBLE, 35, y+3, 80, 20, hWnd, NULL,NULL,NULL);
+            HWND hCombo = CreateWindowW(L"COMBOBOX", NULL, WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL, 120, y, 280, 200, hWnd, (HMENU)ID_COMBO_PLATFORM, NULL, NULL);
             
             y += 30;
-            HWND hEditUA = CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_AUTOHSCROLL, 35, y, 370, 25, hWnd, (HMENU)ID_EDIT_UA_STR, NULL, NULL);
+            HWND hEditUA = CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_AUTOHSCROLL, 35, y, 365, 25, hWnd, (HMENU)ID_EDIT_UA_STR, NULL, NULL);
 
             // 按钮区域
-            y += 50;
-            CreateWindowW(L"BUTTON", L"确定", WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON, 100, y, 100, 32, hWnd, (HMENU)IDOK, NULL,NULL);
-            CreateWindowW(L"BUTTON", L"取消", WS_CHILD|WS_VISIBLE, 240, y, 100, 32, hWnd, (HMENU)IDCANCEL, NULL,NULL);
+            y += 60;
+            CreateWindowW(L"BUTTON", L"确定", WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON, 110, y, 100, 32, hWnd, (HMENU)IDOK, NULL,NULL);
+            CreateWindowW(L"BUTTON", L"取消", WS_CHILD|WS_VISIBLE, 250, y, 100, 32, hWnd, (HMENU)IDCANCEL, NULL,NULL);
 
             // 初始化控件值
             SendMessage(hChk1, BM_SETCHECK, g_enableChromeCiphers ? BST_CHECKED : BST_UNCHECKED, 0);
@@ -310,8 +309,8 @@ void OpenSettingsWindow() {
 
     WNDCLASSW wc = {0}; wc.lpfnWndProc=SettingsWndProc; wc.hInstance=GetModuleHandle(NULL); wc.lpszClassName=L"Settings"; wc.hbrBackground=(HBRUSH)(COLOR_BTNFACE+1);
     WNDCLASSW temp; if (!GetClassInfoW(GetModuleHandle(NULL), L"Settings", &temp)) RegisterClassW(&wc);
-    // 宽度调整为 460，高度 550
-    hSettingsWnd = CreateWindowW(L"Settings", L"软件设置", WS_VISIBLE|WS_CAPTION|WS_SYSMENU, CW_USEDEFAULT,0,460,550, hwnd,NULL,wc.hInstance,NULL);
+    // 宽度调整为 480，高度 560，确保显示完整
+    hSettingsWnd = CreateWindowW(L"Settings", L"软件设置", WS_VISIBLE|WS_CAPTION|WS_SYSMENU, CW_USEDEFAULT,0,480,560, hwnd,NULL,wc.hInstance,NULL);
     ShowWindow(hSettingsWnd, SW_SHOW);
 }
 
@@ -626,7 +625,15 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nSho
     WSADATA wsa; WSAStartup(MAKEWORD(2,2), &wsa);
     INITCOMMONCONTROLSEX ic = {sizeof(INITCOMMONCONTROLSEX), ICC_HOTKEY_CLASS}; InitCommonControlsEx(&ic);
     
-    hAppFont = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Microsoft YaHei");
+    // 关键修改：获取系统菜单字体，确保与右键菜单一致
+    NONCLIENTMETRICSW ncm = { sizeof(NONCLIENTMETRICSW) };
+    if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(NONCLIENTMETRICSW), &ncm, 0)) {
+        hAppFont = CreateFontIndirectW(&ncm.lfMenuFont);
+    } else {
+        // 后备字体：微软雅黑
+        hAppFont = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Microsoft YaHei");
+    }
+    
     hLogFont = CreateFontW(14,0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,0,0,0,0,L"Consolas");
     
     OpenLogViewer(FALSE); 
