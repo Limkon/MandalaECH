@@ -57,14 +57,18 @@ typedef struct {
 #define ID_HOTKEY_CTRL 7001 
 #define ID_PORT_EDIT 7002
 
-// GUI ID 定义
+// GUI ID 定义 (已更新)
 #define ID_CHK_CIPHERS    7010
 #define ID_CHK_ALPN       7011
 #define ID_COMBO_PLATFORM 7012 
 #define ID_EDIT_UA_STR    7013 
 #define ID_CHK_FRAG       7014
-#define ID_EDIT_FRAG_LEN  7015 // 分片长度输入框
-#define ID_EDIT_FRAG_DLY  7016 // 分片延迟输入框
+#define ID_EDIT_FRAG_DLY  7016 
+#define ID_EDIT_FRAG_MIN  7017 // 新增：最小分片
+#define ID_EDIT_FRAG_MAX  7018 // 新增：最大分片
+#define ID_CHK_PADDING    7019 // 新增：启用Padding
+#define ID_EDIT_PAD_MIN   7020 // 新增：最小填充
+#define ID_EDIT_PAD_MAX   7021 // 新增：最大填充
 
 #define ID_EDIT_TAG      8001
 #define ID_EDIT_ADDR     8002
@@ -105,12 +109,21 @@ WNDPROC g_oldListBoxProc = NULL;
 int g_nEditScrollPos = 0;
 int g_nEditContentHeight = 0;
 
-// 抗封锁配置全局变量
+// 抗封锁配置全局变量 (已更新)
 BOOL g_enableChromeCiphers = TRUE;
 BOOL g_enableALPN = TRUE;
+
+// 分片配置
 BOOL g_enableFragment = FALSE;
-int  g_fragSplitSize = 50;
+int  g_fragSizeMin = 5;  
+int  g_fragSizeMax = 20; 
 int  g_fragDelayMs = 2;
+
+// Padding 配置
+BOOL g_enablePadding = FALSE; 
+int  g_padSizeMin = 1;   
+int  g_padSizeMax = 10;  
+
 int  g_uaPlatformIndex = 0; 
 char g_userAgentStr[512] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
@@ -164,27 +177,41 @@ static int frag_free(BIO *b) {
     return 1;
 }
 
+// 核心逻辑修改：随机分片
 static int frag_write(BIO *b, const char *in, int inl) {
     FragCtx *ctx = (FragCtx *)BIO_get_data(b);
     BIO *next = BIO_next(b);
     if (!ctx || !next) return 0;
 
-    // 核心逻辑：使用全局配置的 g_fragSplitSize 和 g_fragDelayMs
-    if (inl > g_fragSplitSize && ctx->first_packet_sent == 0) {
-        ctx->first_packet_sent = 1;
+    // 仅针对握手阶段的 Client Hello (第一次发送) 进行随机切分
+    if (inl > 0 && ctx->first_packet_sent == 0) {
+        ctx->first_packet_sent = 1; 
+
+        int bytes_sent = 0;
+        int remaining = inl;
         
-        // 1. 发送第一部分 (Split Size)
-        int ret1 = BIO_write(next, in, g_fragSplitSize);
-        if (ret1 <= 0) return ret1;
-        
-        // 2. 插入延迟
-        if (g_fragDelayMs > 0) Sleep(g_fragDelayMs); 
-        
-        // 3. 发送剩余部分
-        int ret2 = BIO_write(next, in + g_fragSplitSize, inl - g_fragSplitSize);
-        if (ret2 <= 0) return ret1; 
-        
-        return ret1 + ret2;
+        while (remaining > 0) {
+            // 计算随机切片长度 [min, max]
+            int range = g_fragSizeMax - g_fragSizeMin;
+            if (range < 0) range = 0;
+            int chunk_size = g_fragSizeMin + (range > 0 ? (rand() % (range + 1)) : 0);
+            
+            // 修正边界
+            if (chunk_size < 1) chunk_size = 1;
+            if (chunk_size > remaining) chunk_size = remaining;
+
+            int ret = BIO_write(next, in + bytes_sent, chunk_size);
+            if (ret <= 0) return (bytes_sent > 0) ? bytes_sent : ret;
+
+            bytes_sent += ret;
+            remaining -= ret;
+
+            // 随机微小延迟
+            if (g_fragDelayMs > 0) {
+                 Sleep(rand() % (g_fragDelayMs + 1));
+            }
+        }
+        return bytes_sent;
     }
     
     return BIO_write(next, in, inl);
@@ -375,18 +402,30 @@ void LoadSettings() {
     g_localPort = GetPrivateProfileIntW(L"Settings", L"LocalPort", 10809, g_iniFilePath);
     g_hideTrayStart = GetPrivateProfileIntW(L"Settings", L"HideTray", 0, g_iniFilePath);
     
-    // 抗封锁配置读取
+    // 抗封锁配置读取 (已更新)
     g_enableChromeCiphers = GetPrivateProfileIntW(L"Settings", L"ChromeCiphers", 1, g_iniFilePath);
     g_enableALPN = GetPrivateProfileIntW(L"Settings", L"EnableALPN", 1, g_iniFilePath);
     g_enableFragment = GetPrivateProfileIntW(L"Settings", L"EnableFragment", 0, g_iniFilePath);
-    g_fragSplitSize = GetPrivateProfileIntW(L"Settings", L"FragSize", 50, g_iniFilePath);
+    
+    // 随机分片配置
+    g_fragSizeMin = GetPrivateProfileIntW(L"Settings", L"FragMin", 5, g_iniFilePath);
+    g_fragSizeMax = GetPrivateProfileIntW(L"Settings", L"FragMax", 20, g_iniFilePath);
     g_fragDelayMs = GetPrivateProfileIntW(L"Settings", L"FragDelay", 2, g_iniFilePath);
+
+    // Padding 配置
+    g_enablePadding = GetPrivateProfileIntW(L"Settings", L"EnablePadding", 0, g_iniFilePath);
+    g_padSizeMin = GetPrivateProfileIntW(L"Settings", L"PadMin", 1, g_iniFilePath);
+    g_padSizeMax = GetPrivateProfileIntW(L"Settings", L"PadMax", 10, g_iniFilePath);
+
+    // 校验
+    if (g_fragSizeMin < 1) g_fragSizeMin = 1;
+    if (g_fragSizeMax < g_fragSizeMin) g_fragSizeMax = g_fragSizeMin;
+    if (g_fragDelayMs < 0) g_fragDelayMs = 0;
+    if (g_padSizeMin < 0) g_padSizeMin = 0;
+    if (g_padSizeMax < g_padSizeMin) g_padSizeMax = g_padSizeMin;
+
     g_uaPlatformIndex = GetPrivateProfileIntW(L"Settings", L"UAPlatform", 0, g_iniFilePath);
     
-    // 校验分片参数
-    if (g_fragSplitSize < 1) g_fragSplitSize = 1;
-    if (g_fragDelayMs < 0) g_fragDelayMs = 0;
-
     wchar_t wUABuf[512] = {0};
     GetPrivateProfileStringW(L"Settings", L"UserAgent", L"", wUABuf, 512, g_iniFilePath);
     if (wcslen(wUABuf) > 5) {
@@ -414,10 +453,20 @@ void SaveSettings() {
     wsprintfW(buffer, L"%d", g_enableFragment);
     WritePrivateProfileStringW(L"Settings", L"EnableFragment", buffer, g_iniFilePath);
     
-    wsprintfW(buffer, L"%d", g_fragSplitSize);
-    WritePrivateProfileStringW(L"Settings", L"FragSize", buffer, g_iniFilePath);
+    // 保存新参数
+    wsprintfW(buffer, L"%d", g_fragSizeMin);
+    WritePrivateProfileStringW(L"Settings", L"FragMin", buffer, g_iniFilePath);
+    wsprintfW(buffer, L"%d", g_fragSizeMax);
+    WritePrivateProfileStringW(L"Settings", L"FragMax", buffer, g_iniFilePath);
     wsprintfW(buffer, L"%d", g_fragDelayMs);
     WritePrivateProfileStringW(L"Settings", L"FragDelay", buffer, g_iniFilePath);
+
+    wsprintfW(buffer, L"%d", g_enablePadding);
+    WritePrivateProfileStringW(L"Settings", L"EnablePadding", buffer, g_iniFilePath);
+    wsprintfW(buffer, L"%d", g_padSizeMin);
+    WritePrivateProfileStringW(L"Settings", L"PadMin", buffer, g_iniFilePath);
+    wsprintfW(buffer, L"%d", g_padSizeMax);
+    WritePrivateProfileStringW(L"Settings", L"PadMax", buffer, g_iniFilePath);
 
     wsprintfW(buffer, L"%d", g_uaPlatformIndex);
     WritePrivateProfileStringW(L"Settings", L"UAPlatform", buffer, g_iniFilePath);
@@ -447,478 +496,6 @@ BOOL IsAutorun() {
     return FALSE;
 }
 
-void ParseTags() {
-    if (nodeTags) { for(int i=0; i<nodeCount; i++) free(nodeTags[i]); free(nodeTags); }
-    nodeCount = 0; nodeTags = NULL;
-    char* buffer = NULL; long size = 0;
-    if (!ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) return;
-    cJSON* root = cJSON_Parse(buffer); free(buffer);
-    if (!root) return;
-    cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
-    cJSON* node;
-    cJSON_ArrayForEach(node, outbounds) {
-        cJSON* tag = cJSON_GetObjectItem(node, "tag");
-        if (tag && tag->valuestring) {
-            nodeCount++;
-            nodeTags = (wchar_t**)realloc(nodeTags, nodeCount * sizeof(wchar_t*));
-            int wlen = MultiByteToWideChar(CP_UTF8, 0, tag->valuestring, -1, NULL, 0);
-            nodeTags[nodeCount-1] = (wchar_t*)malloc((wlen+1)*sizeof(wchar_t));
-            MultiByteToWideChar(CP_UTF8, 0, tag->valuestring, -1, nodeTags[nodeCount-1], wlen+1);
-        }
-    }
-    cJSON_Delete(root);
-}
-
-void ParseNodeConfigToGlobal(cJSON *node) {
-    if (!node) return;
-    memset(&g_proxyConfig, 0, sizeof(g_proxyConfig));
-    strcpy(g_proxyConfig.path, "/"); 
-    cJSON *server = cJSON_GetObjectItem(node, "server");
-    cJSON *port = cJSON_GetObjectItem(node, "server_port");
-    cJSON *uuid = cJSON_GetObjectItem(node, "uuid");
-    if (!uuid) uuid = cJSON_GetObjectItem(node, "password"); 
-    if (server && server->valuestring) strcpy(g_proxyConfig.host, server->valuestring);
-    if (port) g_proxyConfig.port = port->valueint;
-    if (uuid && uuid->valuestring) {
-        strcpy(g_proxyConfig.user, uuid->valuestring); 
-        strcpy(g_proxyConfig.pass, uuid->valuestring); 
-    }
-    cJSON *user = cJSON_GetObjectItem(node, "username");
-    cJSON *pass = cJSON_GetObjectItem(node, "password");
-    if(user && user->valuestring) strcpy(g_proxyConfig.user, user->valuestring);
-    if(pass && pass->valuestring) strcpy(g_proxyConfig.pass, pass->valuestring);
-    cJSON *tls = cJSON_GetObjectItem(node, "tls");
-    if (tls) {
-        cJSON *sni = cJSON_GetObjectItem(tls, "server_name");
-        if (sni && sni->valuestring) strcpy(g_proxyConfig.sni, sni->valuestring);
-    }
-    cJSON *trans = cJSON_GetObjectItem(node, "transport");
-    if(trans) {
-        cJSON *path = cJSON_GetObjectItem(trans, "path");
-        if(path && path->valuestring) strcpy(g_proxyConfig.path, path->valuestring);
-    }
-    if (strlen(g_proxyConfig.sni) == 0) strcpy(g_proxyConfig.sni, g_proxyConfig.host);
-    log_msg("Node Config Loaded: %s:%d (SNI: %s)", g_proxyConfig.host, g_proxyConfig.port, g_proxyConfig.sni);
-}
-
-void SwitchNode(const wchar_t* tag) {
-    wcsncpy(currentNode, tag, 63);
-    char* buffer = NULL; long size = 0;
-    if (!ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) return;
-    cJSON* root = cJSON_Parse(buffer); free(buffer);
-    if (!root) return;
-    cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
-    cJSON* targetNode = NULL;
-    char tagUtf8[256];
-    WideCharToMultiByte(CP_UTF8, 0, tag, -1, tagUtf8, 256, NULL, NULL);
-    cJSON* node;
-    cJSON_ArrayForEach(node, outbounds) {
-        cJSON* t = cJSON_GetObjectItem(node, "tag");
-        if (t && strcmp(t->valuestring, tagUtf8) == 0) {
-            targetNode = node; break;
-        }
-    }
-    if (targetNode) {
-        StopProxyCore();
-        ParseNodeConfigToGlobal(targetNode);
-        StartProxyCore();
-        wchar_t tip[128]; wsprintfW(tip, L"已切换: %s", tag);
-        wcsncpy(nid.szInfo, tip, 127);
-        wcsncpy(nid.szInfoTitle, L"Limbox Client", 63);
-        nid.uFlags |= NIF_INFO;
-        Shell_NotifyIconW(NIM_MODIFY, &nid);
-    }
-    cJSON_Delete(root);
-}
-
-void DeleteNode(const wchar_t* tag) {
-    char* buffer = NULL; long size = 0;
-    if (!ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) return;
-    cJSON* root = cJSON_Parse(buffer); free(buffer);
-    if (!root) return;
-    cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
-    char tagUtf8[256];
-    WideCharToMultiByte(CP_UTF8, 0, tag, -1, tagUtf8, 256, NULL, NULL);
-    int idx = 0;
-    cJSON* node;
-    cJSON_ArrayForEach(node, outbounds) {
-        cJSON* t = cJSON_GetObjectItem(node, "tag");
-        if (t && strcmp(t->valuestring, tagUtf8) == 0) {
-            cJSON_DeleteItemFromArray(outbounds, idx);
-            break;
-        }
-        idx++;
-    }
-    char* out = cJSON_Print(root);
-    WriteBufferToFile(CONFIG_FILE, out);
-    free(out); cJSON_Delete(root);
-    ParseTags(); 
-}
-
-void AddComboItem(HWND hCombo, const wchar_t* text, BOOL select) {
-    int idx = SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)text);
-    if (select) SendMessage(hCombo, CB_SETCURSEL, idx, 0);
-}
-
-void LoadNodeToEdit(HWND hWnd, const wchar_t* tag) {
-    char* buffer = NULL; long size = 0;
-    if (!ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) return;
-    cJSON* root = cJSON_Parse(buffer); free(buffer);
-    if (!root) return;
-    
-    char tagUtf8[256];
-    WideCharToMultiByte(CP_UTF8, 0, tag, -1, tagUtf8, 256, NULL, NULL);
-    cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
-    cJSON* target = NULL;
-    cJSON* node;
-    cJSON_ArrayForEach(node, outbounds) {
-        cJSON* t = cJSON_GetObjectItem(node, "tag");
-        if (t && strcmp(t->valuestring, tagUtf8) == 0) { target = node; break; }
-    }
-    if (target) {
-        SetDlgItemTextW(hWnd, ID_EDIT_TAG, tag);
-        cJSON* server = cJSON_GetObjectItem(target, "server");
-        if(server) SetDlgItemTextA(hWnd, ID_EDIT_ADDR, server->valuestring);
-        cJSON* port = cJSON_GetObjectItem(target, "server_port");
-        if(port) SetDlgItemInt(hWnd, ID_EDIT_PORT, port->valueint, FALSE);
-        cJSON* user = cJSON_GetObjectItem(target, "username");
-        if(!user) user = cJSON_GetObjectItem(target, "uuid");
-        if(user) SetDlgItemTextA(hWnd, ID_EDIT_USER, user->valuestring);
-        cJSON* pass = cJSON_GetObjectItem(target, "password");
-        if(pass) SetDlgItemTextA(hWnd, ID_EDIT_PASS, pass->valuestring);
-        cJSON* trans = cJSON_GetObjectItem(target, "transport"); 
-        if (!trans) trans = cJSON_GetObjectItem(target, "streamSettings");
-        HWND hNet = GetDlgItem(hWnd, ID_EDIT_NET);
-        SendMessage(hNet, CB_SETCURSEL, 0, 0); 
-        cJSON* netType = NULL;
-        if (trans) netType = cJSON_GetObjectItem(trans, "type");
-        if (!netType) netType = cJSON_GetObjectItem(target, "network");
-        if (netType && strcmp(netType->valuestring, "ws") == 0) SendMessage(hNet, CB_SETCURSEL, 1, 0);
-        cJSON* wsSettings = NULL;
-        if (trans) wsSettings = cJSON_GetObjectItem(trans, "wsSettings");
-        if (!wsSettings && trans && netType && strcmp(netType->valuestring, "ws") == 0) wsSettings = trans;
-        if (wsSettings) {
-             cJSON* path = cJSON_GetObjectItem(wsSettings, "path");
-             if (path) SetDlgItemTextA(hWnd, ID_EDIT_PATH, path->valuestring);
-             cJSON* headers = cJSON_GetObjectItem(wsSettings, "headers");
-             if (headers) {
-                 cJSON* host = cJSON_GetObjectItem(headers, "Host");
-                 if (host) SetDlgItemTextA(hWnd, ID_EDIT_HOST, host->valuestring);
-             }
-        }
-        HWND hTls = GetDlgItem(hWnd, ID_EDIT_TLS);
-        SendMessage(hTls, CB_SETCURSEL, 0, 0); 
-        cJSON* tls = cJSON_GetObjectItem(target, "tls");
-        cJSON* security = cJSON_GetObjectItem(target, "security");
-        if (tls || (security && strcmp(security->valuestring, "tls") == 0)) {
-             SendMessage(hTls, CB_SETCURSEL, 1, 0);
-             cJSON* sni = NULL;
-             if (tls) sni = cJSON_GetObjectItem(tls, "server_name");
-             if (sni) SetDlgItemTextA(hWnd, ID_EDIT_HOST, sni->valuestring);
-        }
-    }
-    cJSON_Delete(root);
-}
-
-void SaveEditedNode(HWND hWnd) {
-    wchar_t wTag[256], wAddr[256], wUser[256], wPass[256], wHost[256], wPath[256];
-    char tag[256], addr[256], user[256], pass[256], host[256], path[256];
-    int port = GetDlgItemInt(hWnd, ID_EDIT_PORT, NULL, FALSE);
-    GetDlgItemTextW(hWnd, ID_EDIT_TAG, wTag, 256);
-    GetDlgItemTextW(hWnd, ID_EDIT_ADDR, wAddr, 256);
-    GetDlgItemTextW(hWnd, ID_EDIT_USER, wUser, 256);
-    GetDlgItemTextW(hWnd, ID_EDIT_PASS, wPass, 256);
-    GetDlgItemTextW(hWnd, ID_EDIT_HOST, wHost, 256);
-    GetDlgItemTextW(hWnd, ID_EDIT_PATH, wPath, 256);
-    WideCharToMultiByte(CP_UTF8, 0, wTag, -1, tag, 256, NULL, NULL);
-    WideCharToMultiByte(CP_UTF8, 0, wAddr, -1, addr, 256, NULL, NULL);
-    WideCharToMultiByte(CP_UTF8, 0, wUser, -1, user, 256, NULL, NULL);
-    WideCharToMultiByte(CP_UTF8, 0, wPass, -1, pass, 256, NULL, NULL);
-    WideCharToMultiByte(CP_UTF8, 0, wHost, -1, host, 256, NULL, NULL);
-    WideCharToMultiByte(CP_UTF8, 0, wPath, -1, path, 256, NULL, NULL);
-    int netIdx = SendMessage(GetDlgItem(hWnd, ID_EDIT_NET), CB_GETCURSEL, 0, 0);
-    int tlsIdx = SendMessage(GetDlgItem(hWnd, ID_EDIT_TLS), CB_GETCURSEL, 0, 0);
-    cJSON* newNode = cJSON_CreateObject();
-    cJSON_AddStringToObject(newNode, "tag", tag);
-    cJSON_AddStringToObject(newNode, "server", addr);
-    cJSON_AddNumberToObject(newNode, "server_port", port);
-    BOOL isVmess = (strlen(user) > 20); 
-    if (isVmess) {
-        cJSON_AddStringToObject(newNode, "type", "vmess");
-        cJSON_AddStringToObject(newNode, "uuid", user);
-    } else {
-        cJSON_AddStringToObject(newNode, "type", "socks");
-        if (strlen(user)>0) cJSON_AddStringToObject(newNode, "username", user);
-        if (strlen(pass)>0) cJSON_AddStringToObject(newNode, "password", pass);
-    }
-    if (netIdx == 1) { 
-        cJSON* trans = cJSON_CreateObject();
-        cJSON_AddStringToObject(trans, "type", "ws");
-        if (strlen(path) > 0) cJSON_AddStringToObject(trans, "path", path);
-        if (strlen(host) > 0) {
-            cJSON* h = cJSON_CreateObject();
-            cJSON_AddStringToObject(h, "Host", host);
-            cJSON_AddItemToObject(trans, "headers", h);
-        }
-        cJSON_AddItemToObject(newNode, "transport", trans);
-    } else { cJSON_AddStringToObject(newNode, "network", "tcp"); }
-    if (tlsIdx == 1) {
-        cJSON* tlsObj = cJSON_CreateObject();
-        cJSON_AddBoolToObject(tlsObj, "enabled", cJSON_True);
-        if (strlen(host) > 0) cJSON_AddStringToObject(tlsObj, "server_name", host);
-        cJSON_AddItemToObject(newNode, "tls", tlsObj);
-    }
-    char* buffer = NULL; long size = 0;
-    if (ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) {
-        cJSON* root = cJSON_Parse(buffer); free(buffer);
-        if (root) {
-            cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
-            int count = cJSON_GetArraySize(outbounds);
-            int idxToReplace = -1;
-            char oldTagUtf8[256];
-            WideCharToMultiByte(CP_UTF8, 0, g_editingTag, -1, oldTagUtf8, 256, NULL, NULL);
-            for (int i=0; i<count; i++) {
-                cJSON* item = cJSON_GetArrayItem(outbounds, i);
-                cJSON* t = cJSON_GetObjectItem(item, "tag");
-                if (t && strcmp(t->valuestring, oldTagUtf8) == 0) {
-                    idxToReplace = i; break;
-                }
-            }
-            if (idxToReplace != -1) cJSON_ReplaceItemInArray(outbounds, idxToReplace, newNode);
-            else cJSON_AddItemToArray(outbounds, newNode);
-            char* out = cJSON_Print(root);
-            WriteBufferToFile(CONFIG_FILE, out);
-            free(out); cJSON_Delete(root);
-        } else cJSON_Delete(newNode);
-    } else cJSON_Delete(newNode);
-}
-
-char* GetUniqueTagName(cJSON* outbounds, const char* type, const char* base_name) {
-    static char final_tag[512];
-    char candidate[450];
-    const char* safe_name = (base_name && strlen(base_name) > 0) ? base_name : "Unnamed";
-    char prefix[64]; snprintf(prefix, sizeof(prefix), "%s-", type);
-    if (_strnicmp(safe_name, prefix, strlen(prefix)) == 0) snprintf(candidate, sizeof(candidate), "%s", safe_name);
-    else snprintf(candidate, sizeof(candidate), "%s-%s", type, safe_name);
-    int index = 0;
-    while (1) {
-        if (index == 0) snprintf(final_tag, sizeof(final_tag), "%s", candidate);
-        else snprintf(final_tag, sizeof(final_tag), "%s (%d)", candidate, index);
-        BOOL exists = FALSE;
-        cJSON* item = NULL;
-        cJSON_ArrayForEach(item, outbounds) {
-            cJSON* t = cJSON_GetObjectItem(item, "tag");
-            if (t && t->valuestring && strcmp(t->valuestring, final_tag) == 0) { exists = TRUE; break; }
-        }
-        if (!exists) break;
-        index++;
-    }
-    return final_tag;
-}
-
-BOOL AddNodeToConfig(cJSON* newNode) {
-    if (!newNode) return FALSE;
-    char* buffer = NULL; long size = 0; cJSON* root = NULL;
-    if (ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) { root = cJSON_Parse(buffer); free(buffer); }
-    if (!root) { root = cJSON_CreateObject(); cJSON_AddItemToObject(root, "outbounds", cJSON_CreateArray()); }
-    cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
-    if (!outbounds) { outbounds = cJSON_CreateArray(); cJSON_AddItemToObject(root, "outbounds", outbounds); }
-    cJSON* jsonType = cJSON_GetObjectItem(newNode, "type");
-    const char* typeStr = (jsonType && jsonType->valuestring) ? jsonType->valuestring : "proxy";
-    cJSON* jsonTag = cJSON_GetObjectItem(newNode, "tag");
-    const char* originalTag = (jsonTag && jsonTag->valuestring) ? jsonTag->valuestring : "NewNode";
-    char* uniqueTag = GetUniqueTagName(outbounds, typeStr, originalTag);
-    if (cJSON_HasObjectItem(newNode, "tag")) cJSON_ReplaceItemInObject(newNode, "tag", cJSON_CreateString(uniqueTag));
-    else cJSON_AddStringToObject(newNode, "tag", uniqueTag);
-    cJSON_AddItemToArray(outbounds, newNode);
-    char* out = cJSON_Print(root);
-    BOOL ret = WriteBufferToFile(CONFIG_FILE, out);
-    free(out); cJSON_Delete(root);
-    return ret;
-}
-
-cJSON* ParseSocks(const char* link) {
-    if (strncmp(link, "socks://", 8) != 0) return NULL;
-    const char* p = link + 8; const char* at = strchr(p, '@'); if (!at) return NULL; 
-    int authLen = (int)(at - p); char* authBase64 = (char*)malloc(authLen + 1); strncpy(authBase64, p, authLen); authBase64[authLen] = 0;
-    size_t decLen; unsigned char* decoded = Base64Decode(authBase64, &decLen); free(authBase64);
-    if (!decoded) return NULL;
-    char* user = (char*)decoded; char* pass = strchr(user, ':'); if (pass) { *pass = 0; pass++; } else pass = "";
-    p = at + 1; const char* colon = strchr(p, ':'); const char* qMark = strchr(p, '?'); const char* hash = strchr(p, '#');
-    const char* portStart = colon ? colon + 1 : NULL; const char* hostEnd = colon ? colon : (qMark ? qMark : (hash ? hash : p + strlen(p)));
-    int hostLen = (int)(hostEnd - p); char* host = (char*)malloc(hostLen + 1); strncpy(host, p, hostLen); host[hostLen] = 0;
-    int portNum = portStart ? atoi(portStart) : 443;
-    char* tag = hash ? (char*)malloc(strlen(hash+1)+1) : strdup("Socks-Import");
-    if(hash) UrlDecode(tag, hash+1);
-    const char* query = qMark ? qMark + 1 : NULL;
-    char* sni = GetQueryParam(query, "sni");
-    char* path = GetQueryParam(query, "path"); 
-    char* transport = GetQueryParam(query, "transport");
-    cJSON* outbound = cJSON_CreateObject();
-    cJSON_AddStringToObject(outbound, "type", "socks_tls");
-    cJSON_AddStringToObject(outbound, "tag", tag);
-    cJSON_AddStringToObject(outbound, "server", host);
-    cJSON_AddNumberToObject(outbound, "server_port", portNum);
-    cJSON_AddStringToObject(outbound, "username", user);
-    cJSON_AddStringToObject(outbound, "password", pass);
-    if (sni) {
-        cJSON* tls = cJSON_CreateObject(); cJSON_AddStringToObject(tls, "server_name", sni);
-        cJSON_AddItemToObject(outbound, "tls", tls); free(sni);
-    }
-    if (transport && strcmp(transport, "ws") == 0) {
-        cJSON* trans = cJSON_CreateObject(); cJSON_AddStringToObject(trans, "type", "ws");
-        if (path) cJSON_AddStringToObject(trans, "path", path);
-        if (sni) { 
-             cJSON* headers = cJSON_CreateObject(); cJSON_AddStringToObject(headers, "Host", host); 
-             cJSON_AddItemToObject(trans, "headers", headers);
-        }
-        cJSON_AddItemToObject(outbound, "transport", trans);
-    }
-    if (path) free(path); if (transport) free(transport); free(host); free(tag); free(decoded);
-    return outbound;
-}
-
-cJSON* ParseVmess(const char* link) {
-    if (strncmp(link, "vmess://", 8) != 0) return NULL;
-    size_t len; unsigned char* decoded = Base64Decode(link + 8, &len); if (!decoded) return NULL;
-    cJSON* vmessJson = cJSON_Parse((const char*)decoded); free(decoded); if (!vmessJson) return NULL;
-    cJSON* outbound = cJSON_CreateObject();
-    cJSON_AddStringToObject(outbound, "type", "vmess");
-    cJSON* ps = cJSON_GetObjectItem(vmessJson, "ps"); cJSON* add = cJSON_GetObjectItem(vmessJson, "add");
-    cJSON* port = cJSON_GetObjectItem(vmessJson, "port"); cJSON* id = cJSON_GetObjectItem(vmessJson, "id");
-    cJSON* net = cJSON_GetObjectItem(vmessJson, "net"); cJSON* host = cJSON_GetObjectItem(vmessJson, "host");
-    cJSON* path = cJSON_GetObjectItem(vmessJson, "path"); cJSON* tls = cJSON_GetObjectItem(vmessJson, "tls");
-    cJSON* sni = cJSON_GetObjectItem(vmessJson, "sni");
-    cJSON_AddStringToObject(outbound, "tag", cJSON_IsString(ps) ? ps->valuestring : "VMess");
-    cJSON_AddStringToObject(outbound, "server", cJSON_IsString(add) ? add->valuestring : "");
-    cJSON_AddNumberToObject(outbound, "server_port", cJSON_IsNumber(port)?port->valueint:atoi(port->valuestring));
-    cJSON_AddStringToObject(outbound, "uuid", cJSON_IsString(id) ? id->valuestring : "");
-    if (cJSON_IsString(net) && strcmp(net->valuestring, "ws") == 0) {
-        cJSON* t = cJSON_CreateObject(); cJSON_AddStringToObject(t, "type", "ws");
-        if(cJSON_IsString(path)) cJSON_AddStringToObject(t, "path", path->valuestring);
-        if(cJSON_IsString(host) && strlen(host->valuestring)>0) {
-            cJSON* h = cJSON_CreateObject(); cJSON_AddStringToObject(h, "Host", host->valuestring);
-            cJSON_AddItemToObject(t, "headers", h);
-        }
-        cJSON_AddItemToObject(outbound, "transport", t);
-    } 
-    if ((cJSON_IsString(tls) && strcmp(tls->valuestring, "tls") == 0)) {
-        cJSON* t = cJSON_CreateObject(); cJSON_AddBoolToObject(t, "enabled", cJSON_True);
-        if (cJSON_IsString(sni) && strlen(sni->valuestring)>0) cJSON_AddStringToObject(t, "server_name", sni->valuestring);
-        else if (cJSON_IsString(host) && strlen(host->valuestring)>0) cJSON_AddStringToObject(t, "server_name", host->valuestring);
-        cJSON_AddItemToObject(outbound, "tls", t);
-    }
-    cJSON_Delete(vmessJson); return outbound;
-}
-
-cJSON* ParseVlessOrTrojan(const char* link) {
-    char protocol[16] = {0};
-    if (strncmp(link, "vless://", 8) == 0) strcpy(protocol, "vless");
-    else if (strncmp(link, "trojan://", 9) == 0) strcpy(protocol, "trojan");
-    else return NULL;
-    const char* p = link + strlen(protocol) + 3; const char* at = strchr(p, '@'); if (!at) return NULL;
-    int uuidLen = (int)(at - p); char* uuid = (char*)malloc(uuidLen + 1); strncpy(uuid, p, uuidLen); uuid[uuidLen] = 0;
-    p = at + 1; const char* colon = strchr(p, ':'); const char* qMark = strchr(p, '?'); const char* hash = strchr(p, '#');
-    const char* portStart = colon ? colon + 1 : NULL; const char* hostEnd = colon ? colon : (qMark ? qMark : (hash ? hash : p + strlen(p)));
-    int hostLen = (int)(hostEnd - p); char* host = (char*)malloc(hostLen + 1); strncpy(host, p, hostLen); host[hostLen] = 0;
-    int portNum = portStart ? atoi(portStart) : 443;
-    char* tag = hash ? (char*)malloc(strlen(hash+1)+1) : strdup(protocol);
-    if(hash) UrlDecode(tag, hash+1);
-    cJSON* outbound = cJSON_CreateObject();
-    cJSON_AddStringToObject(outbound, "type", protocol);
-    cJSON_AddStringToObject(outbound, "tag", tag);
-    cJSON_AddStringToObject(outbound, "server", host);
-    cJSON_AddNumberToObject(outbound, "server_port", portNum);
-    if (strcmp(protocol, "vless") == 0) cJSON_AddStringToObject(outbound, "uuid", uuid);
-    else cJSON_AddStringToObject(outbound, "password", uuid);
-    const char* query = qMark ? qMark + 1 : NULL;
-    char* type = GetQueryParam(query, "type");
-    if (type && strcmp(type, "ws") == 0) {
-        cJSON* t = cJSON_CreateObject(); cJSON_AddStringToObject(t, "type", "ws");
-        char* path = GetQueryParam(query, "path");
-        if (path) { cJSON_AddStringToObject(t, "path", path); free(path); }
-        char* hHeader = GetQueryParam(query, "host");
-        if (hHeader) {
-            cJSON* headers = cJSON_CreateObject(); cJSON_AddStringToObject(headers, "Host", hHeader);
-            cJSON_AddItemToObject(t, "headers", headers); free(hHeader);
-        }
-        cJSON_AddItemToObject(outbound, "transport", t);
-    }
-    if (type) free(type);
-    char* security = GetQueryParam(query, "security");
-    if (security && strcmp(security, "tls") == 0) {
-        cJSON* tlsObj = cJSON_CreateObject(); cJSON_AddBoolToObject(tlsObj, "enabled", cJSON_True);
-        char* sni = GetQueryParam(query, "sni");
-        if (sni) { cJSON_AddStringToObject(tlsObj, "server_name", sni); free(sni); }
-        else cJSON_AddStringToObject(tlsObj, "server_name", host);
-        cJSON_AddItemToObject(outbound, "tls", tlsObj);
-    }
-    if (security) free(security);
-    free(uuid); free(host); free(tag); return outbound;
-}
-
-cJSON* ParseShadowsocks(const char* link) {
-    if (strncmp(link, "ss://", 5) != 0) return NULL;
-    const char* p = link + 5; const char* hash = strchr(p, '#');
-    char* tag = hash ? (char*)malloc(strlen(hash+1)+1) : strdup("SS");
-    if(hash) UrlDecode(tag, hash+1);
-    size_t mainLen = hash ? (size_t)(hash - p) : strlen(p);
-    char* mainPart = (char*)malloc(mainLen + 1); strncpy(mainPart, p, mainLen); mainPart[mainLen] = 0;
-    char serverPort[256] = {0}, methodPass[256] = {0};
-    char* at = strchr(mainPart, '@');
-    if (!at) {
-        size_t decLen; unsigned char* decoded = Base64Decode(mainPart, &decLen);
-        if(!decoded) { free(mainPart); free(tag); return NULL; }
-        char* dStr = (char*)decoded;
-        at = strchr(dStr, '@');
-        if (at) { strncpy(serverPort, at+1, 255); strncpy(methodPass, dStr, at-dStr); }
-        free(decoded);
-    } else {
-        strncpy(serverPort, at+1, 255);
-        char tmp[256]; strncpy(tmp, mainPart, at-mainPart); tmp[at-mainPart]=0;
-        size_t decLen; unsigned char* decoded = Base64Decode(tmp, &decLen);
-        if(decoded) { strncpy(methodPass, (char*)decoded, 255); free(decoded); }
-    }
-    free(mainPart);
-    char* colon = strrchr(serverPort, ':'); if (!colon) { free(tag); return NULL; }
-    int port = atoi(colon + 1); *colon = 0;
-    char* pass = strchr(methodPass, ':'); if (!pass) { free(tag); return NULL; }
-    *pass = 0; pass++;
-    cJSON* outbound = cJSON_CreateObject();
-    cJSON_AddStringToObject(outbound, "type", "shadowsocks");
-    cJSON_AddStringToObject(outbound, "tag", tag);
-    cJSON_AddStringToObject(outbound, "server", serverPort);
-    cJSON_AddNumberToObject(outbound, "server_port", port);
-    cJSON_AddStringToObject(outbound, "method", methodPass);
-    cJSON_AddStringToObject(outbound, "password", pass);
-    free(tag); return outbound;
-}
-
-int ImportFromClipboard() {
-    char* text = GetClipboardText(); 
-    if (!text) return 0;
-    int successCount = 0;
-    char* context = NULL;
-    char* token = strtok_s(text, " \r\n\t,", &context);
-    while (token != NULL) {
-        TrimString(token);
-        if (strlen(token) > 0) {
-            cJSON* node = NULL;
-            if (_strnicmp(token, "socks://", 8) == 0) node = ParseSocks(token);
-            else if (_strnicmp(token, "vmess://", 8) == 0) node = ParseVmess(token);
-            else if (_strnicmp(token, "vless://", 8) == 0) node = ParseVlessOrTrojan(token);
-            else if (_strnicmp(token, "trojan://", 9) == 0) node = ParseVlessOrTrojan(token);
-            else if (_strnicmp(token, "ss://", 5) == 0) node = ParseShadowsocks(token);
-            if (node) {
-                if (AddNodeToConfig(node)) successCount++;
-            }
-        }
-        token = strtok_s(NULL, " \r\n\t,", &context);
-    }
-    free(text);
-    return successCount;
-}
-
 void ToggleTrayIcon() {
     if (g_isIconVisible) { 
         Shell_NotifyIconW(NIM_DELETE, &nid); 
@@ -941,6 +518,7 @@ void FreeGlobalSSLContext() {
     }
 }
 
+// 核心逻辑修改：从资源加载证书
 void init_openssl_global() {
     if (g_ssl_ctx) return;
     SSL_library_init(); 
@@ -963,8 +541,7 @@ void init_openssl_global() {
         log_msg("[Security] Standard OpenSSL Cipher Suites");
     }
 
-    // --- 修改开始: 从资源加载证书 ---
-    // 资源 ID 为 2，类型为 RT_RCDATA
+    // 从资源加载证书 (ID: 2, Type: RT_RCDATA)
     HRSRC hRes = FindResourceW(NULL, MAKEINTRESOURCEW(2), RT_RCDATA);
     if (hRes) {
         HGLOBAL hData = LoadResource(NULL, hRes);
@@ -972,17 +549,13 @@ void init_openssl_global() {
         DWORD dataSize = SizeofResource(NULL, hRes);
 
         if (pData && dataSize > 0) {
-            // 创建内存 BIO
             BIO *cbio = BIO_new_mem_buf(pData, dataSize);
             if (cbio) {
                 X509_STORE *cts = SSL_CTX_get_cert_store(g_ssl_ctx);
                 X509 *x = NULL;
                 int count = 0;
-                // 循环读取 PEM 数据中的所有证书
                 while ((x = PEM_read_bio_X509(cbio, NULL, 0, NULL)) != NULL) {
-                    if (X509_STORE_add_cert(cts, x)) {
-                        count++;
-                    }
+                    if (X509_STORE_add_cert(cts, x)) count++;
                     X509_free(x);
                 }
                 BIO_free(cbio);
@@ -1003,20 +576,27 @@ void init_openssl_global() {
             log_msg("[Warning] Empty CA resource. Insecure mode.");
         }
     } else {
-        // 如果找不到资源，回退到不验证模式
         SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, NULL);
         log_msg("[Warning] cacert.pem resource not found in exe. Insecure mode.");
     }
-    // --- 修改结束 ---
 }
 
+// 核心逻辑修改：Padding 支持
 int tls_init_connect(TLSContext *ctx) {
     ctx->ssl = SSL_new(g_ssl_ctx);
     
-    // 创建基础 Socket BIO
+    // 设置随机 Padding
+    if (g_enablePadding) {
+        int range = g_padSizeMax - g_padSizeMin;
+        if (range < 0) range = 0;
+        int blockSize = g_padSizeMin + (range > 0 ? (rand() % (range + 1)) : 0);
+        if (blockSize > 0) {
+            SSL_set_block_padding(ctx->ssl, blockSize);
+        }
+    }
+
     BIO *bio = BIO_new_socket(ctx->sock, BIO_NOCLOSE);
     
-    // [抗封锁] 如果开启分片，则挂载分片过滤器 BIO
     if (g_enableFragment) {
         BIO *frag = BIO_new(BIO_f_fragment());
         bio = BIO_push(frag, bio);
@@ -1128,7 +708,6 @@ int send_all(SOCKET s, const char *buf, int len) {
     }
     return total;
 }
-
 DWORD WINAPI client_handler(LPVOID p) {
     SOCKET c = (SOCKET)(UINT_PTR)p; TLSContext tls; memset(&tls, 0, sizeof(tls));
     SOCKET r = INVALID_SOCKET;      
@@ -1159,7 +738,10 @@ DWORD WINAPI client_handler(LPVOID p) {
     a.sin_addr = *(struct in_addr*)h->h_addr;
     if (connect(r, (struct sockaddr*)&a, sizeof(a)) != 0) { log_wsa_error("TCP Connect"); goto cl_end; }
     tls.sock = r;
+    
+    // 这里会调用修改过的 tls_init_connect，应用 Padding 和分片配置
     if (tls_init_connect(&tls) != 0) goto cl_end;
+    
     const char* sni_val = (strlen(g_proxyConfig.sni) > 0) ? g_proxyConfig.sni : g_proxyConfig.host;
 
     int offset = snprintf(ws_send_buf, BUFFER_SIZE, 
@@ -1253,7 +835,7 @@ cl_end:
 }
 
 DWORD WINAPI server_thread(LPVOID p) {
-    init_openssl_global();
+    init_openssl_global(); // 使用修改后的资源加载版本
     g_listen_sock = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET; addr.sin_port = htons(g_localPort);
@@ -1287,109 +869,133 @@ void StopProxyCore() {
     log_msg("Proxy Stopped");
 }
 
+// 界面逻辑完全重写：支持新的随机分片和Padding配置
 LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     static HWND hHotkey, hPortEdit;
     switch(msg) {
-        case WM_CREATE:
-            CreateWindowW(L"STATIC", L"全局快捷键:", WS_CHILD|WS_VISIBLE, 20,20,150,20, hWnd, NULL,NULL,NULL);
-            hHotkey = CreateWindowExW(0, HOTKEY_CLASSW, NULL, WS_CHILD|WS_VISIBLE|WS_BORDER, 20,45,240,25, hWnd, (HMENU)ID_HOTKEY_CTRL, NULL,NULL);
+        case WM_CREATE: {
+            int y = 20;
+            // 1. 基础设置
+            CreateWindowW(L"STATIC", L"全局快捷键:", WS_CHILD|WS_VISIBLE, 20, y, 100, 20, hWnd, NULL,NULL,NULL);
+            hHotkey = CreateWindowExW(0, HOTKEY_CLASSW, NULL, WS_CHILD|WS_VISIBLE|WS_BORDER, 130, y-3, 180, 25, hWnd, (HMENU)ID_HOTKEY_CTRL, NULL,NULL);
             UINT hkMod = 0; if (g_hotkeyModifiers & MOD_SHIFT) hkMod |= HOTKEYF_SHIFT;
             if (g_hotkeyModifiers & MOD_CONTROL) hkMod |= HOTKEYF_CONTROL;
             if (g_hotkeyModifiers & MOD_ALT) hkMod |= HOTKEYF_ALT;
             SendMessage(hHotkey, HKM_SETHOTKEY, MAKEWORD(g_hotkeyVk, hkMod), 0);
             
-            CreateWindowW(L"STATIC", L"本地代理端口:", WS_CHILD|WS_VISIBLE, 20,80,150,20, hWnd, NULL,NULL,NULL);
-            hPortEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", NULL, WS_CHILD|WS_VISIBLE|ES_NUMBER, 20,105,100,25, hWnd, (HMENU)ID_PORT_EDIT, NULL,NULL);
+            y += 35;
+            CreateWindowW(L"STATIC", L"本地代理端口:", WS_CHILD|WS_VISIBLE, 20, y, 100, 20, hWnd, NULL,NULL,NULL);
+            hPortEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", NULL, WS_CHILD|WS_VISIBLE|ES_NUMBER, 130, y-3, 80, 25, hWnd, (HMENU)ID_PORT_EDIT, NULL,NULL);
             SetDlgItemInt(hWnd, ID_PORT_EDIT, g_localPort, FALSE);
 
-            CreateWindowW(L"BUTTON", L"抗封锁设置 (Anti-Censorship)", WS_CHILD|WS_VISIBLE|BS_GROUPBOX, 20, 145, 300, 270, hWnd, NULL, NULL, NULL);
+            // 2. 抗封锁设置 GroupBox
+            y += 40;
+            CreateWindowW(L"BUTTON", L"抗封锁设置 (Anti-Censorship)", WS_CHILD|WS_VISIBLE|BS_GROUPBOX, 20, y, 300, 310, hWnd, NULL, NULL, NULL);
             
-            HWND hChk1 = CreateWindowW(L"BUTTON", L"启用 Chrome 浏览器指纹", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 35, 165, 250, 20, hWnd, (HMENU)ID_CHK_CIPHERS, NULL, NULL);
-            HWND hChk2 = CreateWindowW(L"BUTTON", L"启用 ALPN 伪装 (http/1.1)", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 35, 190, 250, 20, hWnd, (HMENU)ID_CHK_ALPN, NULL, NULL);
+            y += 25;
+            HWND hChk1 = CreateWindowW(L"BUTTON", L"启用 Chrome 浏览器指纹", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 35, y, 250, 20, hWnd, (HMENU)ID_CHK_CIPHERS, NULL, NULL);
+            y += 25;
+            HWND hChk2 = CreateWindowW(L"BUTTON", L"启用 ALPN 伪装 (http/1.1)", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 35, y, 250, 20, hWnd, (HMENU)ID_CHK_ALPN, NULL, NULL);
             
-            HWND hChk3 = CreateWindowW(L"BUTTON", L"启用 TCP 分片 (Fragmentation)", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 35, 215, 250, 20, hWnd, (HMENU)ID_CHK_FRAG, NULL, NULL);
+            // --- 分片设置 ---
+            y += 25;
+            HWND hChk3 = CreateWindowW(L"BUTTON", L"启用 TCP 随机分片 (Fragment)", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 35, y, 250, 20, hWnd, (HMENU)ID_CHK_FRAG, NULL, NULL);
             
-            // 分片参数输入框
-            CreateWindowW(L"STATIC", L"长度:", WS_CHILD|WS_VISIBLE, 55, 240, 40, 20, hWnd, NULL, NULL, NULL);
-            HWND hFragLen = CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER, 95, 238, 40, 22, hWnd, (HMENU)ID_EDIT_FRAG_LEN, NULL, NULL);
+            y += 25;
+            CreateWindowW(L"STATIC", L"分片长度范围:", WS_CHILD|WS_VISIBLE, 55, y+2, 90, 20, hWnd, NULL,NULL,NULL);
+            HWND hFMin = CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER|ES_CENTER, 145, y, 35, 22, hWnd, (HMENU)ID_EDIT_FRAG_MIN, NULL, NULL);
+            CreateWindowW(L"STATIC", L"-", WS_CHILD|WS_VISIBLE, 185, y+2, 10, 20, hWnd, NULL,NULL,NULL);
+            HWND hFMax = CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER|ES_CENTER, 200, y, 35, 22, hWnd, (HMENU)ID_EDIT_FRAG_MAX, NULL, NULL);
             
-            CreateWindowW(L"STATIC", L"延迟(ms):", WS_CHILD|WS_VISIBLE, 150, 240, 60, 20, hWnd, NULL, NULL, NULL);
-            HWND hFragDly = CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER, 210, 238, 40, 22, hWnd, (HMENU)ID_EDIT_FRAG_DLY, NULL, NULL);
+            CreateWindowW(L"STATIC", L"延迟(ms):", WS_CHILD|WS_VISIBLE, 245, y+2, 60, 20, hWnd, NULL,NULL,NULL);
+            HWND hDly = CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER, 290, y, 20, 22, hWnd, (HMENU)ID_EDIT_FRAG_DLY, NULL, NULL);
 
-            SetDlgItemInt(hWnd, ID_EDIT_FRAG_LEN, g_fragSplitSize, FALSE);
-            SetDlgItemInt(hWnd, ID_EDIT_FRAG_DLY, g_fragDelayMs, FALSE);
+            // --- Padding 设置 ---
+            y += 30;
+            HWND hChkPad = CreateWindowW(L"BUTTON", L"启用 TLS Padding (随机包长)", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 35, y, 250, 20, hWnd, (HMENU)ID_CHK_PADDING, NULL, NULL);
+            
+            y += 25;
+            CreateWindowW(L"STATIC", L"随机填充范围:", WS_CHILD|WS_VISIBLE, 55, y+2, 90, 20, hWnd, NULL,NULL,NULL);
+            HWND hPMin = CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER|ES_CENTER, 145, y, 35, 22, hWnd, (HMENU)ID_EDIT_PAD_MIN, NULL, NULL);
+            CreateWindowW(L"STATIC", L"-", WS_CHILD|WS_VISIBLE, 185, y+2, 10, 20, hWnd, NULL,NULL,NULL);
+            HWND hPMax = CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER|ES_CENTER, 200, y, 35, 22, hWnd, (HMENU)ID_EDIT_PAD_MAX, NULL, NULL);
 
+            // --- UA 设置 ---
+            y += 35;
+            CreateWindowW(L"STATIC", L"伪装平台:", WS_CHILD|WS_VISIBLE, 35, y, 60, 20, hWnd, NULL,NULL,NULL);
+            HWND hCombo = CreateWindowW(L"COMBOBOX", NULL, WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL, 100, y-3, 200, 200, hWnd, (HMENU)ID_COMBO_PLATFORM, NULL, NULL);
+            
+            y += 25;
+            HWND hEditUA = CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_AUTOHSCROLL, 35, y, 265, 25, hWnd, (HMENU)ID_EDIT_UA_STR, NULL, NULL);
+
+            // 按钮
+            CreateWindowW(L"BUTTON", L"确定", WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON, 60, 420, 80, 30, hWnd, (HMENU)IDOK, NULL,NULL);
+            CreateWindowW(L"BUTTON", L"取消", WS_CHILD|WS_VISIBLE, 190, 420, 80, 30, hWnd, (HMENU)IDCANCEL, NULL,NULL);
+
+            // 初始化控件值
             SendMessage(hChk1, BM_SETCHECK, g_enableChromeCiphers ? BST_CHECKED : BST_UNCHECKED, 0);
             SendMessage(hChk2, BM_SETCHECK, g_enableALPN ? BST_CHECKED : BST_UNCHECKED, 0);
             SendMessage(hChk3, BM_SETCHECK, g_enableFragment ? BST_CHECKED : BST_UNCHECKED, 0);
+            SendMessage(hChkPad, BM_SETCHECK, g_enablePadding ? BST_CHECKED : BST_UNCHECKED, 0);
 
-            CreateWindowW(L"STATIC", L"伪装平台 (Platform):", WS_CHILD|WS_VISIBLE, 35, 275, 150, 20, hWnd, NULL,NULL,NULL);
-            HWND hCombo = CreateWindowW(L"COMBOBOX", NULL, WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL, 35, 295, 270, 200, hWnd, (HMENU)ID_COMBO_PLATFORM, NULL, NULL);
+            SetDlgItemInt(hWnd, ID_EDIT_FRAG_MIN, g_fragSizeMin, FALSE);
+            SetDlgItemInt(hWnd, ID_EDIT_FRAG_MAX, g_fragSizeMax, FALSE);
+            SetDlgItemInt(hWnd, ID_EDIT_FRAG_DLY, g_fragDelayMs, FALSE);
+            
+            SetDlgItemInt(hWnd, ID_EDIT_PAD_MIN, g_padSizeMin, FALSE);
+            SetDlgItemInt(hWnd, ID_EDIT_PAD_MAX, g_padSizeMax, FALSE);
+
             for(int i=0; i<5; i++) SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)UA_PLATFORMS[i]);
             SendMessage(hCombo, CB_SETCURSEL, g_uaPlatformIndex, 0);
-
-            CreateWindowW(L"STATIC", L"User-Agent:", WS_CHILD|WS_VISIBLE, 35, 325, 100, 20, hWnd, NULL,NULL,NULL);
-            HWND hEditUA = CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_AUTOHSCROLL, 35, 345, 270, 25, hWnd, (HMENU)ID_EDIT_UA_STR, NULL, NULL);
             SetDlgItemTextA(hWnd, ID_EDIT_UA_STR, g_userAgentStr);
-
-            CreateWindowW(L"BUTTON", L"确定", WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON, 60,425,80,30, hWnd, (HMENU)IDOK, NULL,NULL);
-            CreateWindowW(L"BUTTON", L"取消", WS_CHILD|WS_VISIBLE, 190,425,80,30, hWnd, (HMENU)IDCANCEL, NULL,NULL);
             
             EnumChildWindows(hWnd, (WNDENUMPROC)(void*)SendMessageW, (LPARAM)hAppFont);
             SendMessage(hWnd, WM_SETFONT, (WPARAM)hAppFont, TRUE);
             break;
+        }
         case WM_COMMAND:
             if (LOWORD(wParam) == ID_COMBO_PLATFORM && HIWORD(wParam) == CBN_SELCHANGE) {
                 int idx = SendMessage((HWND)lParam, CB_GETCURSEL, 0, 0);
                 if (idx >= 0 && idx < 5) SetDlgItemTextA(hWnd, ID_EDIT_UA_STR, UA_TEMPLATES[idx]);
             }
             if (LOWORD(wParam) == IDOK) {
+                // 保存逻辑
+                int fMin = GetDlgItemInt(hWnd, ID_EDIT_FRAG_MIN, NULL, FALSE);
+                int fMax = GetDlgItemInt(hWnd, ID_EDIT_FRAG_MAX, NULL, FALSE);
+                int fDly = GetDlgItemInt(hWnd, ID_EDIT_FRAG_DLY, NULL, FALSE);
+                int pMin = GetDlgItemInt(hWnd, ID_EDIT_PAD_MIN, NULL, FALSE);
+                int pMax = GetDlgItemInt(hWnd, ID_EDIT_PAD_MAX, NULL, FALSE);
+                
+                // 简单的校验
+                if (fMin < 1) fMin = 1; if (fMax < fMin) fMax = fMin;
+                if (pMin < 0) pMin = 0; if (pMax < pMin) pMax = pMin;
+
+                g_fragSizeMin = fMin; g_fragSizeMax = fMax; g_fragDelayMs = fDly;
+                g_padSizeMin = pMin; g_padSizeMax = pMax;
+
+                g_enableChromeCiphers = (IsDlgButtonChecked(hWnd, ID_CHK_CIPHERS) == BST_CHECKED);
+                g_enableALPN = (IsDlgButtonChecked(hWnd, ID_CHK_ALPN) == BST_CHECKED);
+                g_enableFragment = (IsDlgButtonChecked(hWnd, ID_CHK_FRAG) == BST_CHECKED);
+                g_enablePadding = (IsDlgButtonChecked(hWnd, ID_CHK_PADDING) == BST_CHECKED);
+
+                g_uaPlatformIndex = SendMessage(GetDlgItem(hWnd, ID_COMBO_PLATFORM), CB_GETCURSEL, 0, 0);
+                GetDlgItemTextA(hWnd, ID_EDIT_UA_STR, g_userAgentStr, 511);
+
                 LRESULT res = SendMessage(hHotkey, HKM_GETHOTKEY, 0, 0);
                 UINT vk = LOBYTE(res); UINT mod = HIBYTE(res);
                 UINT newMod = 0; if (mod & HOTKEYF_SHIFT) newMod |= MOD_SHIFT;
                 if (mod & HOTKEYF_CONTROL) newMod |= MOD_CONTROL;
                 if (mod & HOTKEYF_ALT) newMod |= MOD_ALT;
-                
-                int port = GetDlgItemInt(hWnd, ID_PORT_EDIT, NULL, FALSE);
-                BOOL portChanged = (g_localPort != port);
-                if (port > 0 && port < 65535) g_localPort = port;
-
-                BOOL c1 = (IsDlgButtonChecked(hWnd, ID_CHK_CIPHERS) == BST_CHECKED);
-                BOOL c2 = (IsDlgButtonChecked(hWnd, ID_CHK_ALPN) == BST_CHECKED);
-                BOOL c3 = (IsDlgButtonChecked(hWnd, ID_CHK_FRAG) == BST_CHECKED);
-                
-                int fragLen = GetDlgItemInt(hWnd, ID_EDIT_FRAG_LEN, NULL, FALSE);
-                int fragDly = GetDlgItemInt(hWnd, ID_EDIT_FRAG_DLY, NULL, FALSE);
-                
-                char uaBuf[512] = {0};
-                GetDlgItemTextA(hWnd, ID_EDIT_UA_STR, uaBuf, 511);
-                int pIdx = SendMessage(GetDlgItem(hWnd, ID_COMBO_PLATFORM), CB_GETCURSEL, 0, 0);
-
-                BOOL securityChanged = (c1 != g_enableChromeCiphers || c2 != g_enableALPN || c3 != g_enableFragment || 
-                                        fragLen != g_fragSplitSize || fragDly != g_fragDelayMs ||
-                                        strcmp(uaBuf, g_userAgentStr)!=0);
-                
-                g_enableChromeCiphers = c1;
-                g_enableALPN = c2;
-                g_enableFragment = c3;
-                g_fragSplitSize = fragLen > 0 ? fragLen : 1;
-                g_fragDelayMs = fragDly >= 0 ? fragDly : 0;
-                
-                g_uaPlatformIndex = pIdx;
-                strcpy(g_userAgentStr, uaBuf);
-
                 if (vk != 0 && newMod != 0) {
                     UnregisterHotKey(hwnd, ID_GLOBAL_HOTKEY);
                     if (RegisterHotKey(hwnd, ID_GLOBAL_HOTKEY, newMod, vk)) { g_hotkeyVk = vk; g_hotkeyModifiers = newMod; }
                 }
-                
-                SaveSettings(); 
-                
-                if ((portChanged || securityChanged) && g_proxyRunning) {
-                    StopProxyCore(); 
-                    StartProxyCore(); 
-                }
 
+                int port = GetDlgItemInt(hWnd, ID_PORT_EDIT, NULL, FALSE);
+                if (port > 0 && port < 65535) g_localPort = port;
+
+                SaveSettings();
+                if (g_proxyRunning) { StopProxyCore(); StartProxyCore(); }
                 DestroyWindow(hWnd);
             } else if (LOWORD(wParam) == IDCANCEL) DestroyWindow(hWnd);
             break;
@@ -1401,13 +1007,10 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 void OpenSettingsWindow() {
     WNDCLASSW wc = {0}; wc.lpfnWndProc=SettingsWndProc; wc.hInstance=GetModuleHandle(NULL); wc.lpszClassName=L"Settings"; wc.hbrBackground=(HBRUSH)(COLOR_BTNFACE+1);
     WNDCLASSW temp; if (!GetClassInfoW(GetModuleHandle(NULL), L"Settings", &temp)) RegisterClassW(&wc);
-    // 增加高度到 500
+    // 高度增加到 500 以容纳新选项
     HWND h = CreateWindowW(L"Settings", L"程序设置", WS_VISIBLE|WS_CAPTION|WS_SYSMENU, CW_USEDEFAULT,0,350,500, hwnd,NULL,wc.hInstance,NULL);
     ShowWindow(h, SW_SHOW);
 }
-
-// ... (LRESULT CALLBACK ListBox_Proc 及之后代码完全不变，保持原样即可) ...
-// 为了确保完整性，以下是剩余代码，与之前版本一致，无需变动
 
 LRESULT CALLBACK ListBox_Proc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == WM_KEYDOWN) {
@@ -1820,6 +1423,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 }
 
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nShow) {
+    srand((unsigned)time(NULL)); // 初始化随机数种子，用于分片和Padding
     WSADATA wsa; WSAStartup(MAKEWORD(2,2), &wsa);
     INITCOMMONCONTROLSEX ic = {sizeof(INITCOMMONCONTROLSEX), ICC_HOTKEY_CLASS}; InitCommonControlsEx(&ic);
     hAppFont = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Microsoft YaHei");
@@ -1841,7 +1445,4 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nSho
     if (nodeCount > 0) SwitchNode(nodeTags[0]);
     MSG msg; while(GetMessage(&msg, NULL, 0, 0)) { TranslateMessage(&msg); DispatchMessage(&msg); }
     return 0;
-
 }
-
-
