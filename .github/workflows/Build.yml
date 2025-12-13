@@ -17,8 +17,8 @@ jobs:
       with:
         msystem: MINGW64
         # 1. 关闭自动更新，防止启动时因签名问题崩溃
-        update: false
-        cache: false
+        update: true
+        cache: true
         install: git
 
     - name: Disable Signature Check and Install Dependencies
