@@ -24,8 +24,16 @@ static HWND hSubWnd = NULL;
 #define ID_SUB_URL_EDIT 3004
 #define ID_SUB_SAVE_BTN 3005
 
-// [新增] 定义更新完成消息，用于线程通知主界面
+// 定义更新完成消息
 #define WM_UPDATE_FINISH (WM_USER + 200)
+
+// --- 辅助函数：字体设置回调 ---
+// [修复] 标准的 EnumChildWindows 回调函数
+// 之前的强制转换会导致参数错位，导致字体无法应用
+BOOL CALLBACK EnumSetFont(HWND hWnd, LPARAM lParam) {
+    SendMessageW(hWnd, WM_SETFONT, (WPARAM)lParam, TRUE);
+    return TRUE;
+}
 
 // --- 自动更新线程 ---
 DWORD WINAPI AutoUpdateThread(LPVOID lpParam) {
@@ -55,20 +63,14 @@ DWORD WINAPI AutoUpdateThread(LPVOID lpParam) {
     return 0;
 }
 
-// [新增] 手动更新线程函数 (解决 UI 卡顿)
+// 手动更新线程函数 (解决 UI 卡顿)
 DWORD WINAPI ManualUpdateThread(LPVOID param) {
     HWND hWnd = (HWND)param;
     // 执行更新 (TRUE = 强制记录日志)
-    // 这个函数包含网络请求，耗时较长
     int count = UpdateAllSubscriptions(TRUE);
-    
-    // 任务完成后，发送自定义消息通知 UI 线程
-    // wParam 传递获取到的节点数量
     PostMessage(hWnd, WM_UPDATE_FINISH, (WPARAM)count, 0);
     return 0;
 }
-
-// --- 辅助函数 ---
 
 void AddComboItem(HWND hCombo, const wchar_t* text, BOOL select) {
     int idx = SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)text);
@@ -300,7 +302,8 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             SendMessage(hCombo, CB_SETCURSEL, g_uaPlatformIndex, 0);
             SetDlgItemTextA(hWnd, ID_EDIT_UA_STR, g_userAgentStr);
             
-            EnumChildWindows(hWnd, (WNDENUMPROC)(void*)SendMessageW, (LPARAM)hAppFont);
+            // [修复] 使用正确的 EnumChildWindows 调用方式
+            EnumChildWindows(hWnd, EnumSetFont, (LPARAM)hAppFont);
             SendMessage(hWnd, WM_SETFONT, (WPARAM)hAppFont, TRUE);
             break;
         }
@@ -317,7 +320,6 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
                 int pMin = GetDlgItemInt(hWnd, ID_EDIT_PAD_MIN, NULL, FALSE);
                 int pMax = GetDlgItemInt(hWnd, ID_EDIT_PAD_MAX, NULL, FALSE);
                 
-                // 简单的校验
                 if (fMin < 1) fMin = 1; if (fMax < fMin) fMax = fMin;
                 if (pMin < 0) pMin = 0; if (pMax < pMin) pMax = pMin;
 
@@ -422,7 +424,8 @@ LRESULT CALLBACK SubWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             
             RefreshSubList();
             
-            EnumChildWindows(hWnd, (WNDENUMPROC)(void*)SendMessageW, (LPARAM)hAppFont);
+            // [修复] 使用正确的 EnumChildWindows 调用方式
+            EnumChildWindows(hWnd, EnumSetFont, (LPARAM)hAppFont);
             SendMessage(hWnd, WM_SETFONT, (WPARAM)hAppFont, TRUE);
             break;
         }
@@ -547,7 +550,8 @@ LRESULT CALLBACK NodeMgrWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             // 按钮名称已改为 "订阅设置"
             CreateWindowW(L"BUTTON", L"订阅设置", WS_CHILD | WS_VISIBLE, 270, 185, 120, 30, hWnd, (HMENU)ID_NODEMGR_SUB, NULL, NULL);
 
-            EnumChildWindows(hWnd, (WNDENUMPROC)(void*)SendMessageW, (LPARAM)hAppFont);
+            // [修复] 使用正确的 EnumChildWindows 调用方式
+            EnumChildWindows(hWnd, EnumSetFont, (LPARAM)hAppFont);
             SendMessage(hWnd, WM_SETFONT, (WPARAM)hAppFont, TRUE);
             SendMessage(hWnd, WM_REFRESH_NODELIST, 0, 0); 
             break;
@@ -664,8 +668,11 @@ LRESULT CALLBACK NodeEditWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             y += 80; 
             g_nEditContentHeight = y; 
             g_nEditScrollPos = 0;
-            EnumChildWindows(hWnd, (WNDENUMPROC)(void*)SendMessageW, (LPARAM)hAppFont);
+            
+            // [修复] 使用正确的 EnumChildWindows 调用方式
+            EnumChildWindows(hWnd, EnumSetFont, (LPARAM)hAppFont);
             if (hAppFont) SendMessage(hWnd, WM_SETFONT, (WPARAM)hAppFont, TRUE);
+            
             LoadNodeToEdit(hWnd, g_editingTag);
             SCROLLINFO si;
             si.cbSize = sizeof(si);
@@ -863,7 +870,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nSho
     WSADATA wsa; WSAStartup(MAKEWORD(2,2), &wsa);
     INITCOMMONCONTROLSEX ic = {sizeof(INITCOMMONCONTROLSEX), ICC_HOTKEY_CLASS}; InitCommonControlsEx(&ic);
     
-    // 获取系统菜单字体
+    // 获取系统菜单字体 (与主程序一致)
     NONCLIENTMETRICSW ncm = { sizeof(NONCLIENTMETRICSW) };
     if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(NONCLIENTMETRICSW), &ncm, 0)) {
         hAppFont = CreateFontIndirectW(&ncm.lfMenuFont);
@@ -880,7 +887,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nSho
     
     LoadSettings();
 
-    // --- 新增：启动自动更新线程 ---
+    // 启动自动更新线程
     CreateThread(NULL, 0, AutoUpdateThread, NULL, 0, NULL);
     
     WNDCLASSW wc = {0}; wc.lpfnWndProc = WndProc; wc.hInstance = hInst; wc.lpszClassName = L"TrayProxyClass";
