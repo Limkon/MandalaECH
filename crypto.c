@@ -42,7 +42,7 @@ static int frag_free(BIO *b) {
     return 1;
 }
 
-// [优化] 限制最大分片数量，防止 Windows Sleep 精度导致的握手超时
+// [优化] 限制分片数量，防止握手超时
 #define MAX_FRAG_COUNT 32 
 
 static int frag_write(BIO *b, const char *in, int inl) {
@@ -56,11 +56,10 @@ static int frag_write(BIO *b, const char *in, int inl) {
 
         int bytes_sent = 0;
         int remaining = inl;
-        int frag_count = 0; // 分片计数器
+        int frag_count = 0;
 
         while (remaining > 0) {
-            // 如果分片次数过多（超过32次，约覆盖300-600字节，足够覆盖 SNI），
-            // 则停止分片，直接发送剩余数据，避免握手超时。
+            // 安全逃逸：分片过多直接发送剩余数据
             if (frag_count >= MAX_FRAG_COUNT) {
                 int ret = BIO_write(next, in + bytes_sent, remaining);
                 if (ret <= 0) {
@@ -69,7 +68,7 @@ static int frag_write(BIO *b, const char *in, int inl) {
                 }
                 bytes_sent += ret;
                 remaining -= ret;
-                break; // 完成
+                break;
             }
 
             int chunk_size;
@@ -91,8 +90,6 @@ static int frag_write(BIO *b, const char *in, int inl) {
             remaining -= ret;
             frag_count++;
 
-            // 延时处理
-            // 注意：Windows Sleep(1) 实际可能暂停 15.6ms
             if (remaining > 0 && g_fragDelayMs > 0) {
                  Sleep(rand() % (g_fragDelayMs + 1));
             }
@@ -182,7 +179,7 @@ void init_openssl_global() {
     }
 }
 
-// --- 纯净模式：完全依赖配置 ---
+// --- 修复 Padding 导致的 MTU 问题 ---
 int tls_init_connect(TLSContext *ctx) {
     ctx->ssl = SSL_new(g_ssl_ctx);
     
@@ -192,7 +189,10 @@ int tls_init_connect(TLSContext *ctx) {
         
         int blockSize = g_padSizeMin + (range > 0 ? (rand() % (range + 1)) : 0);
         
-        if (blockSize > 16384) blockSize = 16384;
+        // [关键修复] 强制限制最大 Padding 块大小
+        // 防止：ClientHello (600) + Padding (1000) > MTU (1500)
+        // 限制为 200 可以提供足够的混淆，同时避免大跨度的对齐导致包过大
+        if (blockSize > 200) blockSize = 200; 
 
         if (blockSize > 0) {
             SSL_set_block_padding(ctx->ssl, blockSize);
@@ -201,6 +201,7 @@ int tls_init_connect(TLSContext *ctx) {
 
     BIO *bio = BIO_new_socket(ctx->sock, BIO_NOCLOSE);
     
+    // 只有在启用分片时才压入 filter BIO
     if (g_enableFragment) {
         BIO *frag = BIO_new(BIO_f_fragment());
         bio = BIO_push(frag, bio);
