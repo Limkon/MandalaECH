@@ -1,7 +1,6 @@
 #include "common.h"
 
 // --- 全局变量定义 (Definitions) ---
-// 注意：这里没有 extern 关键字
 
 ProxyConfig g_proxyConfig;
 volatile BOOL g_proxyRunning = FALSE;
@@ -27,20 +26,18 @@ int g_hideTrayStart = 0;
 int g_nEditScrollPos = 0;
 int g_nEditContentHeight = 0;
 
-// 抗封锁配置
-BOOL g_enableChromeCiphers = TRUE;
-BOOL g_enableALPN = TRUE;
-// 默认启用分片
-BOOL g_enableFragment = TRUE; 
-// 最佳分片默认值：5 - 20 字节
+// 抗封锁配置 - 默认关闭 (Default: OFF)
+BOOL g_enableChromeCiphers = TRUE; // 模拟 Chrome 指纹通常默认开启无副作用
+BOOL g_enableALPN = TRUE;          // ALPN 也是标准功能，默认开启
+
+// --- 修改点：默认不开启分片 ---
+BOOL g_enableFragment = FALSE; 
 int g_fragSizeMin = 5;
 int g_fragSizeMax = 20;
 int g_fragDelayMs = 2;
 
-// 默认启用 Padding
-BOOL g_enablePadding = TRUE;
-// 最佳 Padding 默认值：100 - 500 字节
-// 确保足够大以掩盖 HTTP 请求头特征，且区间足够大以提供随机性
+// --- 修改点：默认不开启 Padding ---
+BOOL g_enablePadding = FALSE;
 int g_padSizeMin = 100;
 int g_padSizeMax = 500;
 
