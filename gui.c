@@ -24,6 +24,9 @@ static HWND hSubWnd = NULL;
 #define ID_SUB_URL_EDIT 3004
 #define ID_SUB_SAVE_BTN 3005
 
+// [新增] 定义更新完成消息，用于线程通知主界面
+#define WM_UPDATE_FINISH (WM_USER + 200)
+
 // --- 自动更新线程 ---
 DWORD WINAPI AutoUpdateThread(LPVOID lpParam) {
     // 延时 3 秒，等待主程序初始化完毕且界面显示出来
@@ -42,8 +45,6 @@ DWORD WINAPI AutoUpdateThread(LPVOID lpParam) {
             
             // 如果之前没有节点，现在有了，尝试自动切换到第一个
             if (wcslen(currentNode) == 0) {
-                // 注意：这里简单通过解析标签来获取第一个节点
-                // 实际切换最好在主线程或确保线程安全，这里仅做简单处理
                 ParseTags();
                 if (nodeCount > 0) {
                     SwitchNode(nodeTags[0]);
@@ -51,6 +52,19 @@ DWORD WINAPI AutoUpdateThread(LPVOID lpParam) {
             }
         }
     }
+    return 0;
+}
+
+// [新增] 手动更新线程函数 (解决 UI 卡顿)
+DWORD WINAPI ManualUpdateThread(LPVOID param) {
+    HWND hWnd = (HWND)param;
+    // 执行更新 (TRUE = 强制记录日志)
+    // 这个函数包含网络请求，耗时较长
+    int count = UpdateAllSubscriptions(TRUE);
+    
+    // 任务完成后，发送自定义消息通知 UI 线程
+    // wParam 传递获取到的节点数量
+    PostMessage(hWnd, WM_UPDATE_FINISH, (WPARAM)count, 0);
     return 0;
 }
 
@@ -456,36 +470,37 @@ LRESULT CALLBACK SubWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 SaveSettings();
                 MessageBoxW(hWnd, L"订阅设置已保存", L"成功", MB_OK);
             }
-            else if (id == ID_SUB_UPD_BTN) { // 立即更新
-                // [修复] 1. 手动同步界面状态到内存，确保 enabled 状态最新
+            else if (id == ID_SUB_UPD_BTN) { // [修复] 立即更新 (多线程版)
+                // 1. 同步 CheckBox 状态
                 for(int i=0; i<g_subCount; i++) {
                     g_subs[i].enabled = ListView_GetCheckState(hSubList, i);
                 }
-                
-                // [修复] 2. 静默保存到文件，替代原先的 SendMessage 调用，避免弹窗
                 SaveSettings(); 
 
-                SetWindowTextW(hWnd, L"正在更新 (超时10s)...");
-                EnableWindow(GetDlgItem(hWnd, ID_SUB_UPD_BTN), FALSE); // 禁用按钮防止重复点击
-                UpdateWindow(hWnd); // 强制重绘
+                // 2. 更新界面状态 (禁用按钮，防止重复点击)
+                SetWindowTextW(hWnd, L"正在更新 (后台进行中)...");
+                EnableWindow(GetDlgItem(hWnd, ID_SUB_UPD_BTN), FALSE); 
                 
-                HCURSOR hOld = SetCursor(LoadCursor(NULL, IDC_WAIT));
-                
-                // 执行更新 (TRUE = 强制记录日志)
-                int count = UpdateAllSubscriptions(TRUE);
-                
-                SetCursor(hOld);
-                EnableWindow(GetDlgItem(hWnd, ID_SUB_UPD_BTN), TRUE);
-                SetWindowTextW(hWnd, L"订阅设置");
-                
-                wchar_t msg[128];
-                wsprintfW(msg, L"更新完成，共获取 %d 个节点。", count);
-                MessageBoxW(hWnd, msg, L"结果", MB_OK);
-                
-                // 刷新主界面列表
-                HWND hMgr = FindWindowW(L"NodeMgr", NULL);
-                if (hMgr) SendMessage(hMgr, WM_REFRESH_NODELIST, 0, 0);
+                // 3. 启动后台线程执行更新，避免阻塞 UI
+                CreateThread(NULL, 0, ManualUpdateThread, (LPVOID)hWnd, 0, NULL);
             }
+            break;
+        }
+        // [新增] 处理线程完成消息
+        case WM_UPDATE_FINISH: {
+            int count = (int)wParam;
+            
+            // 恢复按钮和窗口标题
+            EnableWindow(GetDlgItem(hWnd, ID_SUB_UPD_BTN), TRUE);
+            SetWindowTextW(hWnd, L"订阅设置");
+            
+            wchar_t msg[128];
+            wsprintfW(msg, L"更新完成，共获取 %d 个节点。", count);
+            MessageBoxW(hWnd, msg, L"结果", MB_OK);
+            
+            // 刷新主界面列表
+            HWND hMgr = FindWindowW(L"NodeMgr", NULL);
+            if (hMgr) SendMessage(hMgr, WM_REFRESH_NODELIST, 0, 0);
             break;
         }
         case WM_CLOSE: DestroyWindow(hWnd); break;
