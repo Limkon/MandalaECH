@@ -10,7 +10,7 @@ WNDPROC g_oldListBoxProc = NULL;
 // 用于追踪设置窗口的句柄，实现单例模式
 static HWND hSettingsWnd = NULL;
 
-// --- 补全缺失的辅助函数 ---
+// --- 辅助函数 ---
 
 void AddComboItem(HWND hCombo, const wchar_t* text, BOOL select) {
     int idx = SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)text);
@@ -150,7 +150,7 @@ void SaveEditedNode(HWND hWnd) {
     } else cJSON_Delete(newNode);
 }
 
-// --- End of missing functions ---
+// --- ListBox 与 Settings 窗口逻辑 ---
 
 LRESULT CALLBACK ListBox_Proc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == WM_KEYDOWN) {
@@ -314,14 +314,99 @@ void OpenSettingsWindow() {
     ShowWindow(hSettingsWnd, SW_SHOW);
 }
 
+// --- 新增：订阅窗口逻辑 ---
+
+LRESULT CALLBACK SubWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch(msg) {
+        case WM_CREATE:
+            CreateWindowW(L"STATIC", L"订阅地址 (URL):", WS_CHILD|WS_VISIBLE, 20, 20, 120, 20, hWnd, NULL,NULL,NULL);
+            // ID 101 为编辑框
+            HWND hEdit = CreateWindowA("EDIT", g_subUrl, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_AUTOHSCROLL, 20, 45, 340, 25, hWnd, (HMENU)101, NULL,NULL);
+            SendMessage(hEdit, EM_SETSEL, 0, -1); 
+            
+            CreateWindowW(L"BUTTON", L"更新并覆盖", WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON, 60, 90, 100, 30, hWnd, (HMENU)IDOK, NULL,NULL);
+            CreateWindowW(L"BUTTON", L"取消", WS_CHILD|WS_VISIBLE, 190, 90, 100, 30, hWnd, (HMENU)IDCANCEL, NULL,NULL);
+            
+            EnumChildWindows(hWnd, (WNDENUMPROC)(void*)SendMessageW, (LPARAM)hAppFont);
+            SendMessage(hWnd, WM_SETFONT, (WPARAM)hAppFont, TRUE);
+            break;
+            
+        case WM_COMMAND:
+            if (LOWORD(wParam) == IDOK) {
+                char newUrl[512];
+                GetDlgItemTextA(hWnd, 101, newUrl, 512);
+                TrimString(newUrl);
+                
+                if (strlen(newUrl) < 4) {
+                    MessageBoxW(hWnd, L"请输入有效的订阅地址！", L"错误", MB_OK|MB_ICONERROR);
+                    return 0;
+                }
+
+                strcpy(g_subUrl, newUrl);
+                SaveSettings();
+
+                // 简单的阻塞式更新提示
+                HCURSOR hOld = SetCursor(LoadCursor(NULL, IDC_WAIT));
+                SetWindowTextW(hWnd, L"正在下载并解析...");
+                
+                int count = UpdateNodesFromSubscription(g_subUrl);
+                
+                SetCursor(hOld);
+                
+                if (count >= 0) {
+                    wchar_t msg[128];
+                    wsprintfW(msg, L"订阅更新成功！\n共获取到 %d 个节点。\n旧节点已被覆盖。", count);
+                    MessageBoxW(hWnd, msg, L"成功", MB_OK|MB_ICONINFORMATION);
+                    
+                    // 刷新节点管理列表
+                    HWND hMgr = FindWindowW(L"NodeMgr", NULL);
+                    if (hMgr) SendMessage(hMgr, WM_REFRESH_NODELIST, 0, 0);
+                    
+                    // 如果存在节点，自动切换到第一个
+                    if (count > 0 && nodeTags && nodeCount > 0) {
+                         SwitchNode(nodeTags[0]);
+                    }
+                    DestroyWindow(hWnd);
+                } else {
+                    MessageBoxW(hWnd, L"下载订阅失败，请检查网络或地址是否正确。", L"失败", MB_OK|MB_ICONERROR);
+                    SetWindowTextW(hWnd, L"订阅设置");
+                }
+            }
+            else if (LOWORD(wParam) == IDCANCEL) {
+                DestroyWindow(hWnd);
+            }
+            break;
+        case WM_CLOSE: DestroyWindow(hWnd); break;
+    }
+    return DefWindowProcW(hWnd, msg, wParam, lParam);
+}
+
+void OpenSubWindow() {
+    WNDCLASSW wc = {0};
+    if (!GetClassInfoW(GetModuleHandle(NULL), L"SubWnd", &wc)) {
+        wc.lpfnWndProc = SubWndProc; wc.hInstance = GetModuleHandle(NULL); 
+        wc.lpszClassName = L"SubWnd"; wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE+1);
+        RegisterClassW(&wc);
+    }
+    HWND h = CreateWindowW(L"SubWnd", L"订阅设置", WS_VISIBLE|WS_CAPTION|WS_SYSMENU, CW_USEDEFAULT,0,400,180, NULL,NULL,GetModuleHandle(NULL),NULL);
+}
+
+// --- 节点管理窗口 ---
+
 LRESULT CALLBACK NodeMgrWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     static HWND hList;
+    #define ID_NODEMGR_SUB 2003 // 新增的订阅按钮 ID
+
     switch(msg) {
         case WM_CREATE:
             hList = CreateWindowW(L"LISTBOX", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|WS_VSCROLL|LBS_NOTIFY|LBS_EXTENDEDSEL, 10, 10, 410, 170, hWnd, (HMENU)ID_NODEMGR_LIST, NULL, NULL);
             g_oldListBoxProc = (WNDPROC)SetWindowLongPtr(hList, GWLP_WNDPROC, (LONG_PTR)ListBox_Proc);
+            
             CreateWindowW(L"BUTTON", L"编辑选中节点", WS_CHILD | WS_VISIBLE, 10, 185, 120, 30, hWnd, (HMENU)ID_NODEMGR_EDIT, NULL, NULL);
             CreateWindowW(L"BUTTON", L"删除选中节点", WS_CHILD | WS_VISIBLE, 140, 185, 120, 30, hWnd, (HMENU)ID_NODEMGR_DEL, NULL, NULL);
+            // 新增订阅按钮
+            CreateWindowW(L"BUTTON", L"订阅更新", WS_CHILD | WS_VISIBLE, 270, 185, 120, 30, hWnd, (HMENU)ID_NODEMGR_SUB, NULL, NULL);
+
             EnumChildWindows(hWnd, (WNDENUMPROC)(void*)SendMessageW, (LPARAM)hAppFont);
             SendMessage(hWnd, WM_SETFONT, (WPARAM)hAppFont, TRUE);
             SendMessage(hWnd, WM_REFRESH_NODELIST, 0, 0); 
@@ -332,7 +417,10 @@ LRESULT CALLBACK NodeMgrWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             for(int i = 0; i < nodeCount; i++) SendMessageW(hList, LB_ADDSTRING, 0, (LPARAM)nodeTags[i]);
             break;
         case WM_COMMAND:
-            if (LOWORD(wParam) == ID_NODEMGR_EDIT) {
+            if (LOWORD(wParam) == ID_NODEMGR_SUB) {
+                OpenSubWindow();
+            }
+            else if (LOWORD(wParam) == ID_NODEMGR_EDIT) {
                 int selCount = SendMessage(hList, LB_GETSELCOUNT, 0, 0);
                 if (selCount <= 0) {
                     MessageBoxW(hWnd, L"请先选择一个需要编辑的节点！", L"提示", MB_OK|MB_ICONWARNING);
@@ -624,7 +712,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nSho
     srand((unsigned)time(NULL)); // 初始化随机数种子
 
     // --- 新增：强制设置工作目录为 EXE 所在目录 ---
-    // 解决开机启动时工作目录被设为 System32 导致无法读取 config.json 的问题
     wchar_t exePath[MAX_PATH];
     GetModuleFileNameW(NULL, exePath, MAX_PATH);
     wchar_t* pDir = wcsrchr(exePath, L'\\');
@@ -637,12 +724,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nSho
     WSADATA wsa; WSAStartup(MAKEWORD(2,2), &wsa);
     INITCOMMONCONTROLSEX ic = {sizeof(INITCOMMONCONTROLSEX), ICC_HOTKEY_CLASS}; InitCommonControlsEx(&ic);
     
-    // 关键修改：获取系统菜单字体，确保与右键菜单一致
+    // 获取系统菜单字体
     NONCLIENTMETRICSW ncm = { sizeof(NONCLIENTMETRICSW) };
     if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(NONCLIENTMETRICSW), &ncm, 0)) {
         hAppFont = CreateFontIndirectW(&ncm.lfMenuFont);
     } else {
-        // 后备字体：微软雅黑
         hAppFont = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Microsoft YaHei");
     }
     
