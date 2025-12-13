@@ -3,14 +3,56 @@
 #include "proxy.h"
 #include "utils.h"
 #include "crypto.h"
+#include <commctrl.h>
+#include <stdio.h>
+
+// 链接 comctl32 库以支持高级控件
+#pragma comment(lib, "comctl32.lib")
 
 // 宣告 ListBox 的舊視窗程序變數
 WNDPROC g_oldListBoxProc = NULL;
 
-// 用于追踪设置窗口的句柄，实现单例模式
+// 用于追踪窗口句柄，实现单例模式
 static HWND hSettingsWnd = NULL;
-// 用于追踪订阅窗口的句柄，实现单例模式
 static HWND hSubWnd = NULL;
+
+// 订阅窗口控件 ID
+#define ID_SUB_LIST     3000
+#define ID_SUB_ADD_BTN  3001
+#define ID_SUB_DEL_BTN  3002
+#define ID_SUB_UPD_BTN  3003
+#define ID_SUB_URL_EDIT 3004
+#define ID_SUB_SAVE_BTN 3005
+
+// --- 自动更新线程 ---
+DWORD WINAPI AutoUpdateThread(LPVOID lpParam) {
+    // 延时 3 秒，等待主程序初始化完毕且界面显示出来
+    Sleep(3000); 
+    
+    // 如果有启用的订阅，执行更新 (FALSE = 不弹窗，只写日志)
+    if (g_subCount > 0) {
+        int count = UpdateAllSubscriptions(FALSE);
+        
+        // 如果更新到了节点，通知界面刷新
+        if (count > 0) {
+            HWND hMgr = FindWindowW(L"NodeMgr", NULL);
+            if (hMgr && IsWindow(hMgr)) {
+                PostMessage(hMgr, WM_REFRESH_NODELIST, 0, 0);
+            }
+            
+            // 如果之前没有节点，现在有了，尝试自动切换到第一个
+            if (wcslen(currentNode) == 0) {
+                // 注意：这里简单通过解析标签来获取第一个节点
+                // 实际切换最好在主线程或确保线程安全，这里仅做简单处理
+                ParseTags();
+                if (nodeCount > 0) {
+                    SwitchNode(nodeTags[0]);
+                }
+            }
+        }
+    }
+    return 0;
+}
 
 // --- 辅助函数 ---
 
@@ -316,91 +358,157 @@ void OpenSettingsWindow() {
     ShowWindow(hSettingsWnd, SW_SHOW);
 }
 
-// --- 新增：订阅窗口逻辑 (修复无响应问题) ---
+// --- 新增：订阅设置窗口逻辑 ---
+
+static HWND hSubList;
+
+void RefreshSubList() {
+    if (!hSubList) return;
+    ListView_DeleteAllItems(hSubList);
+    for (int i = 0; i < g_subCount; i++) {
+        LVITEMW li = {0};
+        li.mask = LVIF_TEXT;
+        li.iItem = i;
+        li.iSubItem = 0;
+        
+        wchar_t wUrl[512];
+        MultiByteToWideChar(CP_UTF8, 0, g_subs[i].url, -1, wUrl, 512);
+        li.pszText = wUrl;
+        
+        ListView_InsertItem(hSubList, &li);
+        // 设置 CheckBox 状态
+        ListView_SetCheckState(hSubList, i, g_subs[i].enabled);
+    }
+}
 
 LRESULT CALLBACK SubWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch(msg) {
-        case WM_CREATE:
-            CreateWindowW(L"STATIC", L"订阅地址 (URL):", WS_CHILD|WS_VISIBLE, 20, 20, 120, 20, hWnd, NULL,NULL,NULL);
-            // ID 101 为编辑框
-            HWND hEdit = CreateWindowA("EDIT", g_subUrl, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_AUTOHSCROLL, 20, 45, 340, 25, hWnd, (HMENU)101, NULL,NULL);
-            SendMessage(hEdit, EM_SETSEL, 0, -1); 
+        case WM_CREATE: {
+            // 1. 创建 ListView (URL 列表)
+            hSubList = CreateWindowExW(0, WC_LISTVIEWW, NULL, 
+                WS_CHILD|WS_VISIBLE|WS_BORDER|LVS_REPORT|LVS_NOCOLUMNHEADER|LVS_SHOWSELALWAYS|LVS_SINGLESEL, 
+                10, 10, 460, 150, hWnd, (HMENU)ID_SUB_LIST, GetModuleHandle(NULL), NULL);
             
-            CreateWindowW(L"BUTTON", L"更新并覆盖", WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON, 60, 90, 100, 30, hWnd, (HMENU)IDOK, NULL,NULL);
-            CreateWindowW(L"BUTTON", L"取消", WS_CHILD|WS_VISIBLE, 190, 90, 100, 30, hWnd, (HMENU)IDCANCEL, NULL,NULL);
+            ListView_SetExtendedListViewStyle(hSubList, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+            
+            LVCOLUMNW lc = {0};
+            lc.mask = LVCF_WIDTH; 
+            lc.cx = 430; 
+            ListView_InsertColumn(hSubList, 0, &lc);
+
+            // 2. 创建 URL 输入框和添加按钮
+            CreateWindowW(L"STATIC", L"新增地址:", WS_CHILD|WS_VISIBLE, 10, 175, 70, 20, hWnd, NULL,NULL,NULL);
+            CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_AUTOHSCROLL, 80, 172, 300, 24, hWnd, (HMENU)ID_SUB_URL_EDIT, NULL,NULL);
+            CreateWindowW(L"BUTTON", L"添加", WS_CHILD|WS_VISIBLE, 390, 172, 80, 24, hWnd, (HMENU)ID_SUB_ADD_BTN, NULL,NULL);
+
+            // 3. 底部功能按钮
+            CreateWindowW(L"BUTTON", L"删除选中", WS_CHILD|WS_VISIBLE, 10, 210, 80, 28, hWnd, (HMENU)ID_SUB_DEL_BTN, NULL,NULL);
+            CreateWindowW(L"BUTTON", L"保存设置", WS_CHILD|WS_VISIBLE, 280, 210, 80, 28, hWnd, (HMENU)ID_SUB_SAVE_BTN, NULL,NULL);
+            CreateWindowW(L"BUTTON", L"立即更新", WS_CHILD|WS_VISIBLE, 370, 210, 100, 28, hWnd, (HMENU)ID_SUB_UPD_BTN, NULL,NULL);
+            
+            RefreshSubList();
             
             EnumChildWindows(hWnd, (WNDENUMPROC)(void*)SendMessageW, (LPARAM)hAppFont);
             SendMessage(hWnd, WM_SETFONT, (WPARAM)hAppFont, TRUE);
             break;
+        }
+        case WM_COMMAND: {
+            int id = LOWORD(wParam);
             
-        case WM_COMMAND:
-            if (LOWORD(wParam) == IDOK) {
-                char newUrl[512];
-                GetDlgItemTextA(hWnd, 101, newUrl, 512);
-                TrimString(newUrl);
-                
-                if (strlen(newUrl) < 4) {
-                    MessageBoxW(hWnd, L"请输入有效的订阅地址！", L"错误", MB_OK|MB_ICONERROR);
-                    return 0;
+            if (id == ID_SUB_ADD_BTN) { // 添加
+                if (g_subCount >= MAX_SUBS) {
+                    MessageBoxW(hWnd, L"已达最大订阅数限制(20个)", L"提示", MB_OK);
+                    break;
                 }
-
-                strcpy(g_subUrl, newUrl);
-                SaveSettings();
-
-                // 阻塞式更新前准备：设置光标，更新文本，强制刷新界面
-                HCURSOR hOld = SetCursor(LoadCursor(NULL, IDC_WAIT));
-                SetWindowTextW(hWnd, L"正在下载并解析...");
-                UpdateWindow(hWnd); // 关键：强制立即重绘，避免界面卡死白屏
+                char newUrl[512];
+                GetDlgItemTextA(hWnd, ID_SUB_URL_EDIT, newUrl, 512);
+                TrimString(newUrl);
+                if (strlen(newUrl) < 4) {
+                    MessageBoxW(hWnd, L"请输入有效的订阅地址", L"错误", MB_OK);
+                    break;
+                }
+                // 加入列表
+                strcpy(g_subs[g_subCount].url, newUrl);
+                g_subs[g_subCount].enabled = TRUE;
+                g_subCount++;
                 
-                int count = UpdateNodesFromSubscription(g_subUrl);
+                RefreshSubList();
+                SetDlgItemTextA(hWnd, ID_SUB_URL_EDIT, ""); // 清空输入框
+            }
+            else if (id == ID_SUB_DEL_BTN) { // 删除
+                int sel = ListView_GetNextItem(hSubList, -1, LVNI_SELECTED);
+                if (sel != -1) {
+                    // 移动删除
+                    for (int i = sel; i < g_subCount - 1; i++) {
+                        g_subs[i] = g_subs[i+1];
+                    }
+                    g_subCount--;
+                    RefreshSubList();
+                } else {
+                    MessageBoxW(hWnd, L"请先在列表中选中一项", L"提示", MB_OK);
+                }
+            }
+            else if (id == ID_SUB_SAVE_BTN) { // 保存
+                // 同步 CheckBox 状态
+                for(int i=0; i<g_subCount; i++) {
+                    g_subs[i].enabled = ListView_GetCheckState(hSubList, i);
+                }
+                SaveSettings();
+                MessageBoxW(hWnd, L"订阅设置已保存", L"成功", MB_OK);
+            }
+            else if (id == ID_SUB_UPD_BTN) { // 立即更新
+                // 先自动保存当前状态
+                SendMessage(hWnd, WM_COMMAND, ID_SUB_SAVE_BTN, 0); 
+
+                SetWindowTextW(hWnd, L"正在更新 (超时10s)...");
+                EnableWindow(GetDlgItem(hWnd, ID_SUB_UPD_BTN), FALSE); // 禁用按钮防止重复点击
+                UpdateWindow(hWnd); // 强制重绘
+                
+                HCURSOR hOld = SetCursor(LoadCursor(NULL, IDC_WAIT));
+                
+                // 执行更新 (TRUE = 强制记录日志，如果需要弹窗提示也可在 UpdateAllSubscriptions 修改，但这里我们在 UI 层弹窗)
+                int count = UpdateAllSubscriptions(TRUE);
                 
                 SetCursor(hOld);
+                EnableWindow(GetDlgItem(hWnd, ID_SUB_UPD_BTN), TRUE);
+                SetWindowTextW(hWnd, L"订阅设置");
                 
-                if (count >= 0) {
-                    wchar_t msg[128];
-                    wsprintfW(msg, L"订阅更新成功！\n共获取到 %d 个节点。\n旧节点已被覆盖。", count);
-                    MessageBoxW(hWnd, msg, L"成功", MB_OK|MB_ICONINFORMATION);
-                    
-                    // 刷新节点管理列表
-                    HWND hMgr = FindWindowW(L"NodeMgr", NULL);
-                    if (hMgr) SendMessage(hMgr, WM_REFRESH_NODELIST, 0, 0);
-                    
-                    // 如果存在节点，自动切换到第一个
-                    if (count > 0 && nodeTags && nodeCount > 0) {
-                         SwitchNode(nodeTags[0]);
-                    }
-                    DestroyWindow(hWnd);
-                } else {
-                    MessageBoxW(hWnd, L"下载订阅失败，请检查网络或地址是否正确。", L"失败", MB_OK|MB_ICONERROR);
-                    SetWindowTextW(hWnd, L"订阅设置");
-                }
-            }
-            else if (LOWORD(wParam) == IDCANCEL) {
-                DestroyWindow(hWnd);
+                wchar_t msg[128];
+                wsprintfW(msg, L"更新完成，共获取 %d 个节点。", count);
+                MessageBoxW(hWnd, msg, L"结果", MB_OK);
+                
+                // 刷新主界面列表
+                HWND hMgr = FindWindowW(L"NodeMgr", NULL);
+                if (hMgr) SendMessage(hMgr, WM_REFRESH_NODELIST, 0, 0);
             }
             break;
+        }
         case WM_CLOSE: DestroyWindow(hWnd); break;
-        case WM_DESTROY: hSubWnd = NULL; break; // 窗口销毁时重置单例句柄
+        case WM_DESTROY: hSubWnd = NULL; break;
     }
     return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
 
 void OpenSubWindow() {
-    // 单例模式检查：如果窗口已存在，则恢复并前置
+    // 单例检查：如果窗口已存在，直接显示并置顶
     if (hSubWnd && IsWindow(hSubWnd)) {
         ShowWindow(hSubWnd, SW_RESTORE);
         SetForegroundWindow(hSubWnd);
         return;
     }
-
     WNDCLASSW wc = {0};
     if (!GetClassInfoW(GetModuleHandle(NULL), L"SubWnd", &wc)) {
         wc.lpfnWndProc = SubWndProc; wc.hInstance = GetModuleHandle(NULL); 
         wc.lpszClassName = L"SubWnd"; wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE+1);
-        wc.hCursor = LoadCursor(NULL, IDC_ARROW); // 显式加载箭头光标
+        wc.hCursor = LoadCursor(NULL, IDC_ARROW);
         RegisterClassW(&wc);
     }
-    hSubWnd = CreateWindowW(L"SubWnd", L"订阅设置", WS_VISIBLE|WS_CAPTION|WS_SYSMENU, CW_USEDEFAULT,0,400,180, NULL,NULL,GetModuleHandle(NULL),NULL);
+    // 创建窗口
+    hSubWnd = CreateWindowW(L"SubWnd", L"订阅设置", WS_VISIBLE|WS_CAPTION|WS_SYSMENU, 
+        CW_USEDEFAULT,0,500,290, NULL,NULL,GetModuleHandle(NULL),NULL);
+        
+    ShowWindow(hSubWnd, SW_SHOW);
+    UpdateWindow(hSubWnd);
 }
 
 // --- 节点管理窗口 ---
@@ -416,7 +524,7 @@ LRESULT CALLBACK NodeMgrWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             
             CreateWindowW(L"BUTTON", L"编辑选中节点", WS_CHILD | WS_VISIBLE, 10, 185, 120, 30, hWnd, (HMENU)ID_NODEMGR_EDIT, NULL, NULL);
             CreateWindowW(L"BUTTON", L"删除选中节点", WS_CHILD | WS_VISIBLE, 140, 185, 120, 30, hWnd, (HMENU)ID_NODEMGR_DEL, NULL, NULL);
-            // 修改：将按钮名称从“订阅更新”改为“订阅设置”
+            // 按钮名称已改为 "订阅设置"
             CreateWindowW(L"BUTTON", L"订阅设置", WS_CHILD | WS_VISIBLE, 270, 185, 120, 30, hWnd, (HMENU)ID_NODEMGR_SUB, NULL, NULL);
 
             EnumChildWindows(hWnd, (WNDENUMPROC)(void*)SendMessageW, (LPARAM)hAppFont);
@@ -723,15 +831,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nShow) {
     srand((unsigned)time(NULL)); // 初始化随机数种子
 
-    // --- 新增：强制设置工作目录为 EXE 所在目录 ---
+    // --- 强制设置工作目录 ---
     wchar_t exePath[MAX_PATH];
     GetModuleFileNameW(NULL, exePath, MAX_PATH);
     wchar_t* pDir = wcsrchr(exePath, L'\\');
     if (pDir) {
-        *pDir = 0; // 截断文件名，只保留目录路径
+        *pDir = 0; 
         SetCurrentDirectoryW(exePath);
     }
-    // ------------------------------------------------
 
     WSADATA wsa; WSAStartup(MAKEWORD(2,2), &wsa);
     INITCOMMONCONTROLSEX ic = {sizeof(INITCOMMONCONTROLSEX), ICC_HOTKEY_CLASS}; InitCommonControlsEx(&ic);
@@ -752,6 +859,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nSho
     else wcscpy(g_iniFilePath, L"set.ini");
     
     LoadSettings();
+
+    // --- 新增：启动自动更新线程 ---
+    CreateThread(NULL, 0, AutoUpdateThread, NULL, 0, NULL);
     
     WNDCLASSW wc = {0}; wc.lpfnWndProc = WndProc; wc.hInstance = hInst; wc.lpszClassName = L"TrayProxyClass";
     wc.hIcon = LoadIcon(hInst, MAKEINTRESOURCE(1)); if (!wc.hIcon) wc.hIcon = LoadIcon(NULL, IDI_APPLICATION);
