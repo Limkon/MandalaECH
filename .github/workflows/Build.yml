@@ -21,6 +21,7 @@ jobs:
           mingw-w64-x86_64-openssl
           mingw-w64-x86_64-make
         update: true
+        cache: false
 
     - name: Compile Resources
       shell: msys2 {0}
