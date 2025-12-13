@@ -7,7 +7,6 @@
 #pragma comment(lib, "wininet.lib")
 #endif
 
-// Base64 解码表
 static const unsigned char base64_table[256] = {
     0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
     0,0,0,0,0,0,0,0,0,0,0,62,0,0,0,63,52,53,54,55,56,57,58,59,60,61,0,0,0,0,0,0,
@@ -21,7 +20,6 @@ void log_msg(const char *format, ...) {
     va_list args; va_start(args, format); vsnprintf(buf, sizeof(buf)-64, format, args); va_end(args);
     char final_msg[2200]; snprintf(final_msg, sizeof(final_msg), "%s%s\r\n", time_buf, buf);
     OutputDebugStringA(final_msg);
-    // 如果日志窗口存在，发送消息更新
     if (hLogViewerWnd && IsWindow(hLogViewerWnd)) {
         int wLen = MultiByteToWideChar(CP_UTF8, 0, final_msg, -1, NULL, 0);
         wchar_t* wBuf = (wchar_t*)malloc((wLen + 1) * sizeof(wchar_t));
@@ -144,35 +142,42 @@ char* GetQueryParam(const char* query, const char* key) {
     return decoded;
 }
 
-// --- 新增：HTTP 下载功能 (WinINet) 带 10秒超时 ---
+// --- 增强版：HTTP 下载功能 (WinINet) ---
 char* Utils_HttpGet(const char* url) {
     if (!url) return NULL;
     
-    // 初始化 WinINet
-    HINTERNET hInternet = InternetOpenA("MandalaClient/1.0", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
+    // 使用 Chrome UA 模拟浏览器，防止被服务器拦截
+    const char* ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+    
+    HINTERNET hInternet = InternetOpenA(ua, INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
     if (!hInternet) {
         log_msg("[Utils] InternetOpen failed: %d", GetLastError());
         return NULL;
     }
 
-    // 设置 10 秒超时 (10000 毫秒)
-    DWORD timeout = 10000;
+    // 设置 30 秒超时 (30000 毫秒) - 网络波动时 10秒可能不够
+    DWORD timeout = 30000;
     InternetSetOption(hInternet, INTERNET_OPTION_CONNECT_TIMEOUT, &timeout, sizeof(timeout));
     InternetSetOption(hInternet, INTERNET_OPTION_RECEIVE_TIMEOUT, &timeout, sizeof(timeout));
     InternetSetOption(hInternet, INTERNET_OPTION_SEND_TIMEOUT, &timeout, sizeof(timeout));
 
-    // 打开 URL (启用重载，不缓存)
-    HINTERNET hConnect = InternetOpenUrlA(hInternet, url, NULL, 0, 
-        INTERNET_FLAG_RELOAD | INTERNET_FLAG_DONT_CACHE | INTERNET_FLAG_PRAGMA_NOCACHE, 0);
+    // 组合标志：
+    // RELOAD/NO_CACHE: 强制刷新
+    // SECURE: 启用 HTTPS
+    // IGNORE_CERT_*: 忽略证书错误 (关键！很多订阅地址证书有问题)
+    DWORD flags = INTERNET_FLAG_RELOAD | INTERNET_FLAG_DONT_CACHE | INTERNET_FLAG_PRAGMA_NOCACHE | 
+                  INTERNET_FLAG_SECURE | INTERNET_FLAG_IGNORE_CERT_CN_INVALID | INTERNET_FLAG_IGNORE_CERT_DATE_INVALID;
+
+    HINTERNET hConnect = InternetOpenUrlA(hInternet, url, NULL, 0, flags, 0);
     
     if (!hConnect) {
-        log_msg("[Utils] Download failed or timed out: %s", url);
+        // 输出详细错误码：12002=超时, 12007=无法解析域名, 12175=安全/证书错误
+        log_msg("[Utils] Download failed for %s. Error Code: %d", url, GetLastError());
         InternetCloseHandle(hInternet);
         return NULL;
     }
 
-    // 读取数据
-    DWORD bufferSize = 8192; // 初始 8KB
+    DWORD bufferSize = 16384; // 16KB 缓存
     char* buffer = (char*)malloc(bufferSize);
     if (!buffer) {
         InternetCloseHandle(hConnect);
@@ -184,7 +189,6 @@ char* Utils_HttpGet(const char* url) {
     DWORD totalRead = 0;
     DWORD bytesRead = 0;
     
-    // 循环读取直到结束
     while (InternetReadFile(hConnect, buffer + totalRead, 4096, &bytesRead) && bytesRead > 0) {
         totalRead += bytesRead;
         // 动态扩容
@@ -195,6 +199,7 @@ char* Utils_HttpGet(const char* url) {
                 free(buffer);
                 InternetCloseHandle(hConnect);
                 InternetCloseHandle(hInternet);
+                log_msg("[Utils] Memory allocation failed during download.");
                 return NULL;
             }
             buffer = newBuf;
@@ -208,9 +213,6 @@ char* Utils_HttpGet(const char* url) {
 }
 
 // --- 系统代理功能 ---
-// 注意：g_localPort 是 config.c 中的全局变量，这里为了解耦，
-// 我们假设调用者会确保端口正确，或者在此处通过外部声明引用。
-// 为避免链接错误，此处使用 extern。
 extern int g_localPort; 
 
 BOOL IsWindows8OrGreater() {
@@ -221,10 +223,7 @@ BOOL IsWindows8OrGreater() {
 }
 
 void SetSystemProxy(BOOL enable) {
-    if (enable && g_localPort <= 0) {
-        // 如果端口无效，暂时不处理或记录日志
-        return; 
-    }
+    if (enable && g_localPort <= 0) return; 
 
     wchar_t proxyServerString[256] = {0};
     wchar_t proxyBypassString[64] = {0};
