@@ -2,11 +2,12 @@
 #include <stdio.h>
 #include <wininet.h>
 
-// 链接 wininet 库 (针对 MSVC，MinGW/GCC 在编译命令中加 -lwininet)
+// 链接 wininet 库
 #ifdef _MSC_VER
 #pragma comment(lib, "wininet.lib")
 #endif
 
+// Base64 解码表
 static const unsigned char base64_table[256] = {
     0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
     0,0,0,0,0,0,0,0,0,0,0,62,0,0,0,63,52,53,54,55,56,57,58,59,60,61,0,0,0,0,0,0,
@@ -20,11 +21,13 @@ void log_msg(const char *format, ...) {
     va_list args; va_start(args, format); vsnprintf(buf, sizeof(buf)-64, format, args); va_end(args);
     char final_msg[2200]; snprintf(final_msg, sizeof(final_msg), "%s%s\r\n", time_buf, buf);
     OutputDebugStringA(final_msg);
+    // 如果日志窗口存在，发送消息更新
     if (hLogViewerWnd && IsWindow(hLogViewerWnd)) {
         int wLen = MultiByteToWideChar(CP_UTF8, 0, final_msg, -1, NULL, 0);
-        wchar_t* wBuf = (wchar_t*)malloc(wLen * sizeof(wchar_t));
+        wchar_t* wBuf = (wchar_t*)malloc((wLen + 1) * sizeof(wchar_t));
         if (wBuf) {
             MultiByteToWideChar(CP_UTF8, 0, final_msg, -1, wBuf, wLen);
+            wBuf[wLen] = 0;
             PostMessageW(hLogViewerWnd, WM_LOG_UPDATE, 0, (LPARAM)wBuf);
         }
     }
@@ -141,7 +144,7 @@ char* GetQueryParam(const char* query, const char* key) {
     return decoded;
 }
 
-// --- 新增：HTTP 下载功能 (WinINet) ---
+// --- 新增：HTTP 下载功能 (WinINet) 带 10秒超时 ---
 char* Utils_HttpGet(const char* url) {
     if (!url) return NULL;
     
@@ -152,10 +155,18 @@ char* Utils_HttpGet(const char* url) {
         return NULL;
     }
 
+    // 设置 10 秒超时 (10000 毫秒)
+    DWORD timeout = 10000;
+    InternetSetOption(hInternet, INTERNET_OPTION_CONNECT_TIMEOUT, &timeout, sizeof(timeout));
+    InternetSetOption(hInternet, INTERNET_OPTION_RECEIVE_TIMEOUT, &timeout, sizeof(timeout));
+    InternetSetOption(hInternet, INTERNET_OPTION_SEND_TIMEOUT, &timeout, sizeof(timeout));
+
     // 打开 URL (启用重载，不缓存)
-    HINTERNET hConnect = InternetOpenUrlA(hInternet, url, NULL, 0, INTERNET_FLAG_RELOAD | INTERNET_FLAG_DONT_CACHE | INTERNET_FLAG_PRAGMA_NOCACHE, 0);
+    HINTERNET hConnect = InternetOpenUrlA(hInternet, url, NULL, 0, 
+        INTERNET_FLAG_RELOAD | INTERNET_FLAG_DONT_CACHE | INTERNET_FLAG_PRAGMA_NOCACHE, 0);
+    
     if (!hConnect) {
-        log_msg("[Utils] InternetOpenUrl failed for %s. Error: %d", url, GetLastError());
+        log_msg("[Utils] Download failed or timed out: %s", url);
         InternetCloseHandle(hInternet);
         return NULL;
     }
@@ -173,6 +184,7 @@ char* Utils_HttpGet(const char* url) {
     DWORD totalRead = 0;
     DWORD bytesRead = 0;
     
+    // 循环读取直到结束
     while (InternetReadFile(hConnect, buffer + totalRead, 4096, &bytesRead) && bytesRead > 0) {
         totalRead += bytesRead;
         // 动态扩容
@@ -196,6 +208,10 @@ char* Utils_HttpGet(const char* url) {
 }
 
 // --- 系统代理功能 ---
+// 注意：g_localPort 是 config.c 中的全局变量，这里为了解耦，
+// 我们假设调用者会确保端口正确，或者在此处通过外部声明引用。
+// 为避免链接错误，此处使用 extern。
+extern int g_localPort; 
 
 BOOL IsWindows8OrGreater() {
     HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
@@ -205,27 +221,11 @@ BOOL IsWindows8OrGreater() {
 }
 
 void SetSystemProxy(BOOL enable) {
-    // 简单实现，实际依赖全局变量 g_localPort，这里为了通用性暂不检查 g_localPort
-    // 若需要 g_localPort，需 include config.h 或在 config.c 中处理逻辑
-    // 这里保留您原有的代码逻辑
-    // ...
-    // (由于 utils.c 不包含 config.h，g_localPort 可能未定义。
-    //  通常 SetSystemProxy 会放在 config.c 或 proxy.c 中，或者 utils.c 包含 globals.h)
-    //  为了避免编译错误，如果 utils.c 中没有 g_localPort 定义，请确保项目中有相应声明。
-    //  在此次修改中，我保留您原 utils.c 的系统代理代码结构。
-    
-    // 注意：如果您原有的 utils.c 依赖 g_localPort，请确保它在这个文件中可见
-    // 这里假设 g_localPort 是外部变量
-    extern int g_localPort;
-
-    if (g_localPort <= 0 && enable) {
-        MessageBoxW(NULL, L"本地端口无效，无法设置系统代理。", L"错误", MB_OK | MB_ICONERROR);
-        return;
+    if (enable && g_localPort <= 0) {
+        // 如果端口无效，暂时不处理或记录日志
+        return; 
     }
-    
-    // ... (保留您上传文件中的 SetSystemProxy 逻辑) ...
-    // 为节省篇幅，核心逻辑如前，关键是补充了头文件和 Utils_HttpGet
-    
+
     wchar_t proxyServerString[256] = {0};
     wchar_t proxyBypassString[64] = {0};
     if (enable) {
@@ -283,7 +283,6 @@ BOOL IsSystemProxyEnabled() {
     DWORD dwSize = sizeof(dwEnable);
     wchar_t proxyServer[1024] = {0};
     DWORD dwProxySize = sizeof(proxyServer);
-    extern int g_localPort; 
 
     if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_PATH_PROXY, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
         if (RegQueryValueExW(hKey, L"ProxyEnable", NULL, NULL, (LPBYTE)&dwEnable, &dwSize) == ERROR_SUCCESS) {
