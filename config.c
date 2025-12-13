@@ -3,12 +3,9 @@
 #include "proxy.h" 
 #include <stdio.h>
 
-// --- 注意 ---
-// 这里的 g_localPort, g_iniFilePath 等变量定义已被移除，
-// 因为它们已经存在于 globals.c 中。
-// 我们只定义新增的订阅相关变量。
-
-// --- 新增：订阅列表变量 ---
+// --- 全局变量声明 ---
+// 注意：g_localPort, g_iniFilePath 等变量定义在 globals.c 中
+// 这里只定义新增的订阅相关变量
 Subscription g_subs[MAX_SUBS];
 int g_subCount = 0;
 
@@ -104,7 +101,7 @@ void LoadSettings() {
         strcpy(g_userAgentStr, UA_TEMPLATES[0]);
     }
 
-    // --- 新增：读取订阅列表 ---
+    // --- 读取订阅列表 ---
     g_subCount = GetPrivateProfileIntW(L"Subscriptions", L"Count", 0, g_iniFilePath);
     if (g_subCount > MAX_SUBS) g_subCount = MAX_SUBS;
     
@@ -158,7 +155,11 @@ void SaveSettings() {
     MultiByteToWideChar(CP_UTF8, 0, g_userAgentStr, -1, wUABuf, 512);
     WritePrivateProfileStringW(L"Settings", L"UserAgent", wUABuf, g_iniFilePath);
 
-    // --- 新增：保存订阅列表 ---
+    // --- [修复] 保存订阅列表 ---
+    // 1. 先清空整个 [Subscriptions] Section，防止残留旧的、被删除的 key
+    WritePrivateProfileStringW(L"Subscriptions", NULL, NULL, g_iniFilePath);
+
+    // 2. 重新写入所有数据
     wsprintfW(buffer, L"%d", g_subCount);
     WritePrivateProfileStringW(L"Subscriptions", L"Count", buffer, g_iniFilePath);
     
@@ -219,7 +220,6 @@ void ParseTags() {
 
 void ParseNodeConfigToGlobal(cJSON *node) {
     if (!node) return;
-    // 修复：直接使用 ProxyConfig 类型
     memset(&g_proxyConfig, 0, sizeof(ProxyConfig));
     
     strcpy(g_proxyConfig.path, "/"); 
@@ -547,7 +547,7 @@ void ToggleTrayIcon() {
     SaveSettings();
 }
 
-// --- 新增：更新所有订阅逻辑 (安全版：下载成功后再覆盖) ---
+// --- 更新所有订阅逻辑 (使用 Utils_HttpGet) ---
 int UpdateAllSubscriptions(BOOL forceMsg) {
     int activeSubs = 0;
     for(int i=0; i<g_subCount; i++) {
@@ -561,7 +561,6 @@ int UpdateAllSubscriptions(BOOL forceMsg) {
 
     log_msg("[Sub] Starting update for %d subscriptions...", activeSubs);
 
-    // 1. 临时存储下载内容，防止直接清空导致配置丢失
     char* rawData[MAX_SUBS] = {0};
     int successCount = 0;
 
@@ -569,7 +568,6 @@ int UpdateAllSubscriptions(BOOL forceMsg) {
         if (g_subs[i].enabled && strlen(g_subs[i].url) > 4) {
             log_msg("[Sub] Downloading (%d/%d): %s", i+1, g_subCount, g_subs[i].url);
             
-            // 使用 Utils_HttpGet (已包含超时和TLS修复)
             char* data = Utils_HttpGet(g_subs[i].url);
             
             if (data) {
@@ -582,24 +580,22 @@ int UpdateAllSubscriptions(BOOL forceMsg) {
         }
     }
 
-    // 2. 如果至少有一个成功，则执行清空和解析
     int totalNewNodes = 0;
     if (successCount > 0) {
         log_msg("[Sub] %d subscriptions downloaded successfully. Updating config...", successCount);
         
-        ClearAllNodes(); // 现在安全了，可以清空旧配置
+        ClearAllNodes(); 
 
         for (int i = 0; i < g_subCount; i++) {
             if (rawData[i]) {
                 int count = ParseAndAppendSubscriptionData(rawData[i]);
                 totalNewNodes += count;
-                free(rawData[i]); // 释放内存
+                free(rawData[i]); 
             }
         }
-        ParseTags(); // 刷新标签
+        ParseTags(); 
     } else {
         log_msg("[Error] All subscription downloads failed. Configuration NOT updated.");
-        // 如果失败，确保释放已分配的内存(虽然这里 count=0 应该没有，但为了严谨)
         for(int i=0; i<MAX_SUBS; i++) if(rawData[i]) free(rawData[i]);
     }
 
