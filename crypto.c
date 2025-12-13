@@ -50,6 +50,9 @@ static int frag_write(BIO *b, const char *in, int inl) {
     BIO *next = BIO_next(b);
     if (!ctx || !next) return 0;
 
+    // [关键修复] 清除当前的重试标志，防止状态残留
+    BIO_clear_retry_flags(b);
+
     // 随机分片逻辑：仅针对握手阶段 (TLS ClientHello)
     if (inl > 0 && ctx->first_packet_sent == 0) {
         ctx->first_packet_sent = 1; 
@@ -63,7 +66,15 @@ static int frag_write(BIO *b, const char *in, int inl) {
             if (frag_count >= MAX_FRAG_COUNT) {
                 int ret = BIO_write(next, in + bytes_sent, remaining);
                 if (ret <= 0) {
-                    if (bytes_sent > 0) return bytes_sent;
+                    // [关键修复] 发生错误/重试时，复制底层 BIO 的重试标志
+                    BIO_copy_next_retry(b);
+                    if (bytes_sent > 0) {
+                        // 如果已经写入了部分数据，由于这是非原子操作，
+                        // 我们返回已写入字节数，让上层视为成功（上层会再次调用写入剩余部分）
+                        // 此时这是一次"部分成功"，不需要保留 Retry 标志
+                        BIO_clear_retry_flags(b);
+                        return bytes_sent;
+                    }
                     return ret;
                 }
                 bytes_sent += ret;
@@ -82,7 +93,12 @@ static int frag_write(BIO *b, const char *in, int inl) {
             int ret = BIO_write(next, in + bytes_sent, chunk_size);
             
             if (ret <= 0) {
-                if (bytes_sent > 0) return bytes_sent;
+                // [关键修复] 复制重试标志
+                BIO_copy_next_retry(b);
+                if (bytes_sent > 0) {
+                    BIO_clear_retry_flags(b);
+                    return bytes_sent;
+                }
                 return ret;
             }
 
@@ -97,13 +113,23 @@ static int frag_write(BIO *b, const char *in, int inl) {
         return bytes_sent;
     }
     
-    return BIO_write(next, in, inl);
+    // 直通模式
+    int ret = BIO_write(next, in, inl);
+    // [关键修复] 无论成功失败，都复制 Retry 标志（针对非阻塞 IO）
+    BIO_copy_next_retry(b);
+    return ret;
 }
 
 static int frag_read(BIO *b, char *out, int outl) {
     BIO *next = BIO_next(b);
     if (!next) return 0;
-    return BIO_read(next, out, outl);
+
+    // [关键修复] 必须处理非阻塞 IO 的重试标志
+    BIO_clear_retry_flags(b);
+    int ret = BIO_read(next, out, outl);
+    BIO_copy_next_retry(b);
+    
+    return ret;
 }
 
 static long frag_ctrl(BIO *b, int cmd, long num, void *ptr) {
