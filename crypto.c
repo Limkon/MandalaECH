@@ -42,7 +42,7 @@ static int frag_free(BIO *b) {
     return 1;
 }
 
-// --- 核心优化：智能分片写入逻辑 ---
+// --- 纯净模式：完全依赖配置 ---
 static int frag_write(BIO *b, const char *in, int inl) {
     FragCtx *ctx = (FragCtx *)BIO_get_data(b);
     BIO *next = BIO_next(b);
@@ -54,34 +54,24 @@ static int frag_write(BIO *b, const char *in, int inl) {
 
         int bytes_sent = 0;
         int remaining = inl;
-        int frag_count = 0;
         
-        // [最佳实践硬编码]
-        // 1. MAX_FRAG_BYTES (512): 覆盖绝大多数 SNI 位置，确保关键信息被切分。
-        //    超过此范围后的数据（如长 Padding）不切分，提升握手速度。
-        // 2. MAX_FRAG_COUNT (100): 允许较细粒度（如 3-5 字节）的切分，而不至于过早耗尽次数。
-        const int MAX_FRAG_COUNT = 100;   
-        const int MAX_FRAG_BYTES = 512; 
+        // [移除] 硬编码限制 MAX_FRAG_COUNT 和 MAX_FRAG_BYTES
+        // 现在的逻辑：只要还有数据，就一直切，直到切完为止。
+        // 警告：如果 g_fragSizeMin 设为 1 且包很大，会产生数千个包。
 
         while (remaining > 0) {
             int chunk_size;
 
-            // 策略：如果超过了最大包数限制，或已经覆盖了关键的 SNI 区域，则停止切分
-            if (frag_count >= MAX_FRAG_COUNT || bytes_sent >= MAX_FRAG_BYTES) {
-                chunk_size = remaining; // 剩余部分一次性发送
-            } else {
-                // 正常切分：尊重用户的 FragMin/Max 配置
-                int range = g_fragSizeMax - g_fragSizeMin;
-                if (range < 0) range = 0;
-                chunk_size = g_fragSizeMin + (range > 0 ? (rand() % (range + 1)) : 0);
-            }
+            // 完全依据配置计算切片大小
+            int range = g_fragSizeMax - g_fragSizeMin;
+            if (range < 0) range = 0;
+            chunk_size = g_fragSizeMin + (range > 0 ? (rand() % (range + 1)) : 0);
             
             if (chunk_size < 1) chunk_size = 1;
             if (chunk_size > remaining) chunk_size = remaining;
 
             int ret = BIO_write(next, in + bytes_sent, chunk_size);
             
-            // 错误处理：如果底层写入失败
             if (ret <= 0) {
                 if (bytes_sent > 0) return bytes_sent;
                 return ret;
@@ -89,9 +79,8 @@ static int frag_write(BIO *b, const char *in, int inl) {
 
             bytes_sent += ret;
             remaining -= ret;
-            frag_count++;
 
-            // 智能延时：仅在确实进行了切分时延时
+            // 延时处理：完全依据配置
             if (remaining > 0 && chunk_size < remaining && g_fragDelayMs > 0) {
                  Sleep(rand() % (g_fragDelayMs + 1));
             }
@@ -99,7 +88,6 @@ static int frag_write(BIO *b, const char *in, int inl) {
         return bytes_sent;
     }
     
-    // 非握手阶段或后续数据，直接透传
     return BIO_write(next, in, inl);
 }
 
@@ -182,7 +170,7 @@ void init_openssl_global() {
     }
 }
 
-// --- 核心优化：Padding 强制安全底线 ---
+// --- 纯净模式：完全依赖配置 ---
 int tls_init_connect(TLSContext *ctx) {
     ctx->ssl = SSL_new(g_ssl_ctx);
     
@@ -192,13 +180,9 @@ int tls_init_connect(TLSContext *ctx) {
         
         int blockSize = g_padSizeMin + (range > 0 ? (rand() % (range + 1)) : 0);
         
-        // [最佳实践硬编码]
-        // 强制最小安全块大小为 16 字节。
-        // 防止计算出的 blockSize 过小（如 1-5），导致无法有效掩盖流量特征。
-        const int MIN_SAFE_BLOCK = 16; 
-        if (blockSize < MIN_SAFE_BLOCK) {
-            blockSize = MIN_SAFE_BLOCK;
-        }
+        // [移除] 硬编码 MIN_SAFE_BLOCK
+        // 现在的逻辑：如果配置计算出的值是 1，那就真的只按 1 字节对齐（等于不填充）。
+        // 安全责任完全在 set.ini 配置中。
         
         if (blockSize > 16384) blockSize = 16384;
 
