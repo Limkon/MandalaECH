@@ -27,7 +27,11 @@ int send_all(SOCKET s, const char *buf, int len) {
 DWORD WINAPI client_handler(LPVOID p) {
     SOCKET c = (SOCKET)(UINT_PTR)p; TLSContext tls; memset(&tls, 0, sizeof(tls));
     SOCKET r = INVALID_SOCKET;      
-    char *c_buf = (char*)malloc(BUFFER_SIZE); char *ws_read_buf = (char*)malloc(BUFFER_SIZE); char *ws_send_buf = (char*)malloc(BUFFER_SIZE);
+    // [优化] ws_send_buf 增大 128 字节，防止 WebSocket 封包头溢出
+    char *c_buf = (char*)malloc(BUFFER_SIZE); 
+    char *ws_read_buf = (char*)malloc(BUFFER_SIZE); 
+    char *ws_send_buf = (char*)malloc(BUFFER_SIZE + 128);
+
     if (!c_buf || !ws_read_buf || !ws_send_buf) { goto cl_end; }
     int ws_buf_len = 0; int flag = 1; 
     setsockopt(c, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
