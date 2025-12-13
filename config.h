@@ -22,4 +22,8 @@ cJSON* ParseVmess(const char* link);
 cJSON* ParseVlessOrTrojan(const char* link);
 cJSON* ParseShadowsocks(const char* link);
 
+
 #endif // CONFIG_H
+
+extern char g_subUrl[512];
+int UpdateNodesFromSubscription(const char* url);
