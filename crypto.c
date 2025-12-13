@@ -42,7 +42,9 @@ static int frag_free(BIO *b) {
     return 1;
 }
 
-// --- 纯净模式：完全依赖配置 ---
+// [优化] 限制最大分片数量，防止 Windows Sleep 精度导致的握手超时
+#define MAX_FRAG_COUNT 32 
+
 static int frag_write(BIO *b, const char *in, int inl) {
     FragCtx *ctx = (FragCtx *)BIO_get_data(b);
     BIO *next = BIO_next(b);
@@ -54,15 +56,23 @@ static int frag_write(BIO *b, const char *in, int inl) {
 
         int bytes_sent = 0;
         int remaining = inl;
-        
-        // [移除] 硬编码限制 MAX_FRAG_COUNT 和 MAX_FRAG_BYTES
-        // 现在的逻辑：只要还有数据，就一直切，直到切完为止。
-        // 警告：如果 g_fragSizeMin 设为 1 且包很大，会产生数千个包。
+        int frag_count = 0; // 分片计数器
 
         while (remaining > 0) {
-            int chunk_size;
+            // 如果分片次数过多（超过32次，约覆盖300-600字节，足够覆盖 SNI），
+            // 则停止分片，直接发送剩余数据，避免握手超时。
+            if (frag_count >= MAX_FRAG_COUNT) {
+                int ret = BIO_write(next, in + bytes_sent, remaining);
+                if (ret <= 0) {
+                    if (bytes_sent > 0) return bytes_sent;
+                    return ret;
+                }
+                bytes_sent += ret;
+                remaining -= ret;
+                break; // 完成
+            }
 
-            // 完全依据配置计算切片大小
+            int chunk_size;
             int range = g_fragSizeMax - g_fragSizeMin;
             if (range < 0) range = 0;
             chunk_size = g_fragSizeMin + (range > 0 ? (rand() % (range + 1)) : 0);
@@ -79,9 +89,11 @@ static int frag_write(BIO *b, const char *in, int inl) {
 
             bytes_sent += ret;
             remaining -= ret;
+            frag_count++;
 
-            // 延时处理：完全依据配置
-            if (remaining > 0 && chunk_size < remaining && g_fragDelayMs > 0) {
+            // 延时处理
+            // 注意：Windows Sleep(1) 实际可能暂停 15.6ms
+            if (remaining > 0 && g_fragDelayMs > 0) {
                  Sleep(rand() % (g_fragDelayMs + 1));
             }
         }
@@ -179,10 +191,6 @@ int tls_init_connect(TLSContext *ctx) {
         if (range < 0) range = 0;
         
         int blockSize = g_padSizeMin + (range > 0 ? (rand() % (range + 1)) : 0);
-        
-        // [移除] 硬编码 MIN_SAFE_BLOCK
-        // 现在的逻辑：如果配置计算出的值是 1，那就真的只按 1 字节对齐（等于不填充）。
-        // 安全责任完全在 set.ini 配置中。
         
         if (blockSize > 16384) blockSize = 16384;
 
