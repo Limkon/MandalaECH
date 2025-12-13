@@ -1,6 +1,10 @@
 #include "config.h"
 #include "utils.h"
 #include "proxy.h" 
+#include <wininet.h> // 需要包含此头文件以支持 WinINet
+
+// --- 新增：全局订阅地址变量 ---
+char g_subUrl[512] = "";
 
 void LoadSettings() {
     g_hotkeyModifiers = GetPrivateProfileIntW(L"Settings", L"Modifiers", MOD_CONTROL | MOD_ALT, g_iniFilePath);
@@ -11,15 +15,12 @@ void LoadSettings() {
     // 抗封锁配置读取
     g_enableChromeCiphers = GetPrivateProfileIntW(L"Settings", L"ChromeCiphers", 1, g_iniFilePath);
     g_enableALPN = GetPrivateProfileIntW(L"Settings", L"EnableALPN", 1, g_iniFilePath);
-    
-    // --- 修改点：默认值为 0 (关闭) ---
     g_enableFragment = GetPrivateProfileIntW(L"Settings", L"EnableFragment", 0, g_iniFilePath);
     
     g_fragSizeMin = GetPrivateProfileIntW(L"Settings", L"FragMin", 5, g_iniFilePath);
     g_fragSizeMax = GetPrivateProfileIntW(L"Settings", L"FragMax", 20, g_iniFilePath);
     g_fragDelayMs = GetPrivateProfileIntW(L"Settings", L"FragDelay", 2, g_iniFilePath);
 
-    // --- 修改点：默认值为 0 (关闭) ---
     g_enablePadding = GetPrivateProfileIntW(L"Settings", L"EnablePadding", 0, g_iniFilePath);
     
     g_padSizeMin = GetPrivateProfileIntW(L"Settings", L"PadMin", 100, g_iniFilePath);
@@ -39,6 +40,15 @@ void LoadSettings() {
         WideCharToMultiByte(CP_UTF8, 0, wUABuf, -1, g_userAgentStr, sizeof(g_userAgentStr), NULL, NULL);
     } else {
         strcpy(g_userAgentStr, UA_TEMPLATES[0]);
+    }
+
+    // --- 新增：读取订阅地址 (处理宽字符转 UTF-8) ---
+    wchar_t wSubUrl[512] = {0};
+    GetPrivateProfileStringW(L"Settings", L"SubUrl", L"", wSubUrl, 512, g_iniFilePath);
+    if (wcslen(wSubUrl) > 0) {
+        WideCharToMultiByte(CP_UTF8, 0, wSubUrl, -1, g_subUrl, 512, NULL, NULL);
+    } else {
+        g_subUrl[0] = '\0';
     }
 }
 
@@ -80,6 +90,11 @@ void SaveSettings() {
     wchar_t wUABuf[512] = {0};
     MultiByteToWideChar(CP_UTF8, 0, g_userAgentStr, -1, wUABuf, 512);
     WritePrivateProfileStringW(L"Settings", L"UserAgent", wUABuf, g_iniFilePath);
+
+    // --- 新增：保存订阅地址 ---
+    wchar_t wSubUrl[512] = {0};
+    MultiByteToWideChar(CP_UTF8, 0, g_subUrl, -1, wSubUrl, 512);
+    WritePrivateProfileStringW(L"Settings", L"SubUrl", wSubUrl, g_iniFilePath);
 }
 
 void SetAutorun(BOOL enable) {
@@ -436,7 +451,6 @@ int ImportFromClipboard() {
     return successCount;
 
 }
-// --- 追加到 config.c 末尾 ---
 
 void ToggleTrayIcon() {
     if (g_isIconVisible) { 
@@ -451,4 +465,83 @@ void ToggleTrayIcon() {
         g_hideTrayStart = 0;
     }
     SaveSettings();
+}
+
+// --- 新增：订阅管理核心逻辑 ---
+
+// 清空现有节点
+void ClearAllNodes() {
+    char* buffer = NULL; long size = 0;
+    if (!ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) return;
+    cJSON* root = cJSON_Parse(buffer); free(buffer);
+    if (!root) return;
+    
+    // 移除所有出站节点
+    cJSON_DeleteItemFromObject(root, "outbounds");
+    // 重建空数组
+    cJSON_AddItemToObject(root, "outbounds", cJSON_CreateArray());
+    
+    char* out = cJSON_Print(root);
+    WriteBufferToFile(CONFIG_FILE, out);
+    free(out); cJSON_Delete(root);
+}
+
+// 更新订阅主函数
+// 1. 下载 -> 2. 解码 -> 3. 清空旧节点 -> 4. 逐行解析并添加 -> 5. 刷新
+int UpdateNodesFromSubscription(const char* url) {
+    if (!url || strlen(url) < 4) return -1;
+    
+    log_msg("[Sub] Downloading from: %s", url);
+    char* data = Utils_HttpGet(url);
+    if (!data) {
+        log_msg("[Sub] Download failed.");
+        return -1;
+    }
+
+    // 订阅内容通常是 Base64 编码的列表
+    size_t decLen = 0;
+    unsigned char* decoded = Base64Decode(data, &decLen);
+    
+    // 如果解码失败，可能返回的就是明文，或者是不支持的格式
+    // 尝试使用解码后的内容，如果解码为空，则使用原始内容
+    char* sourceText = NULL;
+    if (decoded) {
+        sourceText = (char*)decoded;
+    } else {
+        sourceText = strdup(data); 
+    }
+    free(data); // 释放原始下载数据
+
+    if (!sourceText) return -1;
+
+    // 清空旧节点 (覆盖模式)
+    ClearAllNodes();
+
+    int successCount = 0;
+    char* context = NULL;
+    // 按行拆分，支持 \r \n 和空格
+    char* line = strtok_s(sourceText, "\r\n ", &context);
+    
+    while (line != NULL) {
+        TrimString(line);
+        if (strlen(line) > 0) {
+            cJSON* node = NULL;
+            // 尝试各种协议解析
+            if (_strnicmp(line, "vmess://", 8) == 0) node = ParseVmess(line);
+            else if (_strnicmp(line, "ss://", 5) == 0) node = ParseShadowsocks(line);
+            else if (_strnicmp(line, "vless://", 8) == 0) node = ParseVlessOrTrojan(line);
+            else if (_strnicmp(line, "trojan://", 9) == 0) node = ParseVlessOrTrojan(line);
+            else if (_strnicmp(line, "socks://", 8) == 0) node = ParseSocks(line);
+
+            if (node) {
+                if (AddNodeToConfig(node)) successCount++;
+                else cJSON_Delete(node); // 添加失败则释放
+            }
+        }
+        line = strtok_s(NULL, "\r\n ", &context);
+    }
+    
+    free(sourceText);
+    ParseTags(); // 刷新内存中的标签列表，确保 GUI 能读到新节点
+    return successCount;
 }
