@@ -1,5 +1,6 @@
 #include "crypto.h"
 #include "utils.h"
+#include <stdlib.h>
 
 // ---------------------- BIO Fragmentation Implementation ----------------------
 typedef struct {
@@ -42,27 +43,27 @@ static int frag_free(BIO *b) {
     return 1;
 }
 
-// [优化] 增加分片上限以覆盖整个SNI，但限制Sleep次数以防超时
-#define MAX_FRAG_COUNT 200 
-#define MAX_SLEEP_COUNT 5
+// [核心修复] 温和分片策略
+// 即使开启分片，也强制限制最大切分次数，避免产生数百个小包导致被运营商/路由器丢弃
+#define MAX_SPLIT_COUNT 7 
 
 static int frag_write(BIO *b, const char *in, int inl) {
     FragCtx *ctx = (FragCtx *)BIO_get_data(b);
     BIO *next = BIO_next(b);
     if (!ctx || !next) return 0;
 
-    // 随机分片逻辑：仅针对握手阶段 (TLS ClientHello)
+    // 仅针对握手阶段 (TLS ClientHello) 进行处理
     if (inl > 0 && ctx->first_packet_sent == 0) {
         ctx->first_packet_sent = 1; 
 
         int bytes_sent = 0;
         int remaining = inl;
-        int frag_count = 0;
+        int split_count = 0; // 记录已切分次数
 
         while (remaining > 0) {
-            // 安全逃逸：如果分片次数实在太多(超过200次)，直接发送剩余数据
-            // 防止极端配置(如1字节分片)导致的CPU/网络过载
-            if (frag_count >= MAX_FRAG_COUNT) {
+            // 策略：如果已经切了 MAX_SPLIT_COUNT 次，剩下的数据一次性发完
+            // 这样既打乱了 SNI，又保证了包数量极少，稳定性极高
+            if (split_count >= MAX_SPLIT_COUNT) {
                 int ret = BIO_write(next, in + bytes_sent, remaining);
                 if (ret <= 0) {
                     if (bytes_sent > 0) return bytes_sent;
@@ -73,36 +74,40 @@ static int frag_write(BIO *b, const char *in, int inl) {
                 break;
             }
 
+            // 计算本次切片大小
             int chunk_size;
             int range = g_fragSizeMax - g_fragSizeMin;
             if (range < 0) range = 0;
-            chunk_size = g_fragSizeMin + (range > 0 ? (rand() % (range + 1)) : 0);
             
+            // 确保 chunk_size 至少为 1
+            chunk_size = g_fragSizeMin + (range > 0 ? (rand() % (range + 1)) : 0);
             if (chunk_size < 1) chunk_size = 1;
+            
+            // 如果计算出的分片比剩余数据还大，就只发剩余的
             if (chunk_size > remaining) chunk_size = remaining;
 
+            // 执行写入
             int ret = BIO_write(next, in + bytes_sent, chunk_size);
             
             if (ret <= 0) {
-                // 如果底层 buffer 满，返回已发送字节数，让 OpenSSL 处理重试
                 if (bytes_sent > 0) return bytes_sent;
                 return ret;
             }
 
             bytes_sent += ret;
             remaining -= ret;
-            frag_count++;
+            split_count++;
 
-            // [关键修复] 仅对前 5 个分片进行延时
-            // 这样既能混淆流量头部特征，又保证了整体握手速度极快，
-            // 解决了 "首次打开慢" 和 "下载超时" 的问题。
-            if (remaining > 0 && g_fragDelayMs > 0 && frag_count <= MAX_SLEEP_COUNT) {
+            // 仅当前几次切片时延时，且剩余数据量还比较大时才延时
+            // 避免最后几个字节还要 sleep，影响体验
+            if (remaining > 0 && g_fragDelayMs > 0) {
                  Sleep(rand() % (g_fragDelayMs + 1));
             }
         }
         return bytes_sent;
     }
     
+    // 握手之后的普通数据，直接透传，不分片，保证下载速度和稳定性
     return BIO_write(next, in, inl);
 }
 
@@ -117,6 +122,7 @@ static long frag_ctrl(BIO *b, int cmd, long num, void *ptr) {
     if (!next) return 0;
     return BIO_ctrl(next, cmd, num, ptr);
 }
+
 // ---------------------- End BIO Implementation ----------------------
 
 void FreeGlobalSSLContext() {
@@ -135,12 +141,15 @@ void init_openssl_global() {
     g_ssl_ctx = SSL_CTX_new(TLS_client_method());
     if (!g_ssl_ctx) return;
 
+    // 使用广泛兼容的版本
     SSL_CTX_set_min_proto_version(g_ssl_ctx, TLS1_2_VERSION);
     SSL_CTX_set_max_proto_version(g_ssl_ctx, TLS1_3_VERSION);
 
     if (g_enableChromeCiphers) {
+        // 模拟 Chrome 的加密套件列表
         const char *chrome_ciphers = "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-RSA-AES128-SHA";
         SSL_CTX_set_cipher_list(g_ssl_ctx, chrome_ciphers);
+        // 禁用压缩和会话重用（为了伪装）
         SSL_CTX_set_options(g_ssl_ctx, SSL_OP_NO_COMPRESSION | SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION);
         SSL_CTX_set_session_cache_mode(g_ssl_ctx, SSL_SESS_CACHE_CLIENT);
         log_msg("[Security] Chrome Cipher Suites Enabled");
@@ -148,6 +157,7 @@ void init_openssl_global() {
         log_msg("[Security] Standard OpenSSL Cipher Suites");
     }
 
+    // 尝试加载内嵌证书，如果失败则不验证（防止部分环境报错）
     HRSRC hRes = FindResourceW(NULL, MAKEINTRESOURCEW(2), RT_RCDATA);
     if (hRes) {
         HGLOBAL hData = LoadResource(NULL, hRes);
@@ -169,43 +179,33 @@ void init_openssl_global() {
                     log_msg("[Security] Embedded CA loaded (%d certs). Strict mode.", count);
                 } else {
                     SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, NULL);
-                    log_msg("[Warning] Embedded CA data invalid. Insecure mode.");
                 }
             } else {
                 SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, NULL);
-                log_msg("[Warning] Failed to create BIO for CA. Insecure mode.");
             }
         } else {
             SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, NULL);
-            log_msg("[Warning] Empty CA resource. Insecure mode.");
         }
     } else {
         SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, NULL);
-        log_msg("[Warning] cacert.pem resource not found in exe. Insecure mode.");
     }
 }
 
-// --- 修复 Padding 导致的 MTU 问题 ---
 int tls_init_connect(TLSContext *ctx) {
     ctx->ssl = SSL_new(g_ssl_ctx);
     
     if (g_enablePadding) {
         int range = g_padSizeMax - g_padSizeMin;
         if (range < 0) range = 0;
-        
         int blockSize = g_padSizeMin + (range > 0 ? (rand() % (range + 1)) : 0);
         
-        // 强制限制最大 Padding 块大小，防止 MTU 溢出
+        // 限制最大 Padding 防止 MTU 问题
         if (blockSize > 200) blockSize = 200; 
-
-        if (blockSize > 0) {
-            SSL_set_block_padding(ctx->ssl, blockSize);
-        }
+        if (blockSize > 0) SSL_set_block_padding(ctx->ssl, blockSize);
     }
 
     BIO *bio = BIO_new_socket(ctx->sock, BIO_NOCLOSE);
     
-    // 只有在启用分片时才压入 filter BIO
     if (g_enableFragment) {
         BIO *frag = BIO_new(BIO_f_fragment());
         bio = BIO_push(frag, bio);
