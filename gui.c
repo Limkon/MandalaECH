@@ -9,8 +9,8 @@
 // 链接 comctl32 库以支持高级控件
 #pragma comment(lib, "comctl32.lib")
 
-// 宣告 ListBox 的舊視窗程序變數
-WNDPROC g_oldListBoxProc = NULL;
+// [修复] 删除此处的定义，因为已在 globals.c 中定义，在 common.h 中声明
+// WNDPROC g_oldListBoxProc = NULL; 
 
 // 用于追踪窗口句柄，实现单例模式
 static HWND hSettingsWnd = NULL;
