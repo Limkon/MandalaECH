@@ -703,3 +703,41 @@ cl_end:
     if (c != INVALID_SOCKET) closesocket(c);
     return 0;
 }
+
+// 监听线程与管理函数 (保持不变)
+DWORD WINAPI server_thread(LPVOID p) {
+    g_listen_sock = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET; addr.sin_port = htons(g_localPort);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    int opt = 1; setsockopt(g_listen_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
+    if (bind(g_listen_sock, (struct sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
+        log_msg("Port %d bind fail", g_localPort); g_proxyRunning = FALSE; return 0;
+    }
+    listen(g_listen_sock, 100);
+    log_msg("Proxy Started: 127.0.0.1:%d", g_localPort);
+    while(g_proxyRunning) {
+        SOCKET c = accept(g_listen_sock, NULL, NULL);
+        if (c != INVALID_SOCKET) {
+            HANDLE hClient = CreateThread(NULL, 0, client_handler, (LPVOID)(UINT_PTR)c, 0, NULL);
+            if (hClient) CloseHandle(hClient); else closesocket(c);
+        } else break;
+    }
+    return 0;
+}
+
+void StartProxyCore() {
+    if (g_proxyRunning) return;
+    g_proxyRunning = TRUE;
+    // 全局随机种子
+    srand((unsigned int)time(NULL));
+    hProxyThread = CreateThread(NULL, 0, server_thread, NULL, 0, NULL);
+    if (!hProxyThread) { log_msg("CreateThread Failed"); g_proxyRunning = FALSE; }
+}
+
+void StopProxyCore() {
+    g_proxyRunning = FALSE;
+    if (g_listen_sock != INVALID_SOCKET) { closesocket(g_listen_sock); g_listen_sock = INVALID_SOCKET; }
+    if (hProxyThread) { WaitForSingleObject(hProxyThread, 2000); CloseHandle(hProxyThread); hProxyThread = NULL; }
+    log_msg("Proxy Stopped");
+}
