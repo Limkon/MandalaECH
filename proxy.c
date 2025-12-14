@@ -90,6 +90,12 @@ DWORD WINAPI client_handler(LPVOID p) {
     char *c_buf = NULL; 
     char *ws_read_buf = NULL; 
     char *ws_send_buf = NULL; 
+    
+    // VMess 专用缓冲区
+    unsigned char *vmess_chunk_buf = NULL; 
+    unsigned char *vmess_recv_plain = NULL;
+    int vmess_recv_rem_len = 0; // 剩余未处理的解密数据长度
+
     int ws_buf_len = 0; 
     int flag = 1; 
 
@@ -109,13 +115,13 @@ DWORD WINAPI client_handler(LPVOID p) {
     int len;
 
     int flen = 0;
-    unsigned char proto_buf[2048]; // 加大缓冲区以容纳 VMess 头
+    unsigned char proto_buf[2048]; 
     int proto_len = 0;
     
     BOOL is_vless;
     BOOL is_trojan;
     BOOL is_shadowsocks;
-    BOOL is_vmess; // [New] VMess flag
+    BOOL is_vmess; 
     
     struct in_addr ip4; 
     struct in6_addr ip6;
@@ -126,20 +132,23 @@ DWORD WINAPI client_handler(LPVOID p) {
     int hl, pl;
     long long frame_total;
     int vless_response_header_stripped = 0;
-    int vmess_response_header_stripped = 0; // [New]
-    int retry_count = 0;
     
-    // VMess 加密上下文
+    // VMess 状态
+    int vmess_response_header_stripped = 0; 
     AesCfbCtx vmess_enc_ctx;
     AesCfbCtx vmess_dec_ctx;
+    
+    int retry_count = 0;
     
     // 初始化
     memset(&tls, 0, sizeof(tls));
     c_buf = (char*)malloc(BUFFER_SIZE); 
     ws_read_buf = (char*)malloc(BUFFER_SIZE); 
     ws_send_buf = (char*)malloc(BUFFER_SIZE + 4096); 
+    vmess_chunk_buf = (unsigned char*)malloc(BUFFER_SIZE + 4096); // 用于构建加密块
+    vmess_recv_plain = (unsigned char*)malloc(BUFFER_SIZE);       // 用于存放解密后但未分包的数据
 
-    if (!c_buf || !ws_read_buf || !ws_send_buf) goto cl_end; 
+    if (!c_buf || !ws_read_buf || !ws_send_buf || !vmess_chunk_buf || !vmess_recv_plain) goto cl_end; 
     setsockopt(c, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
     
     // 1. 读取浏览器首包
@@ -263,10 +272,9 @@ DWORD WINAPI client_handler(LPVOID p) {
     is_vless = (_stricmp(g_proxyConfig.type, "vless") == 0);
     is_trojan = (_stricmp(g_proxyConfig.type, "trojan") == 0);
     is_shadowsocks = (_stricmp(g_proxyConfig.type, "shadowsocks") == 0);
-    is_vmess = (_stricmp(g_proxyConfig.type, "vmess") == 0); // [New] VMess detection
+    is_vmess = (_stricmp(g_proxyConfig.type, "vmess") == 0);
 
     if (is_vless) {
-        // ... (VLESS logic kept as is) ...
         proto_buf[proto_len++] = 0x00; 
         parse_uuid(g_proxyConfig.user, proto_buf + proto_len); proto_len += 16; 
         proto_buf[proto_len++] = 0x00; 
@@ -283,7 +291,7 @@ DWORD WINAPI client_handler(LPVOID p) {
         flen = build_ws_frame((char*)proto_buf, proto_len, ws_send_buf);
         tls_write(&tls, ws_send_buf, flen);
     } else if (is_vmess) {
-        // --- VMess Logic Start ---
+        // --- VMess 握手与加密初始化 ---
         unsigned char uuid[16];
         parse_uuid(g_proxyConfig.user, uuid);
         
@@ -291,42 +299,32 @@ DWORD WINAPI client_handler(LPVOID p) {
         unsigned char req_iv[16];
         unsigned char req_key[16];
         
-        // 1. 生成 Request IV (Random 16 bytes)
         for(int i=0; i<16; i++) req_iv[i] = rand() % 256;
-        
-        // 2. 生成 Request Key (Random 16 bytes)
         for(int i=0; i<16; i++) req_key[i] = rand() % 256;
         
-        // 3. 生成 Header Key & IV (用于加密指令部分)
         unsigned char head_key[16], head_iv[16];
-        vmess_kdf_header(uuid, head_key, head_iv); // IV 其实不基于 UUID，而是基于 TS
-        vmess_kdf_iv(ts, head_iv); // 修正 IV 生成
+        vmess_kdf_header(uuid, head_key, head_iv); 
+        vmess_kdf_iv(ts, head_iv); 
 
-        // 4. 构建 VMess 认证头 (16 bytes)
+        // Auth
         unsigned char auth[16];
         vmess_get_auth(uuid, ts, auth);
         memcpy(proto_buf, auth, 16);
         proto_len = 16;
 
-        // 5. 构建 VMess 指令部分 (在临时缓冲区)
+        // Command Buffer
         unsigned char cmd_buf[512];
         int cmd_len = 0;
         
         cmd_buf[cmd_len++] = 1; // Ver
         memcpy(cmd_buf + cmd_len, req_iv, 16); cmd_len += 16;
         memcpy(cmd_buf + cmd_len, req_key, 16); cmd_len += 16;
-        cmd_buf[cmd_len++] = rand() % 256; // V (Response Auth Byte)
-        cmd_buf[cmd_len++] = 0x01; // Opt (Standard)
-        // P (Padding Len 4 bits | Security 4 bits)
-        // Security: 3 (AES-128-GCM) is common, but CFB is 0?
-        // Let's use AES-128-CFB (0) or Auto (3). Using Auto (3) often implies AEAD which is hard.
-        // Using Type 0 (AES-128-CFB) for legacy compatibility.
-        // P: High 4 bits padding len, Low 4 bits security type (0=AES-128-CFB)
+        cmd_buf[cmd_len++] = rand() % 256; // V
+        cmd_buf[cmd_len++] = 0x01; // Opt=1 (Standard, implies Chunked Body)
         int pad_len = rand() % 16;
         cmd_buf[cmd_len++] = (pad_len << 4) | 0x00; // Sec=0 (AES-128-CFB)
-        
-        cmd_buf[cmd_len++] = 0; // Reserved
-        cmd_buf[cmd_len++] = 1; // Cmd: 1=TCP
+        cmd_buf[cmd_len++] = 0; // Res
+        cmd_buf[cmd_len++] = 1; // Cmd=TCP
         
         cmd_buf[cmd_len++] = (port >> 8) & 0xFF; 
         cmd_buf[cmd_len++] = port & 0xFF;
@@ -350,29 +348,23 @@ DWORD WINAPI client_handler(LPVOID p) {
         cmd_buf[cmd_len++] = (f >> 8) & 0xFF;
         cmd_buf[cmd_len++] = f & 0xFF;
         
-        // 6. 加密指令部分并拼接到 proto_buf
+        // Encrypt Command
         AesCfbCtx head_enc_ctx;
         aes_cfb128_init(&head_enc_ctx, head_key, head_iv);
         aes_cfb128_encrypt(&head_enc_ctx, cmd_buf, proto_buf + proto_len, cmd_len);
         proto_len += cmd_len;
         
-        // 发送 VMess 头部
         flen = build_ws_frame((char*)proto_buf, proto_len, ws_send_buf);
         tls_write(&tls, ws_send_buf, flen);
         
-        // 7. 初始化 Body 加密上下文 (Request Body)
+        // Init Body Crypto
         aes_cfb128_init(&vmess_enc_ctx, req_key, req_iv);
         
-        // 8. 初始化 Body 解密上下文 (Response Body)
-        // Response Key = MD5(ReqKey), Response IV = MD5(ReqIV)
         unsigned char resp_key[16], resp_iv[16];
         vmess_md5(req_key, 16, resp_key);
         vmess_md5(req_iv, 16, resp_iv);
         aes_cfb128_init(&vmess_dec_ctx, resp_key, resp_iv);
-        
-        // --- VMess Logic End ---
     } else if (is_trojan) {
-        // ... (Trojan logic kept as is) ...
         char hex_pass[56 + 1]; trojan_password_hash(g_proxyConfig.pass, hex_pass);
         memcpy(proto_buf, hex_pass, 56); proto_len = 56;
         proto_buf[proto_len++] = 0x0D; proto_buf[proto_len++] = 0x0A;
@@ -390,7 +382,6 @@ DWORD WINAPI client_handler(LPVOID p) {
         flen = build_ws_frame((char*)proto_buf, proto_len, ws_send_buf);
         tls_write(&tls, ws_send_buf, flen);
     } else if (is_shadowsocks) {
-        // ... (SS logic kept as is) ...
         if (inet_pton(AF_INET, host, &ip4) == 1) {
              proto_buf[proto_len++] = 0x01; memcpy(proto_buf + proto_len, &ip4, 4); proto_len += 4;
         } else if (inet_pton(AF_INET6, host, &ip6) == 1) {
@@ -403,7 +394,7 @@ DWORD WINAPI client_handler(LPVOID p) {
         flen = build_ws_frame((char*)proto_buf, proto_len, ws_send_buf);
         tls_write(&tls, ws_send_buf, flen);
     } else {
-        // ... (Socks5/Default logic kept as is) ...
+        // ... (Socks5 logic, same as before) ...
         char auth[] = {0x05, 0x01, 0x00}; 
         if (strlen(g_proxyConfig.user) > 0) auth[2] = 0x02; 
         flen = build_ws_frame(auth, 3, ws_send_buf);
@@ -448,22 +439,29 @@ DWORD WINAPI client_handler(LPVOID p) {
         if (send(c, ok, strlen(ok), 0) == SOCKET_ERROR) goto cl_end;
         if (browser_len > header_len) {
             int extra_len = browser_len - header_len;
-            
-            // [New] VMess: 如果有剩余数据，需要加密后发送
             if (is_vmess) {
-                aes_cfb128_encrypt(&vmess_enc_ctx, (unsigned char*)(c_buf + header_len), (unsigned char*)c_buf, extra_len); // 原地加密
-                flen = build_ws_frame(c_buf, extra_len, ws_send_buf);
+                // [FIX] VMess Chunking: [Len 2][Data N]
+                vmess_chunk_buf[0] = (extra_len >> 8) & 0xFF;
+                vmess_chunk_buf[1] = extra_len & 0xFF;
+                memcpy(vmess_chunk_buf + 2, c_buf + header_len, extra_len);
+                aes_cfb128_encrypt(&vmess_enc_ctx, vmess_chunk_buf, vmess_chunk_buf, extra_len + 2);
+                flen = build_ws_frame((char*)vmess_chunk_buf, extra_len + 2, ws_send_buf);
             } else {
                 flen = build_ws_frame(c_buf + header_len, extra_len, ws_send_buf);
             }
             tls_write(&tls, ws_send_buf, flen);
         }
     } else {
-        // [New] VMess: 全局加密浏览器首包
         if (is_vmess) {
-            aes_cfb128_encrypt(&vmess_enc_ctx, (unsigned char*)c_buf, (unsigned char*)c_buf, browser_len); // 原地加密
+            // [FIX] VMess Chunking
+            vmess_chunk_buf[0] = (browser_len >> 8) & 0xFF;
+            vmess_chunk_buf[1] = browser_len & 0xFF;
+            memcpy(vmess_chunk_buf + 2, c_buf, browser_len);
+            aes_cfb128_encrypt(&vmess_enc_ctx, vmess_chunk_buf, vmess_chunk_buf, browser_len + 2);
+            flen = build_ws_frame((char*)vmess_chunk_buf, browser_len + 2, ws_send_buf);
+        } else {
+            flen = build_ws_frame(c_buf, browser_len, ws_send_buf);
         }
-        flen = build_ws_frame(c_buf, browser_len, ws_send_buf);
         tls_write(&tls, ws_send_buf, flen);
     }
     
@@ -482,15 +480,17 @@ DWORD WINAPI client_handler(LPVOID p) {
         if (FD_ISSET(c, &fds)) {
             len = recv(c, c_buf, BUFFER_SIZE, 0);
             if (len > 0) {
-                // [New] VMess Encryption
                 if (is_vmess) {
-                    aes_cfb128_encrypt(&vmess_enc_ctx, (unsigned char*)c_buf, (unsigned char*)c_buf, len);
+                    // [FIX] VMess Request Chunking
+                    vmess_chunk_buf[0] = (len >> 8) & 0xFF;
+                    vmess_chunk_buf[1] = len & 0xFF;
+                    memcpy(vmess_chunk_buf + 2, c_buf, len);
+                    aes_cfb128_encrypt(&vmess_enc_ctx, vmess_chunk_buf, vmess_chunk_buf, len + 2);
+                    flen = build_ws_frame((char*)vmess_chunk_buf, len + 2, ws_send_buf);
+                } else {
+                    flen = build_ws_frame(c_buf, len, ws_send_buf);
                 }
-                
-                flen = build_ws_frame(c_buf, len, ws_send_buf);
-                if (tls_write(&tls, ws_send_buf, flen) < 0) {
-                    break;
-                }
+                if (tls_write(&tls, ws_send_buf, flen) < 0) break;
             } else if (len == 0) {
                 break;
             } else if (WSAGetLastError() != WSAEWOULDBLOCK) {
@@ -502,9 +502,7 @@ DWORD WINAPI client_handler(LPVOID p) {
             if (ws_buf_len < BUFFER_SIZE) {
                 len = tls_read(&tls, ws_read_buf + ws_buf_len, BUFFER_SIZE - ws_buf_len);
                 if (len > 0) ws_buf_len += len;
-                else if (len == -1) {
-                    break; 
-                }
+                else if (len == -1) break; 
             }
         }
         
@@ -518,7 +516,6 @@ DWORD WINAPI client_handler(LPVOID p) {
                     char* payload_ptr = ws_read_buf + hl;
                     int payload_size = pl;
                     
-                    // --- VLESS Response Header Stripping ---
                     if (is_vless && !vless_response_header_stripped) {
                         if (payload_size >= 2) {
                             int addon_len = (unsigned char)payload_ptr[1];
@@ -527,41 +524,59 @@ DWORD WINAPI client_handler(LPVOID p) {
                                 payload_ptr += head_size;
                                 payload_size -= head_size;
                                 vless_response_header_stripped = 1;
-                            } else { 
-                                payload_size = 0; 
-                            }
+                            } else { payload_size = 0; }
                         } else { payload_size = 0; }
                     }
                     
-                    // --- [New] VMess Response Decryption & Header Stripping ---
                     if (is_vmess) {
-                        // 1. 解密数据流
-                        aes_cfb128_decrypt(&vmess_dec_ctx, (unsigned char*)payload_ptr, (unsigned char*)payload_ptr, payload_size);
+                        // [FIX] VMess Response Processing (Stream Mode)
+                        // 1. 解密整个 WebSocket 载荷到 vmess_recv_plain
+                        aes_cfb128_decrypt(&vmess_dec_ctx, (unsigned char*)payload_ptr, 
+                                           vmess_recv_plain + vmess_recv_rem_len, payload_size);
+                        int total_plain = vmess_recv_rem_len + payload_size;
+                        unsigned char* p_scan = vmess_recv_plain;
                         
-                        // 2. 剥离 Response Header
+                        // 2. 剥离 Response Header (仅一次)
                         if (!vmess_response_header_stripped) {
-                            // VMess Response Header 也是加密的，但我们已经解密了数据流。
-                            // 格式: [ResponseHeaderLen(1)] [ResponseHeader(Ver,Option,Cmd,CmdLen,Cmd...)]
-                            // 实际的 VMess 响应头长度是动态的。
-                            // 简单处理：第一个字节是 Response 认证信息 V？
-                            // 标准 Response Header：
-                            // [V(1)][Opt(1)][Cmd(1)][CmdLen(1)][CmdData(N)]
-                            // 我们需要剥离这部分。
-                            if (payload_size >= 4) {
-                                int cmd_len = (unsigned char)payload_ptr[3];
+                            if (total_plain >= 4) {
+                                int cmd_len = (unsigned char)p_scan[3];
                                 int head_size = 4 + cmd_len;
-                                if (payload_size >= head_size) {
-                                    payload_ptr += head_size;
-                                    payload_size -= head_size;
+                                if (total_plain >= head_size) {
+                                    p_scan += head_size;
+                                    total_plain -= head_size;
                                     vmess_response_header_stripped = 1;
                                 } else {
-                                    // 头不完整，丢弃当前帧 (实际应缓存，为简化暂时丢弃)
-                                    payload_size = 0;
+                                    // 头不完整，等待更多数据
+                                    vmess_recv_rem_len = total_plain;
+                                    goto vmess_skip_send;
                                 }
                             } else {
-                                payload_size = 0;
+                                vmess_recv_rem_len = total_plain;
+                                goto vmess_skip_send;
                             }
                         }
+
+                        // 3. 解析 Chunk [Len][Data] ...
+                        while (total_plain > 2) {
+                            int chunk_len = (p_scan[0] << 8) | p_scan[1];
+                            if (total_plain >= 2 + chunk_len) {
+                                // 发送完整块
+                                if (chunk_len > 0) send_all(c, (char*)p_scan + 2, chunk_len);
+                                p_scan += (2 + chunk_len);
+                                total_plain -= (2 + chunk_len);
+                            } else {
+                                break; // 数据不足一个完整 Chunk，等待
+                            }
+                        }
+                        
+                        // 4. 保存剩余未处理数据到 buffer 头部
+                        if (total_plain > 0) {
+                            memmove(vmess_recv_plain, p_scan, total_plain);
+                        }
+                        vmess_recv_rem_len = total_plain;
+                        
+                        vmess_skip_send:; 
+                        payload_size = 0; // 已在内部处理发送，置0避免后续重复发送
                     }
 
                     if (payload_size > 0) {
@@ -583,6 +598,8 @@ cl_end:
     if (c_buf) free(c_buf); 
     if (ws_read_buf) free(ws_read_buf); 
     if (ws_send_buf) free(ws_send_buf); 
+    if (vmess_chunk_buf) free(vmess_chunk_buf);
+    if (vmess_recv_plain) free(vmess_recv_plain);
     tls_close(&tls);
     if (r != INVALID_SOCKET) closesocket(r); 
     if (c != INVALID_SOCKET) closesocket(c);
