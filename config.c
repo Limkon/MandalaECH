@@ -92,6 +92,9 @@ void LoadSettings() {
     if (wcslen(wUABuf) > 5) WideCharToMultiByte(CP_UTF8, 0, wUABuf, -1, g_userAgentStr, sizeof(g_userAgentStr), NULL, NULL);
     else strcpy(g_userAgentStr, UA_TEMPLATES[0]);
 
+    // [新增] 读取上次选择的节点
+    GetPrivateProfileStringW(L"Settings", L"LastNode", L"", currentNode, 64, g_iniFilePath);
+
     g_subCount = GetPrivateProfileIntW(L"Subscriptions", L"Count", 0, g_iniFilePath);
     if (g_subCount > MAX_SUBS) g_subCount = MAX_SUBS;
     for (int i = 0; i < g_subCount; i++) {
@@ -121,6 +124,9 @@ void SaveSettings() {
     wsprintfW(buffer, L"%d", g_uaPlatformIndex); WritePrivateProfileStringW(L"Settings", L"UAPlatform", buffer, g_iniFilePath);
     wchar_t wUABuf[512] = {0}; MultiByteToWideChar(CP_UTF8, 0, g_userAgentStr, -1, wUABuf, 512);
     WritePrivateProfileStringW(L"Settings", L"UserAgent", wUABuf, g_iniFilePath);
+
+    // [新增] 保存当前选择的节点
+    WritePrivateProfileStringW(L"Settings", L"LastNode", currentNode, g_iniFilePath);
 
     WritePrivateProfileStringW(L"Subscriptions", NULL, NULL, g_iniFilePath);
     wsprintfW(buffer, L"%d", g_subCount); WritePrivateProfileStringW(L"Subscriptions", L"Count", buffer, g_iniFilePath);
@@ -221,7 +227,7 @@ void ParseNodeConfigToGlobal(cJSON *node) {
     }
     if (strlen(g_proxyConfig.sni) == 0) strcpy(g_proxyConfig.sni, g_proxyConfig.host);
 
-    // [修改] 解析并保存协议类型
+    // 解析并保存协议类型
     cJSON *type = cJSON_GetObjectItem(node, "type");
     if (type && type->valuestring) {
         strncpy(g_proxyConfig.type, type->valuestring, 31);
@@ -249,6 +255,9 @@ void SwitchNode(const wchar_t* tag) {
     }
     if (targetNode) {
         StopProxyCore(); ParseNodeConfigToGlobal(targetNode); StartProxyCore();
+        // 保存设置
+        SaveSettings(); 
+        
         wchar_t tip[128]; wsprintfW(tip, L"已切换: %s", tag);
         wcsncpy(nid.szInfo, tip, 127); wcsncpy(nid.szInfoTitle, L"Mandala Client", 63); nid.uFlags |= NIF_INFO;
         Shell_NotifyIconW(NIM_MODIFY, &nid);
@@ -372,7 +381,6 @@ void ToggleTrayIcon() {
 }
 
 // --- 协议解析函数 ---
-
 cJSON* ParseSocks(const char* link) {
     if (strncmp(link, "socks://", 8) != 0) return NULL;
     const char* p = link + 8; const char* at = strchr(p, '@'); if (!at) return NULL; 
