@@ -2,6 +2,7 @@
 #define CRYPTO_H
 
 #include "common.h"
+#include <openssl/evp.h>
 
 // 初始化与清理
 void init_openssl_global();
@@ -19,22 +20,25 @@ int build_ws_frame(const char *in, int len, char *out);
 long long check_ws_frame(unsigned char *in, int len, int *head_len, int *payload_len);
 int ws_read_payload_exact(TLSContext *tls, char *out_buf, int expected_len);
 
-// --- VMess 协议加密辅助函数 ---
-void vmess_md5(const unsigned char *d, size_t n, unsigned char *md);
+// --- VMess/Trojan 协议加密辅助函数 (EVP Based) ---
+void crypto_md5(const unsigned char *d, size_t n, unsigned char *md);
+void crypto_sha224(const char *data, size_t len, unsigned char *md); // 新增：用于 Trojan
+
 void vmess_get_auth(const unsigned char *uuid, long long ts, unsigned char *out_auth);
 void vmess_kdf_header(const unsigned char *uuid, unsigned char *out_key, unsigned char *out_iv);
 void vmess_kdf_iv(long long ts, unsigned char *out_iv);
 unsigned int fnv1a_hash(const unsigned char *data, int len);
 
-// AES-128-CFB 上下文与操作
+// AES-128-CFB 上下文 (使用 EVP_CIPHER_CTX)
 typedef struct {
-    unsigned char key[16];
-    unsigned char iv[16];
-    int num; // OpenSSL cfb128 内部偏移状态
+    EVP_CIPHER_CTX *ctx;
+    int is_valid;
 } AesCfbCtx;
 
-void aes_cfb128_init(AesCfbCtx *ctx, const unsigned char *key, const unsigned char *iv);
+// is_encrypt: 1 为加密，0 为解密
+void aes_cfb128_init(AesCfbCtx *ctx, const unsigned char *key, const unsigned char *iv, int is_encrypt);
 void aes_cfb128_encrypt(AesCfbCtx *ctx, const unsigned char *in, unsigned char *out, size_t len);
 void aes_cfb128_decrypt(AesCfbCtx *ctx, const unsigned char *in, unsigned char *out, size_t len);
+void aes_cfb128_cleanup(AesCfbCtx *ctx); // 必须调用以释放内存
 
 #endif // CRYPTO_H
