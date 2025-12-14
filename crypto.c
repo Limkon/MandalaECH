@@ -1,9 +1,12 @@
 #include "crypto.h"
 #include "utils.h"
 #include <openssl/rand.h>
-#include <openssl/err.h> // 引入 ERR 头文件
+#include <openssl/err.h>
+#include <openssl/md5.h>
+#include <openssl/aes.h>
 
 // ---------------------- BIO Fragmentation Implementation ----------------------
+// (保留原有 BIO 代码，此处省略未修改部分，确保编译时完整包含原有的 BIO 实现)
 typedef struct {
     int first_packet_sent;
 } FragCtx;
@@ -142,6 +145,7 @@ void init_openssl_global() {
     SSL_CTX_set_min_proto_version(g_ssl_ctx, TLS1_2_VERSION);
     SSL_CTX_set_max_proto_version(g_ssl_ctx, TLS1_3_VERSION);
 
+    // ... (保留 Chrome Ciphers 和 CA 加载逻辑) ...
     if (g_enableChromeCiphers) {
         const char *chrome_ciphers = "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-RSA-AES128-SHA";
         if (SSL_CTX_set_cipher_list(g_ssl_ctx, chrome_ciphers) != 1) {
@@ -223,7 +227,6 @@ int tls_init_connect(TLSContext *ctx) {
         SSL_set_alpn_protos(ctx->ssl, alpn_protos, sizeof(alpn_protos));
     }
     
-    // [Debug] 增加详细的 SSL 连接日志
     log_msg("[Debug] SSL_connect starting to %s...", sni_name);
     int ret = SSL_connect(ctx->ssl);
     if (ret == 1) {
@@ -361,4 +364,66 @@ int ws_read_payload_exact(TLSContext *tls, char *out_buf, int expected_len) {
     if (payload_len < expected_len) return 0;
     if (!tls_read_exact(tls, out_buf, payload_len)) return 0;
     return payload_len;
+}
+
+// --- VMess Crypto Implementation ---
+
+void vmess_md5(const unsigned char *d, size_t n, unsigned char *md) {
+    MD5(d, n, md);
+}
+
+void vmess_get_auth(const unsigned char *uuid, long long ts, unsigned char *out_auth) {
+    // Auth = MD5(UUID + Timestamp(8 bytes big endian))
+    unsigned char buf[24];
+    memcpy(buf, uuid, 16);
+    for(int i=0; i<8; i++) buf[16+i] = (ts >> ((7-i)*8)) & 0xFF;
+    MD5(buf, 24, out_auth);
+}
+
+void vmess_kdf_header(const unsigned char *uuid, unsigned char *out_key, unsigned char *out_iv) {
+    // Cmd Key = MD5(UUID + "c48619fe-8f02-49e0-b9e9-edf763e17e21")
+    unsigned char k_buf[16 + 36];
+    memcpy(k_buf, uuid, 16);
+    memcpy(k_buf + 16, "c48619fe-8f02-49e0-b9e9-edf763e17e21", 36);
+    MD5(k_buf, 52, out_key);
+}
+
+void vmess_kdf_iv(long long ts, unsigned char *out_iv) {
+    // Cmd IV = MD5(TS + TS + TS + TS)
+    unsigned char t_buf[32];
+    unsigned char ts_bytes[8];
+    for(int i=0; i<8; i++) ts_bytes[i] = (ts >> ((7-i)*8)) & 0xFF;
+    memcpy(t_buf, ts_bytes, 8);
+    memcpy(t_buf+8, ts_bytes, 8);
+    memcpy(t_buf+16, ts_bytes, 8);
+    memcpy(t_buf+24, ts_bytes, 8);
+    MD5(t_buf, 32, out_iv);
+}
+
+unsigned int fnv1a_hash(const unsigned char *data, int len) {
+    unsigned int prime = 16777619;
+    unsigned int hash = 2166136261;
+    for(int i=0;i<len;i++) {
+        hash ^= data[i];
+        hash *= prime;
+    }
+    return hash;
+}
+
+void aes_cfb128_init(AesCfbCtx *ctx, const unsigned char *key, const unsigned char *iv) {
+    memcpy(ctx->key, key, 16);
+    memcpy(ctx->iv, iv, 16);
+    ctx->num = 0;
+}
+
+void aes_cfb128_encrypt(AesCfbCtx *ctx, const unsigned char *in, unsigned char *out, size_t len) {
+    AES_KEY aes_key;
+    AES_set_encrypt_key(ctx->key, 128, &aes_key);
+    AES_cfb128_encrypt(in, out, len, &aes_key, ctx->iv, &ctx->num, AES_ENCRYPT);
+}
+
+void aes_cfb128_decrypt(AesCfbCtx *ctx, const unsigned char *in, unsigned char *out, size_t len) {
+    AES_KEY aes_key;
+    AES_set_encrypt_key(ctx->key, 128, &aes_key);
+    AES_cfb128_encrypt(in, out, len, &aes_key, ctx->iv, &ctx->num, AES_DECRYPT);
 }
