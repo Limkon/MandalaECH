@@ -114,6 +114,7 @@ DWORD WINAPI client_handler(LPVOID p) {
     long long frame_total;
     int vless_response_header_stripped = 0;
     int err_code = 0;
+    int retry_count = 0; // [新增] 重试计数器
 
     // 初始化
     memset(&tls, 0, sizeof(tls));
@@ -157,19 +158,46 @@ DWORD WINAPI client_handler(LPVOID p) {
     // 2. DNS 解析与连接代理服务器
     h = gethostbyname(g_proxyConfig.host);
     if(!h) { log_msg("[Err] DNS Fail: %s", g_proxyConfig.host); goto cl_end; }
-    
-    r = socket(AF_INET, SOCK_STREAM, 0);
-    if (r == INVALID_SOCKET) goto cl_end;
-    setsockopt(r, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
-    
-    memset(&a, 0, sizeof(a)); a.sin_family = AF_INET; a.sin_port = htons((unsigned short)g_proxyConfig.port);
-    a.sin_addr = *(struct in_addr*)h->h_addr;
-    
-    if (connect(r, (struct sockaddr*)&a, sizeof(a)) != 0) { log_msg("[Err] TCP Connect Fail"); goto cl_end; }
-    
-    // 3. TLS 握手
-    tls.sock = r;
-    if (tls_init_connect(&tls) != 0) { log_msg("[Err] TLS Handshake Fail"); goto cl_end; }
+
+    // [新增] 代理服务器连接重试循环 (最多重试 3 次)
+    for (retry_count = 0; retry_count < 3; retry_count++) {
+        r = socket(AF_INET, SOCK_STREAM, 0);
+        if (r == INVALID_SOCKET) goto cl_end;
+        
+        setsockopt(r, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
+        // 设置发送和接收超时，防止卡死 (5秒超时)
+        int timeout_ms = 5000;
+        setsockopt(r, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout_ms, sizeof(int));
+        setsockopt(r, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout_ms, sizeof(int));
+
+        memset(&a, 0, sizeof(a)); a.sin_family = AF_INET; a.sin_port = htons((unsigned short)g_proxyConfig.port);
+        a.sin_addr = *(struct in_addr*)h->h_addr;
+        
+        if (connect(r, (struct sockaddr*)&a, sizeof(a)) == 0) {
+            // TCP 连接成功，开始 TLS 握手
+            tls.sock = r;
+            if (tls_init_connect(&tls) == 0) {
+                // TLS 握手成功，跳出循环
+                break;
+            } else {
+                log_msg("[Warn] TLS Handshake Fail. Retrying %d...", retry_count + 1);
+                tls_close(&tls); // 清理 SSL
+            }
+        } else {
+            log_msg("[Warn] TCP Connect Fail. Retrying %d...", retry_count + 1);
+        }
+        
+        // 失败处理：关闭 Socket，等待后重试
+        closesocket(r); 
+        r = INVALID_SOCKET;
+        Sleep(200); // 稍微等待一下
+    }
+
+    // 如果重试 3 次后 r 依然无效或 TLS 握手失败，则彻底放弃
+    if (r == INVALID_SOCKET || tls.ssl == NULL) {
+        log_msg("[Err] Connection failed after 3 retries.");
+        goto cl_end;
+    }
     
     // 4. WebSocket 握手
     sni_val = (strlen(g_proxyConfig.sni) > 0) ? g_proxyConfig.sni : g_proxyConfig.host;
@@ -309,7 +337,6 @@ DWORD WINAPI client_handler(LPVOID p) {
         const char *ok = "HTTP/1.1 200 Connection Established\r\n\r\n";
         // [关键修复] 如果发送 200 OK 时浏览器已断开，直接退出，防止进入死循环
         if (send(c, ok, strlen(ok), 0) == SOCKET_ERROR) {
-            // log_msg("[Info] Browser closed connection early");
             goto cl_end;
         }
         
