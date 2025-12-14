@@ -237,8 +237,7 @@ DWORD WINAPI client_handler(LPVOID p) {
         for(int i=0; i<16; i++) rnd_key[i] = rand() % 256;
         base64_encode_key(rnd_key, ws_key_str);
 
-        // [Fix] 添加 Origin 头部，以兼容严格检查的服务器
-        // 关键修改：Origin: https://<host>
+        // [Fix] 增加 Origin 头部，这是关键修复点
         offset = snprintf(ws_send_buf, BUFFER_SIZE, 
             "GET %s HTTP/1.1\r\n"
             "Host: %s\r\n"
@@ -248,9 +247,8 @@ DWORD WINAPI client_handler(LPVOID p) {
             "Sec-WebSocket-Key: %s\r\n"
             "Sec-WebSocket-Version: 13\r\n"
             "Origin: https://%s\r\n\r\n", 
-            req_path, req_host, g_userAgentStr, ws_key_str, req_host);
+            req_path, req_host, g_userAgentStr, ws_key_str, req_host); // 注意这里增加了 req_host 参数
 
-        // [Debug] Log for WS Request
         log_msg("[Debug] Sending WS Request (Path='%s', Host='%s')", req_path, req_host);
 
         if (tls_write(&tls, ws_send_buf, offset) <= 0) {
@@ -269,11 +267,12 @@ DWORD WINAPI client_handler(LPVOID p) {
                 ws_read_buf[total_read] = 0;
                 if (strstr(ws_read_buf, "\r\n\r\n")) break; 
             } else if (n == 0) {
-                // [Fix] 如果返回 0，说明服务器主动关闭连接，直接退出，不重试
-                log_msg("[Err] Server closed connection during WS handshake. Check Headers/Path.");
+                // [Fix] 如果 n==0，说明服务器已关闭连接(EOF)，没有必要重试，直接退出
+                log_msg("[Err] Server closed connection during handshake.");
                 break; 
             } else {
-                // n < 0 (错误) 或 -1
+                // 真正需要重试的是 WouldBlock 状态（视 tls_read 实现而定），或者其他临时错误
+                // 如果 tls_read 封装了 SSL_read，返回负数通常是严重错误
                 Sleep(100); 
                 handshake_retry++;
                 continue; 
