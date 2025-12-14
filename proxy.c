@@ -111,6 +111,14 @@ DWORD WINAPI client_handler(LPVOID p) {
     
     log_msg("[Access] %s %s:%d (%s)", method, host, port, g_proxyConfig.type);
 
+    // [Shadowsocks 检查]
+    if (_stricmp(g_proxyConfig.type, "shadowsocks") == 0) {
+        log_msg("[Err] Shadowsocks protocol is not fully supported yet (Missing crypto).");
+        // 可以在此直接返回，或者尝试走 Socks5 (如果用户配置的其实是 SS 伪装的 Socks)
+        // 为避免混淆，暂时中断
+        goto cl_end;
+    }
+
     // 2. DNS 解析与连接代理服务器
     struct hostent *h = gethostbyname(g_proxyConfig.host);
     if(!h) { log_msg("[Err] DNS Fail: %s", g_proxyConfig.host); goto cl_end; }
@@ -164,30 +172,16 @@ DWORD WINAPI client_handler(LPVOID p) {
         proto_buf[proto_len++] = 0x01; // Cmd: TCP
         proto_buf[proto_len++] = (port >> 8) & 0xFF; proto_buf[proto_len++] = port & 0xFF;        
         
-        // [智能地址类型判断]
-        struct in_addr ip4;
-        struct in6_addr ip6;
-        
+        // 智能地址类型判断
+        struct in_addr ip4; struct in6_addr ip6;
         if (inet_pton(AF_INET, host, &ip4) == 1) {
-            // IPv4 (Type 1)
-            proto_buf[proto_len++] = 0x01; 
-            memcpy(proto_buf + proto_len, &ip4, 4); 
-            proto_len += 4;
-        } 
-        else if (inet_pton(AF_INET6, host, &ip6) == 1) {
-            // IPv6 (Type 3)
-            proto_buf[proto_len++] = 0x03; 
-            memcpy(proto_buf + proto_len, &ip6, 16); 
-            proto_len += 16;
-        } 
-        else {
-            // Domain (Type 2)
-            proto_buf[proto_len++] = 0x02; 
-            proto_buf[proto_len++] = (unsigned char)strlen(host);
-            memcpy(proto_buf + proto_len, host, strlen(host)); 
-            proto_len += (int)strlen(host);
+            proto_buf[proto_len++] = 0x01; memcpy(proto_buf + proto_len, &ip4, 4); proto_len += 4;
+        } else if (inet_pton(AF_INET6, host, &ip6) == 1) {
+            proto_buf[proto_len++] = 0x03; memcpy(proto_buf + proto_len, &ip6, 16); proto_len += 16;
+        } else {
+            proto_buf[proto_len++] = 0x02; proto_buf[proto_len++] = (unsigned char)strlen(host);
+            memcpy(proto_buf + proto_len, host, strlen(host)); proto_len += (int)strlen(host);
         }
-        
         flen = build_ws_frame((char*)proto_buf, proto_len, ws_send_buf);
         tls_write(&tls, ws_send_buf, flen);
 
@@ -198,59 +192,77 @@ DWORD WINAPI client_handler(LPVOID p) {
         proto_buf[proto_len++] = 0x0D; proto_buf[proto_len++] = 0x0A;
         proto_buf[proto_len++] = 0x01; // TCP
         
-        // Trojan 的地址类型定义与 VLESS 略有不同：1=IPv4, 3=Domain, 4=IPv6
-        // 这里为了安全起见，我们对 Trojan 也做一个简单的智能判断
-        struct in_addr ip4;
-        struct in6_addr ip6;
-
+        struct in_addr ip4; struct in6_addr ip6;
         if (inet_pton(AF_INET, host, &ip4) == 1) {
-             proto_buf[proto_len++] = 0x01; // IPv4
-             memcpy(proto_buf + proto_len, &ip4, 4); proto_len += 4;
+             proto_buf[proto_len++] = 0x01; memcpy(proto_buf + proto_len, &ip4, 4); proto_len += 4;
         } else if (inet_pton(AF_INET6, host, &ip6) == 1) {
-             proto_buf[proto_len++] = 0x04; // IPv6 (Trojan use 0x04)
-             memcpy(proto_buf + proto_len, &ip6, 16); proto_len += 16;
+             proto_buf[proto_len++] = 0x04; memcpy(proto_buf + proto_len, &ip6, 16); proto_len += 16;
         } else {
-             proto_buf[proto_len++] = 0x03; // Domain
-             proto_buf[proto_len++] = (unsigned char)strlen(host);
+             proto_buf[proto_len++] = 0x03; proto_buf[proto_len++] = (unsigned char)strlen(host);
              memcpy(proto_buf + proto_len, host, strlen(host)); proto_len += strlen(host);
         }
-
         proto_buf[proto_len++] = (port >> 8) & 0xFF; proto_buf[proto_len++] = port & 0xFF;
         proto_buf[proto_len++] = 0x0D; proto_buf[proto_len++] = 0x0A;
         flen = build_ws_frame((char*)proto_buf, proto_len, ws_send_buf);
         tls_write(&tls, ws_send_buf, flen);
 
     } else {
-        // [Socks5 Request] (Simplified)
-        char auth[] = {0x05, 0x01, 0x00};
-        if (strlen(g_proxyConfig.user) > 0) auth[2] = 0x02;
+        // [Socks5 Request] (修复了认证流程)
+        char resp_buf[512]; 
+        
+        // 1. 发送支持的认证方法
+        char auth[] = {0x05, 0x01, 0x00}; // 默认支持 No Auth
+        if (strlen(g_proxyConfig.user) > 0) auth[2] = 0x02; // 如果有用户，支持 User/Pass
+        
         flen = build_ws_frame(auth, 3, ws_send_buf);
         tls_write(&tls, ws_send_buf, flen);
-        char resp_buf[256]; ws_read_payload_exact(&tls, resp_buf, 2); 
         
+        // 2. 读取服务端选择的方法
+        if (ws_read_payload_exact(&tls, resp_buf, 2) < 2) { log_msg("[Err] Socks5 Handshake Read Fail"); goto cl_end; }
+        
+        if (resp_buf[1] == 0x02) {
+            // 服务端选择了 User/Pass 认证，发送账号密码
+            int ulen = strlen(g_proxyConfig.user);
+            int plen = strlen(g_proxyConfig.pass);
+            unsigned char auth_pkg[512];
+            int ap_len = 0;
+            auth_pkg[ap_len++] = 0x01; // Ver
+            auth_pkg[ap_len++] = ulen; memcpy(auth_pkg+ap_len, g_proxyConfig.user, ulen); ap_len += ulen;
+            auth_pkg[ap_len++] = plen; memcpy(auth_pkg+ap_len, g_proxyConfig.pass, plen); ap_len += plen;
+            
+            flen = build_ws_frame((char*)auth_pkg, ap_len, ws_send_buf);
+            tls_write(&tls, ws_send_buf, flen);
+            
+            // 读取认证结果
+            if (ws_read_payload_exact(&tls, resp_buf, 2) < 2) { log_msg("[Err] Socks5 Auth Read Fail"); goto cl_end; }
+            if (resp_buf[1] != 0x00) { log_msg("[Err] Socks5 Auth Failed"); goto cl_end; }
+        } else if (resp_buf[1] != 0x00) {
+            log_msg("[Err] Socks5 Auth Method Rejected: %02X", resp_buf[1]); goto cl_end;
+        }
+
+        // 3. 发送 Connect 请求
         unsigned char socks_req[512]; int slen = 0;
         socks_req[slen++] = 0x05; socks_req[slen++] = 0x01; socks_req[slen++] = 0x00; 
         
-        // Socks5 也支持 IPv4/IPv6/Domain
-        struct in_addr ip4;
-        struct in6_addr ip6;
-        
+        struct in_addr ip4; struct in6_addr ip6;
         if (inet_pton(AF_INET, host, &ip4) == 1) {
-            socks_req[slen++] = 0x01; // IPv4
-            memcpy(socks_req + slen, &ip4, 4); slen += 4;
+            socks_req[slen++] = 0x01; memcpy(socks_req + slen, &ip4, 4); slen += 4;
         } else if (inet_pton(AF_INET6, host, &ip6) == 1) {
-            socks_req[slen++] = 0x04; // IPv6
-            memcpy(socks_req + slen, &ip6, 16); slen += 16;
+            socks_req[slen++] = 0x04; memcpy(socks_req + slen, &ip6, 16); slen += 16;
         } else {
-            socks_req[slen++] = 0x03; // Domain
-            socks_req[slen++] = (unsigned char)strlen(host);
+            socks_req[slen++] = 0x03; socks_req[slen++] = (unsigned char)strlen(host);
             memcpy(socks_req + slen, host, strlen(host)); slen += (int)strlen(host);
         }
-
         socks_req[slen++] = (port >> 8) & 0xFF; socks_req[slen++] = port & 0xFF;
+        
         flen = build_ws_frame((char*)socks_req, slen, ws_send_buf);
         tls_write(&tls, ws_send_buf, flen);
-        ws_read_payload_exact(&tls, resp_buf, 4); 
+        
+        // 4. 读取 Connect 响应 (完整读取)
+        // ws_read_payload_exact 会读取并丢弃整个 WebSocket 帧的 Payload，我们只需要确认它成功读取即可
+        // 响应长度通常是 10 字节以上
+        if (ws_read_payload_exact(&tls, resp_buf, 4) == 0) { log_msg("[Err] Socks5 Connect Read Fail"); goto cl_end; }
+        if (resp_buf[1] != 0x00) { log_msg("[Err] Socks5 Connect Failed: %02X", resp_buf[1]); goto cl_end; }
     }
     
     // 6. 响应浏览器并处理 Pipeline 数据
