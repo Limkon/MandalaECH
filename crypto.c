@@ -1,347 +1,477 @@
+#include "proxy.h"
 #include "crypto.h"
 #include "utils.h"
-#include <openssl/rand.h>
+#include <openssl/sha.h>
 
-// ---------------------- BIO Fragmentation Implementation ----------------------
-typedef struct {
-    int first_packet_sent;
-} FragCtx;
-
-static int frag_write(BIO *b, const char *in, int inl);
-static int frag_read(BIO *b, char *out, int outl);
-static long frag_ctrl(BIO *b, int cmd, long num, void *ptr);
-static int frag_new(BIO *b);
-static int frag_free(BIO *b);
-
-static BIO_METHOD *method_frag = NULL;
-
-BIO_METHOD *BIO_f_fragment(void) {
-    if (method_frag == NULL) {
-        method_frag = BIO_meth_new(BIO_TYPE_FILTER, "Fragmentation Filter");
-        BIO_meth_set_write(method_frag, frag_write);
-        BIO_meth_set_read(method_frag, frag_read);
-        BIO_meth_set_ctrl(method_frag, frag_ctrl);
-        BIO_meth_set_create(method_frag, frag_new);
-        BIO_meth_set_destroy(method_frag, frag_free);
+// --- 辅助函数：解析 UUID (支持带横杠或不带) ---
+void parse_uuid(const char* uuid_str, unsigned char* out) {
+    const char* p = uuid_str;
+    int i = 0;
+    while (*p && i < 16) {
+        if (*p == '-' || *p == ' ' || *p == '{' || *p == '}') { 
+            p++; continue; 
+        }
+        int v;
+        if (sscanf(p, "%2x", &v) == 1) {
+            out[i++] = (unsigned char)v;
+            p += 2;
+        } else {
+            p++; // 跳过非十六进制字符
+        }
     }
-    return method_frag;
 }
 
-static int frag_new(BIO *b) {
-    FragCtx *ctx = (FragCtx *)malloc(sizeof(FragCtx));
-    if(!ctx) return 0;
-    ctx->first_packet_sent = 0;
-    BIO_set_data(b, ctx);
-    BIO_set_init(b, 1);
-    return 1;
+// --- 辅助函数：Trojan 密码哈希 (SHA224) ---
+void trojan_password_hash(const char* password, char* out_hex) {
+    unsigned char digest[SHA224_DIGEST_LENGTH];
+    SHA224((unsigned char*)password, strlen(password), digest);
+    for(int i = 0; i < SHA224_DIGEST_LENGTH; i++) {
+        sprintf(out_hex + (i * 2), "%02x", digest[i]);
+    }
+    out_hex[SHA224_DIGEST_LENGTH * 2] = 0;
 }
 
-static int frag_free(BIO *b) {
-    if (b == NULL) return 0;
-    FragCtx *ctx = (FragCtx *)BIO_get_data(b);
-    if (ctx) { free(ctx); BIO_set_data(b, NULL); }
-    return 1;
+// 接收超时辅助函数
+int recv_timeout(SOCKET s, char *buf, int len, int timeout_sec) {
+    fd_set fds; FD_ZERO(&fds); FD_SET(s, &fds);
+    struct timeval tv = { timeout_sec, 0 };
+    int n = select(0, &fds, NULL, NULL, &tv);
+    if (n == 0) return -2; if (n < 0) return -1;  
+    return recv(s, buf, len, 0);
 }
 
-#define MAX_FRAG_COUNT 32 
+// 发送全部数据辅助函数
+int send_all(SOCKET s, const char *buf, int len) {
+    int total = 0; int bytesleft = len; int n;
+    while(total < len) {
+        n = send(s, buf+total, bytesleft, 0);
+        if (n == -1) {
+            int err = WSAGetLastError();
+            if (err == WSAEWOULDBLOCK) { Sleep(1); continue; }
+            // [优化] 忽略连接被对方重置或中止的错误，这在代理中很常见
+            if (err != WSAECONNRESET && err != WSAECONNABORTED) {
+                log_msg("[Err] send_all fail: %d", err); 
+            }
+            return -1;
+        }
+        total += n; bytesleft -= n;
+    }
+    return total;
+}
 
-static int frag_write(BIO *b, const char *in, int inl) {
-    FragCtx *ctx = (FragCtx *)BIO_get_data(b);
-    BIO *next = BIO_next(b);
-    if (!ctx || !next) return 0;
+// 调试日志：打印简短 Hex 预览
+void log_hex_simple(const char* tag, unsigned char* data, int len) {
+    if (len <= 0) return;
+    char buf[64] = {0};
+    int max = len > 6 ? 6 : len;
+    int p = 0;
+    for(int i=0; i<max; i++) p += sprintf(buf+p, "%02X ", data[i]);
+    log_msg("%s %d bytes: %s...", tag, len, buf);
+}
 
-    BIO_clear_retry_flags(b);
+// --- 客户端处理线程 (核心逻辑) ---
+DWORD WINAPI client_handler(LPVOID p) {
+    // 变量声明前置，兼容性更好
+    SOCKET c = (SOCKET)(UINT_PTR)p; 
+    TLSContext tls; 
+    SOCKET r = INVALID_SOCKET;      
+    
+    char *c_buf = NULL; 
+    char *ws_read_buf = NULL; 
+    char *ws_send_buf = NULL; 
+    int ws_buf_len = 0; 
+    int flag = 1; 
 
-    if (inl > 0 && ctx->first_packet_sent == 0) {
-        ctx->first_packet_sent = 1; 
-        int bytes_sent = 0;
-        int remaining = inl;
-        int frag_count = 0;
+    int browser_len;
+    char method[16], host[256]; 
+    int port = 80; 
+    int is_connect_method = 0;
+    char *header_end = NULL;
+    int header_len = 0;
 
-        while (remaining > 0) {
-            if (frag_count >= MAX_FRAG_COUNT) {
-                int ret = BIO_write(next, in + bytes_sent, remaining);
-                if (ret <= 0) {
-                    BIO_copy_next_retry(b);
-                    if (bytes_sent > 0) {
-                        BIO_clear_retry_flags(b);
-                        return bytes_sent;
-                    }
-                    return ret;
+    struct hostent *h;
+    struct sockaddr_in a;
+    const char* sni_val;
+    const char* req_path;
+    int offset;
+    int len;
+
+    int flen = 0;
+    unsigned char proto_buf[1024];
+    int proto_len = 0;
+    
+    BOOL is_vless;
+    BOOL is_trojan;
+    BOOL is_shadowsocks;
+    
+    struct in_addr ip4; 
+    struct in6_addr ip6;
+    
+    fd_set fds; 
+    struct timeval tv; 
+    u_long mode = 1;
+    int hl, pl;
+    long long frame_total;
+    int vless_response_header_stripped = 0;
+    int err_code = 0;
+
+    // 初始化
+    memset(&tls, 0, sizeof(tls));
+    
+    c_buf = (char*)malloc(BUFFER_SIZE); 
+    ws_read_buf = (char*)malloc(BUFFER_SIZE); 
+    ws_send_buf = (char*)malloc(BUFFER_SIZE + 4096); 
+
+    if (!c_buf || !ws_read_buf || !ws_send_buf) { goto cl_end; }
+    
+    // 设置浏览器连接为无延迟
+    setsockopt(c, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
+    
+    // 1. 读取浏览器首包 (分析目标地址)
+    browser_len = recv_timeout(c, c_buf, BUFFER_SIZE, 10);
+    if (browser_len <= 0) goto cl_end; 
+    c_buf[browser_len] = 0;
+    
+    // 简单的协议判断
+    if (c_buf[0] == 0x05) { send(c, "\x05\x00", 2, 0); goto cl_end; } 
+    else {
+        if (sscanf(c_buf, "%15s %255s", method, host) == 2) {
+            char *p = strchr(host, ':');
+            if (p) { *p = 0; port = atoi(p+1); }
+            else if(stricmp(method, "CONNECT")==0) port = 443;
+            
+            if (stricmp(method, "CONNECT") == 0) is_connect_method = 1;
+            
+            // 计算 HTTP 头部长度
+            header_end = strstr(c_buf, "\r\n\r\n");
+            if (header_end) {
+                header_len = (int)(header_end - c_buf) + 4;
+            } else {
+                header_len = browser_len;
+            }
+        } else { goto cl_end; }
+    }
+    
+    log_msg("[Access] %s %s:%d (%s)", method, host, port, g_proxyConfig.type);
+
+    // 2. DNS 解析与连接代理服务器
+    h = gethostbyname(g_proxyConfig.host);
+    if(!h) { log_msg("[Err] DNS Fail: %s", g_proxyConfig.host); goto cl_end; }
+    
+    r = socket(AF_INET, SOCK_STREAM, 0);
+    if (r == INVALID_SOCKET) goto cl_end;
+    setsockopt(r, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
+    
+    memset(&a, 0, sizeof(a)); a.sin_family = AF_INET; a.sin_port = htons((unsigned short)g_proxyConfig.port);
+    a.sin_addr = *(struct in_addr*)h->h_addr;
+    
+    if (connect(r, (struct sockaddr*)&a, sizeof(a)) != 0) { log_msg("[Err] TCP Connect Fail"); goto cl_end; }
+    
+    // 3. TLS 握手
+    tls.sock = r;
+    if (tls_init_connect(&tls) != 0) { log_msg("[Err] TLS Handshake Fail"); goto cl_end; }
+    
+    // 4. WebSocket 握手
+    sni_val = (strlen(g_proxyConfig.sni) > 0) ? g_proxyConfig.sni : g_proxyConfig.host;
+    req_path = (strlen(g_proxyConfig.path) > 0) ? g_proxyConfig.path : "/";
+    
+    offset = snprintf(ws_send_buf, BUFFER_SIZE, 
+        "GET %s HTTP/1.1\r\n"
+        "Host: %s\r\n"
+        "User-Agent: %s\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+        "Sec-WebSocket-Version: 13\r\n\r\n", 
+        req_path, sni_val, g_userAgentStr);
+
+    tls_write(&tls, ws_send_buf, offset);
+
+    // 读取 WS 响应
+    len = tls_read(&tls, ws_read_buf, BUFFER_SIZE-1);
+    if (len <= 0 || !strstr(ws_read_buf, "101")) { log_msg("[Err] WS Handshake Fail (Not 101)"); goto cl_end; }
+    
+    // 5. 发送代理协议请求头 (VLESS/Trojan/Socks/Shadowsocks)
+    is_vless = (_stricmp(g_proxyConfig.type, "vless") == 0);
+    is_trojan = (_stricmp(g_proxyConfig.type, "trojan") == 0);
+    is_shadowsocks = (_stricmp(g_proxyConfig.type, "shadowsocks") == 0);
+
+    if (is_vless) {
+        // [VLESS Request]
+        proto_buf[proto_len++] = 0x00; // Version
+        parse_uuid(g_proxyConfig.user, proto_buf + proto_len); proto_len += 16; 
+        proto_buf[proto_len++] = 0x00; // Addons Len
+        proto_buf[proto_len++] = 0x01; // Cmd: TCP
+        proto_buf[proto_len++] = (port >> 8) & 0xFF; proto_buf[proto_len++] = port & 0xFF;        
+        
+        if (inet_pton(AF_INET, host, &ip4) == 1) {
+            proto_buf[proto_len++] = 0x01; memcpy(proto_buf + proto_len, &ip4, 4); proto_len += 4;
+        } else if (inet_pton(AF_INET6, host, &ip6) == 1) {
+            proto_buf[proto_len++] = 0x03; memcpy(proto_buf + proto_len, &ip6, 16); proto_len += 16;
+        } else {
+            proto_buf[proto_len++] = 0x02; proto_buf[proto_len++] = (unsigned char)strlen(host);
+            memcpy(proto_buf + proto_len, host, strlen(host)); proto_len += (int)strlen(host);
+        }
+        flen = build_ws_frame((char*)proto_buf, proto_len, ws_send_buf);
+        tls_write(&tls, ws_send_buf, flen);
+
+    } else if (is_trojan) {
+        // [Trojan Request]
+        char hex_pass[56 + 1]; trojan_password_hash(g_proxyConfig.pass, hex_pass);
+        memcpy(proto_buf, hex_pass, 56); proto_len = 56;
+        proto_buf[proto_len++] = 0x0D; proto_buf[proto_len++] = 0x0A;
+        proto_buf[proto_len++] = 0x01; // TCP
+        
+        if (inet_pton(AF_INET, host, &ip4) == 1) {
+             proto_buf[proto_len++] = 0x01; memcpy(proto_buf + proto_len, &ip4, 4); proto_len += 4;
+        } else if (inet_pton(AF_INET6, host, &ip6) == 1) {
+             proto_buf[proto_len++] = 0x04; memcpy(proto_buf + proto_len, &ip6, 16); proto_len += 16;
+        } else {
+             proto_buf[proto_len++] = 0x03; proto_buf[proto_len++] = (unsigned char)strlen(host);
+             memcpy(proto_buf + proto_len, host, strlen(host)); proto_len += strlen(host);
+        }
+        proto_buf[proto_len++] = (port >> 8) & 0xFF; proto_buf[proto_len++] = port & 0xFF;
+        proto_buf[proto_len++] = 0x0D; proto_buf[proto_len++] = 0x0A;
+        flen = build_ws_frame((char*)proto_buf, proto_len, ws_send_buf);
+        tls_write(&tls, ws_send_buf, flen);
+
+    } else if (is_shadowsocks) {
+        // [Shadowsocks Request] SS Over TLS
+        if (inet_pton(AF_INET, host, &ip4) == 1) {
+             proto_buf[proto_len++] = 0x01; memcpy(proto_buf + proto_len, &ip4, 4); proto_len += 4;
+        } else if (inet_pton(AF_INET6, host, &ip6) == 1) {
+             proto_buf[proto_len++] = 0x04; memcpy(proto_buf + proto_len, &ip6, 16); proto_len += 16;
+        } else {
+             proto_buf[proto_len++] = 0x03; proto_buf[proto_len++] = (unsigned char)strlen(host);
+             memcpy(proto_buf + proto_len, host, strlen(host)); proto_len += strlen(host);
+        }
+        proto_buf[proto_len++] = (port >> 8) & 0xFF; proto_buf[proto_len++] = port & 0xFF;
+        flen = build_ws_frame((char*)proto_buf, proto_len, ws_send_buf);
+        tls_write(&tls, ws_send_buf, flen);
+
+    } else {
+        // [Socks5 Request]
+        char resp_buf[512]; 
+        
+        // 1. 发送支持的认证方法
+        char auth[] = {0x05, 0x01, 0x00}; 
+        if (strlen(g_proxyConfig.user) > 0) auth[2] = 0x02; 
+        
+        flen = build_ws_frame(auth, 3, ws_send_buf);
+        tls_write(&tls, ws_send_buf, flen);
+        
+        // 2. 读取服务端选择的方法
+        if (ws_read_payload_exact(&tls, resp_buf, 2) < 2) { log_msg("[Err] Socks5 Handshake Read Fail"); goto cl_end; }
+        
+        if (resp_buf[1] == 0x02) {
+            int ulen = strlen(g_proxyConfig.user);
+            int plen = strlen(g_proxyConfig.pass);
+            unsigned char auth_pkg[512];
+            int ap_len = 0;
+            auth_pkg[ap_len++] = 0x01; 
+            auth_pkg[ap_len++] = ulen; memcpy(auth_pkg+ap_len, g_proxyConfig.user, ulen); ap_len += ulen;
+            auth_pkg[ap_len++] = plen; memcpy(auth_pkg+ap_len, g_proxyConfig.pass, plen); ap_len += plen;
+            
+            flen = build_ws_frame((char*)auth_pkg, ap_len, ws_send_buf);
+            tls_write(&tls, ws_send_buf, flen);
+            
+            if (ws_read_payload_exact(&tls, resp_buf, 2) < 2) { log_msg("[Err] Socks5 Auth Read Fail"); goto cl_end; }
+            if (resp_buf[1] != 0x00) { log_msg("[Err] Socks5 Auth Failed"); goto cl_end; }
+        } else if (resp_buf[1] != 0x00) {
+            log_msg("[Err] Socks5 Auth Method Rejected: %02X", resp_buf[1]); goto cl_end;
+        }
+
+        // 3. 发送 Connect 请求
+        int slen = 0;
+        unsigned char socks_req[512];
+        socks_req[slen++] = 0x05; socks_req[slen++] = 0x01; socks_req[slen++] = 0x00; 
+        
+        if (inet_pton(AF_INET, host, &ip4) == 1) {
+            socks_req[slen++] = 0x01; memcpy(socks_req + slen, &ip4, 4); slen += 4;
+        } else if (inet_pton(AF_INET6, host, &ip6) == 1) {
+            socks_req[slen++] = 0x04; memcpy(socks_req + slen, &ip6, 16); slen += 16;
+        } else {
+            socks_req[slen++] = 0x03; socks_req[slen++] = (unsigned char)strlen(host);
+            memcpy(socks_req + slen, host, strlen(host)); slen += (int)strlen(host);
+        }
+        socks_req[slen++] = (port >> 8) & 0xFF; socks_req[slen++] = port & 0xFF;
+        
+        flen = build_ws_frame((char*)socks_req, slen, ws_send_buf);
+        tls_write(&tls, ws_send_buf, flen);
+        
+        // 4. 读取 Connect 响应
+        if (ws_read_payload_exact(&tls, resp_buf, 4) == 0) { log_msg("[Err] Socks5 Connect Read Fail"); goto cl_end; }
+        if (resp_buf[1] != 0x00) { log_msg("[Err] Socks5 Connect Failed: %02X", resp_buf[1]); goto cl_end; }
+    }
+    
+    // 6. 响应浏览器并处理 Pipeline 数据
+    if (is_connect_method) {
+        const char *ok = "HTTP/1.1 200 Connection Established\r\n\r\n";
+        // [关键修复] 如果发送 200 OK 时浏览器已断开，直接退出，防止进入死循环
+        if (send(c, ok, strlen(ok), 0) == SOCKET_ERROR) {
+            // log_msg("[Info] Browser closed connection early");
+            goto cl_end;
+        }
+        
+        if (browser_len > header_len) {
+            int extra_len = browser_len - header_len;
+            log_hex_simple("[Tx] Early Data", (unsigned char*)(c_buf + header_len), extra_len);
+            flen = build_ws_frame(c_buf + header_len, extra_len, ws_send_buf);
+            tls_write(&tls, ws_send_buf, flen);
+        }
+    } else {
+        log_hex_simple("[Tx] Direct Data", (unsigned char*)c_buf, browser_len);
+        flen = build_ws_frame(c_buf, browser_len, ws_send_buf);
+        tls_write(&tls, ws_send_buf, flen);
+    }
+    
+    // 7. 双向数据转发循环
+    ioctlsocket(c, FIONBIO, &mode); ioctlsocket(r, FIONBIO, &mode);
+    ws_buf_len = 0;
+
+    while(1) {
+        FD_ZERO(&fds); FD_SET(c, &fds); FD_SET(r, &fds);
+        int pending = SSL_pending(tls.ssl);
+        tv.tv_sec = 1; tv.tv_usec = 0;
+        if (pending > 0) { tv.tv_sec = 0; tv.tv_usec = 0; }
+        
+        int n = select(0, &fds, NULL, NULL, &tv);
+        if (n < 0) break;
+        
+        // [Browser -> Proxy]
+        if (FD_ISSET(c, &fds)) {
+            len = recv(c, c_buf, BUFFER_SIZE, 0);
+            if (len > 0) {
+                flen = build_ws_frame(c_buf, len, ws_send_buf);
+                if (tls_write(&tls, ws_send_buf, flen) < 0) {
+                    log_msg("[Err] TLS Write Failed");
+                    break;
                 }
-                bytes_sent += ret;
-                remaining -= ret;
+            } else if (len == 0) {
+                break;
+            } else if (WSAGetLastError() != WSAEWOULDBLOCK) {
+                err_code = WSAGetLastError();
+                // [优化] 过滤 10053 和 10054 错误，减少日志干扰
+                if (err_code != WSAECONNABORTED && err_code != WSAECONNRESET) {
+                    log_msg("[Err] Recv Error: %d", err_code);
+                }
                 break;
             }
-
-            int chunk_size;
-            int range = g_fragSizeMax - g_fragSizeMin;
-            if (range < 0) range = 0;
-            chunk_size = g_fragSizeMin + (range > 0 ? (rand() % (range + 1)) : 0);
+        }
+        
+        // [Proxy -> Browser]
+        if (FD_ISSET(r, &fds) || pending > 0) {
+            if (ws_buf_len < BUFFER_SIZE) {
+                len = tls_read(&tls, ws_read_buf + ws_buf_len, BUFFER_SIZE - ws_buf_len);
+                if (len > 0) {
+                    ws_buf_len += len;
+                }
+                else if (len == -1) break; 
+            }
+        }
+        
+        // 处理 WebSocket 粘包/拆包
+        while (ws_buf_len > 0) {
+            frame_total = check_ws_frame((unsigned char*)ws_read_buf, ws_buf_len, &hl, &pl);
             
-            if (chunk_size < 1) chunk_size = 1;
-            if (chunk_size > remaining) chunk_size = remaining;
-
-            int ret = BIO_write(next, in + bytes_sent, chunk_size);
-            if (ret <= 0) {
-                BIO_copy_next_retry(b);
-                if (bytes_sent > 0) {
-                    BIO_clear_retry_flags(b);
-                    return bytes_sent;
-                }
-                return ret;
+            if (frame_total < 0) {
+                log_msg("[Err] WS Frame check failed");
+                goto cl_end; 
             }
-            bytes_sent += ret;
-            remaining -= ret;
-            frag_count++;
-            if (remaining > 0 && g_fragDelayMs > 0) Sleep(rand() % (g_fragDelayMs + 1));
-        }
-        return bytes_sent;
-    }
-    
-    int ret = BIO_write(next, in, inl);
-    BIO_copy_next_retry(b);
-    return ret;
-}
 
-static int frag_read(BIO *b, char *out, int outl) {
-    BIO *next = BIO_next(b);
-    if (!next) return 0;
-    BIO_clear_retry_flags(b);
-    int ret = BIO_read(next, out, outl);
-    BIO_copy_next_retry(b);
-    return ret;
-}
+            if (frame_total > 0) {
+                int opcode = ws_read_buf[0] & 0x0F;
+                if (opcode == 0x8) goto cl_end; // Close frame
+                
+                // 处理数据帧 (Binary=0x2, Text=0x1)
+                if ((opcode == 0x1 || opcode == 0x2) && pl > 0) {
+                    char* payload_ptr = ws_read_buf + hl;
+                    int payload_size = pl;
 
-static long frag_ctrl(BIO *b, int cmd, long num, void *ptr) {
-    BIO *next = BIO_next(b);
-    if (!next) return 0;
-    return BIO_ctrl(next, cmd, num, ptr);
-}
-// ---------------------- End BIO Implementation ----------------------
+                    // [VLESS 响应头剥离逻辑]
+                    if (is_vless && !vless_response_header_stripped) {
+                        if (payload_size >= 2) {
+                            int addon_len = (unsigned char)payload_ptr[1];
+                            int head_size = 2 + addon_len;
+                            if (payload_size >= head_size) {
+                                log_msg("[Rx] VLESS Header Stripped. Payload: %d bytes", payload_size - head_size);
+                                payload_ptr += head_size;
+                                payload_size -= head_size;
+                                vless_response_header_stripped = 1;
+                            } else {
+                                // [优化] 数据不足以剥离头时，暂时当作空处理，等待下一包
+                                // 但注意：这可能会丢失数据。理想做法是缓存。
+                                // 鉴于 VLESS 响应头极短，且通常单独发送，此处设为0通常安全
+                                payload_size = 0; 
+                            }
+                        } else { payload_size = 0; }
+                    }
 
-extern SSL_CTX *g_ssl_ctx; 
-
-void FreeGlobalSSLContext() {
-    if (g_ssl_ctx) { SSL_CTX_free(g_ssl_ctx); g_ssl_ctx = NULL; }
-}
-
-void init_openssl_global() {
-    if (g_ssl_ctx) return;
-    SSL_library_init(); 
-    OpenSSL_add_all_algorithms(); 
-    SSL_load_error_strings();
-    
-    g_ssl_ctx = SSL_CTX_new(TLS_client_method());
-    if (!g_ssl_ctx) return;
-
-    SSL_CTX_set_min_proto_version(g_ssl_ctx, TLS1_2_VERSION);
-    SSL_CTX_set_max_proto_version(g_ssl_ctx, TLS1_3_VERSION);
-
-    if (g_enableChromeCiphers) {
-        const char *chrome_ciphers = "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-RSA-AES128-SHA";
-        SSL_CTX_set_cipher_list(g_ssl_ctx, chrome_ciphers);
-        SSL_CTX_set_options(g_ssl_ctx, SSL_OP_NO_COMPRESSION | SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION);
-        SSL_CTX_set_session_cache_mode(g_ssl_ctx, SSL_SESS_CACHE_CLIENT);
-        log_msg("[Security] Chrome Cipher Suites Enabled");
-    } else {
-        log_msg("[Security] Standard OpenSSL Cipher Suites");
-    }
-
-    HRSRC hRes = FindResourceW(NULL, MAKEINTRESOURCEW(2), RT_RCDATA);
-    if (hRes) {
-        HGLOBAL hData = LoadResource(NULL, hRes);
-        void* pData = LockResource(hData);
-        DWORD dataSize = SizeofResource(NULL, hRes);
-        if (pData && dataSize > 0) {
-            BIO *cbio = BIO_new_mem_buf(pData, dataSize);
-            if (cbio) {
-                X509_STORE *cts = SSL_CTX_get_cert_store(g_ssl_ctx);
-                X509 *x = NULL;
-                int count = 0;
-                while ((x = PEM_read_bio_X509(cbio, NULL, 0, NULL)) != NULL) {
-                    if (X509_STORE_add_cert(cts, x)) count++;
-                    X509_free(x);
+                    if (payload_size > 0) {
+                        if (send_all(c, payload_ptr, payload_size) < 0) {
+                            // send_all 内部已处理日志（忽略 10053/10054），此处直接退出
+                            goto cl_end;
+                        }
+                    }
                 }
-                BIO_free(cbio);
-                if (count > 0) {
-                    SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_PEER, NULL);
-                    log_msg("[Security] Embedded CA loaded (%d certs). Strict mode.", count);
-                } else {
-                    SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, NULL);
-                    log_msg("[Warning] Embedded CA data invalid. Insecure mode.");
+                
+                // 移动缓冲区剩余数据
+                if (frame_total < ws_buf_len) {
+                    memmove(ws_read_buf, ws_read_buf + frame_total, ws_buf_len - frame_total);
                 }
-            } else {
-                SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, NULL);
-                log_msg("[Warning] Failed to create BIO for CA. Insecure mode.");
+                ws_buf_len -= (int)frame_total;
+            } else { 
+                if (ws_buf_len >= BUFFER_SIZE) {
+                    log_msg("[Err] Buffer Full (%d bytes) but no complete frame. Flush.", ws_buf_len);
+                    goto cl_end; 
+                }
+                break; // 数据不全，等待更多数据
             }
-        } else {
-            SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, NULL);
-            log_msg("[Warning] Empty CA resource. Insecure mode.");
-        }
-    } else {
-        SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, NULL);
-        log_msg("[Warning] cacert.pem resource not found in exe. Insecure mode.");
-    }
-}
-
-int tls_init_connect(TLSContext *ctx) {
-    if (!g_ssl_ctx) init_openssl_global();
-    ctx->ssl = SSL_new(g_ssl_ctx);
-    if (!ctx->ssl) return -1;
-    SSL_set_fd(ctx->ssl, (int)ctx->sock);
-    
-    if (g_enablePadding) {
-        int range = g_padSizeMax - g_padSizeMin;
-        if (range < 0) range = 0;
-        int blockSize = g_padSizeMin + (range > 0 ? (rand() % (range + 1)) : 0);
-        if (blockSize > 200) blockSize = 200; 
-        if (blockSize > 0) SSL_set_block_padding(ctx->ssl, blockSize);
-    }
-
-    BIO *bio = BIO_new_socket(ctx->sock, BIO_NOCLOSE);
-    if (g_enableFragment) {
-        BIO *frag = BIO_new(BIO_f_fragment());
-        bio = BIO_push(frag, bio);
-    }
-    SSL_set_bio(ctx->ssl, bio, bio);
-    
-    const char *sni_name = (strlen(g_proxyConfig.sni) ? g_proxyConfig.sni : g_proxyConfig.host);
-    SSL_set_tlsext_host_name(ctx->ssl, sni_name);
-    
-    if (g_enableALPN) {
-        unsigned char alpn_protos[] = { 8, 'h', 't', 't', 'p', '/', '1', '.', '1' };
-        SSL_set_alpn_protos(ctx->ssl, alpn_protos, sizeof(alpn_protos));
-    }
-
-    return (SSL_connect(ctx->ssl) == 1) ? 0 : -1;
-}
-
-int tls_write(TLSContext *ctx, const char *data, int len) {
-    if (!ctx || !ctx->ssl) return -1;
-    int written = 0;
-    while (written < len) {
-        int ret = SSL_write(ctx->ssl, data + written, len - written);
-        if (ret > 0) { written += ret; } 
-        else {
-            int err = SSL_get_error(ctx->ssl, ret);
-            if (err == SSL_ERROR_WANT_WRITE || err == SSL_ERROR_WANT_READ) { Sleep(1); continue; }
-            log_msg("[Error] SSL_write failed. Error: %d", err);
-            return -1; 
         }
     }
-    return written;
+
+cl_end:
+    if (c_buf) free(c_buf); 
+    if (ws_read_buf) free(ws_read_buf); 
+    if (ws_send_buf) free(ws_send_buf); 
+    tls_close(&tls);
+    if (r != INVALID_SOCKET) closesocket(r); 
+    if (c != INVALID_SOCKET) closesocket(c);
+    return 0;
 }
 
-int tls_read(TLSContext *ctx, char *out, int max) {
-    if (!ctx || !ctx->ssl) return -1;
-    int ret = SSL_read(ctx->ssl, out, max);
-    if (ret <= 0) {
-        int err = SSL_get_error(ctx->ssl, ret);
-        if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) return 0;
-        if (err == SSL_ERROR_ZERO_RETURN) return -1;
-        return -1;
+// 监听线程与管理函数 (保持不变)
+DWORD WINAPI server_thread(LPVOID p) {
+    g_listen_sock = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET; addr.sin_port = htons(g_localPort);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    int opt = 1; setsockopt(g_listen_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
+    if (bind(g_listen_sock, (struct sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
+        log_msg("Port %d bind fail", g_localPort); g_proxyRunning = FALSE; return 0;
     }
-    return ret;
+    listen(g_listen_sock, 100);
+    log_msg("Proxy Started: 127.0.0.1:%d", g_localPort);
+    while(g_proxyRunning) {
+        SOCKET c = accept(g_listen_sock, NULL, NULL);
+        if (c != INVALID_SOCKET) {
+            HANDLE hClient = CreateThread(NULL, 0, client_handler, (LPVOID)(UINT_PTR)c, 0, NULL);
+            if (hClient) CloseHandle(hClient); else closesocket(c);
+        } else break;
+    }
+    return 0;
 }
 
-int tls_read_exact(TLSContext *ctx, char *buf, int len) {
-    int total = 0;
-    while (total < len) {
-        int ret = tls_read(ctx, buf + total, len - total);
-        if (ret < 0) return 0; 
-        if (ret == 0) { Sleep(1); continue; } 
-        total += ret;
-    }
-    return 1;
+void StartProxyCore() {
+    if (g_proxyRunning) return;
+    g_proxyRunning = TRUE;
+    hProxyThread = CreateThread(NULL, 0, server_thread, NULL, 0, NULL);
+    if (!hProxyThread) { log_msg("CreateThread Failed"); g_proxyRunning = FALSE; }
 }
 
-void tls_close(TLSContext *ctx) {
-    if (ctx->ssl) { SSL_shutdown(ctx->ssl); SSL_free(ctx->ssl); ctx->ssl = NULL; }
-}
-
-// [更新] 使用 rand() 代替 RAND_bytes，避免环境问题
-int build_ws_frame(const char *in, int len, char *out) {
-    int idx = 0;
-    out[idx++] = (char)0x82; 
-
-    // 使用标准 rand() 生成掩码，简单且稳定
-    unsigned char mask[4];
-    for(int i=0; i<4; i++) mask[i] = (unsigned char)(rand() & 0xFF);
-
-    if (len < 126) {
-        out[idx++] = (char)(0x80 | len);
-    } else if (len <= 65535) {
-        out[idx++] = (char)(0x80 | 126);
-        out[idx++] = (len >> 8) & 0xFF;
-        out[idx++] = len & 0xFF;
-    } else {
-        out[idx++] = (char)(0x80 | 127);
-        out[idx++] = 0; out[idx++] = 0; out[idx++] = 0; out[idx++] = 0;
-        out[idx++] = (len >> 24) & 0xFF;
-        out[idx++] = (len >> 16) & 0xFF;
-        out[idx++] = (len >> 8) & 0xFF;
-        out[idx++] = len & 0xFF;
-    }
-
-    memcpy(out + idx, mask, 4);
-    idx += 4;
-
-    for (int i = 0; i < len; i++) {
-        out[idx + i] = in[i] ^ mask[i % 4];
-    }
-    
-    return idx + len;
-}
-
-// [更新] 正确解析 64 位长度 WebSocket 帧
-long long check_ws_frame(unsigned char *in, int len, int *head_len, int *payload_len) {
-    if(len < 2) return 0;
-    
-    int hl = 2; 
-    unsigned long long pl = in[1] & 0x7F;
-
-    if (pl == 126) { 
-        if (len < 4) return 0; 
-        hl = 4; 
-        pl = ((unsigned long long)in[2] << 8) | in[3]; 
-    } 
-    else if (pl == 127) { 
-        if (len < 10) return 0; 
-        hl = 10; 
-        // 解析 64 位长度 (Big Endian)
-        pl = 0;
-        for(int i = 0; i < 8; i++) {
-            pl = (pl << 8) | in[2 + i];
-        }
-    }
-    
-    if (in[1] & 0x80) hl += 4; // Mask key present
-
-    // [安全检查] 检查包大小是否超过缓冲区限制 (BUFFER_SIZE from common.h)
-    if (pl > BUFFER_SIZE) {
-        log_msg("[Err] WS Frame too large: %llu (Max: %d). Dropping connection.", pl, BUFFER_SIZE);
-        return -1; 
-    }
-
-    // 检查是否有足够的数据
-    if ((unsigned long long)len < (unsigned long long)hl + pl) return 0;
-    
-    *head_len = hl; 
-    *payload_len = (int)pl; 
-    
-    return (long long)(hl + pl); 
-}
-
-int ws_read_payload_exact(TLSContext *tls, char *out_buf, int expected_len) {
-    char raw_head[16];
-    if (!tls_read_exact(tls, raw_head, 2)) return 0;
-    int payload_len = raw_head[1] & 0x7F;
-    if (payload_len == 126) {
-        if (!tls_read_exact(tls, raw_head + 2, 2)) return 0;
-        payload_len = (unsigned char)raw_head[2] << 8 | (unsigned char)raw_head[3];
-    }
-    if (payload_len < expected_len) return 0;
-    if (!tls_read_exact(tls, out_buf, payload_len)) return 0;
-    return payload_len;
+void StopProxyCore() {
+    g_proxyRunning = FALSE;
+    if (g_listen_sock != INVALID_SOCKET) { closesocket(g_listen_sock); g_listen_sock = INVALID_SOCKET; }
+    if (hProxyThread) { WaitForSingleObject(hProxyThread, 2000); CloseHandle(hProxyThread); hProxyThread = NULL; }
+    log_msg("Proxy Stopped");
 }
