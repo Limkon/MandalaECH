@@ -28,7 +28,6 @@ static HWND hSubWnd = NULL;
 #define WM_UPDATE_FINISH (WM_USER + 200)
 
 // --- 辅助函数：字体设置回调 ---
-// [修复] 标准的 EnumChildWindows 回调函数定义
 BOOL CALLBACK EnumSetFont(HWND hWnd, LPARAM lParam) {
     SendMessageW(hWnd, WM_SETFONT, (WPARAM)lParam, TRUE);
     return TRUE;
@@ -294,7 +293,6 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             SendMessage(hCombo, CB_SETCURSEL, g_uaPlatformIndex, 0);
             SetDlgItemTextA(hWnd, ID_EDIT_UA_STR, g_userAgentStr);
             
-            // [修复] 正确的 EnumChildWindows 调用
             EnumChildWindows(hWnd, EnumSetFont, (LPARAM)hAppFont);
             SendMessage(hWnd, WM_SETFONT, (WPARAM)hAppFont, TRUE);
             break;
@@ -715,7 +713,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nSho
 
     WSADATA wsa; WSAStartup(MAKEWORD(2,2), &wsa);
     
-    // [新增] 必须在主线程最开始初始化 OpenSSL 全局表
+    // 必须在主线程最开始初始化 OpenSSL 全局表
     init_openssl_global(); 
 
     INITCOMMONCONTROLSEX ic = {sizeof(INITCOMMONCONTROLSEX), ICC_HOTKEY_CLASS}; InitCommonControlsEx(&ic);
@@ -743,11 +741,18 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nSho
     if (g_hideTrayStart == 1) { g_isIconVisible = FALSE; } else { Shell_NotifyIconW(NIM_ADD, &nid); g_isIconVisible = TRUE; }
     
     ParseTags();
-    if (nodeCount > 0) SwitchNode(nodeTags[0]);
+
+    // [修复] 启动时优先使用上次保存的节点
+    if (wcslen(currentNode) > 0) {
+        SwitchNode(currentNode);
+    }
+    else if (nodeCount > 0) {
+        SwitchNode(nodeTags[0]);
+    }
     
     MSG msg; while(GetMessage(&msg, NULL, 0, 0)) { TranslateMessage(&msg); DispatchMessage(&msg); }
     
-    // [新增] 程序退出前清理
+    // 程序退出前清理
     FreeGlobalSSLContext();
     
     return 0;
