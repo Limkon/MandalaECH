@@ -2,11 +2,10 @@
 #include "utils.h"
 #include <openssl/rand.h>
 #include <openssl/err.h>
-#include <openssl/md5.h>
-#include <openssl/aes.h>
+#include <openssl/evp.h>
 
 // ---------------------- BIO Fragmentation Implementation ----------------------
-// (保留原有 BIO 代码，此处省略未修改部分，确保编译时完整包含原有的 BIO 实现)
+// (保持原有 BIO 代码不变)
 typedef struct {
     int first_packet_sent;
 } FragCtx;
@@ -132,6 +131,7 @@ void FreeGlobalSSLContext() {
 
 void init_openssl_global() {
     if (g_ssl_ctx) return;
+    // OpenSSL 3.0+ 不需要显式调用 SSL_library_init，但调用也无害
     SSL_library_init(); 
     OpenSSL_add_all_algorithms(); 
     SSL_load_error_strings();
@@ -145,7 +145,6 @@ void init_openssl_global() {
     SSL_CTX_set_min_proto_version(g_ssl_ctx, TLS1_2_VERSION);
     SSL_CTX_set_max_proto_version(g_ssl_ctx, TLS1_3_VERSION);
 
-    // ... (保留 Chrome Ciphers 和 CA 加载逻辑) ...
     if (g_enableChromeCiphers) {
         const char *chrome_ciphers = "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-RSA-AES128-SHA";
         if (SSL_CTX_set_cipher_list(g_ssl_ctx, chrome_ciphers) != 1) {
@@ -158,6 +157,7 @@ void init_openssl_global() {
         log_msg("[Security] Standard OpenSSL Cipher Suites");
     }
 
+    // CA 载入逻辑保持不变...
     HRSRC hRes = FindResourceW(NULL, MAKEINTRESOURCEW(2), RT_RCDATA);
     if (hRes) {
         HGLOBAL hData = LoadResource(NULL, hRes);
@@ -366,30 +366,46 @@ int ws_read_payload_exact(TLSContext *tls, char *out_buf, int expected_len) {
     return payload_len;
 }
 
-// --- VMess Crypto Implementation ---
+// --- VMess Crypto Implementation (EVP) ---
 
-void vmess_md5(const unsigned char *d, size_t n, unsigned char *md) {
-    MD5(d, n, md);
+void crypto_md5(const unsigned char *d, size_t n, unsigned char *md) {
+    unsigned int md_len;
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    if (ctx) {
+        EVP_DigestInit_ex(ctx, EVP_md5(), NULL);
+        EVP_DigestUpdate(ctx, d, n);
+        EVP_DigestFinal_ex(ctx, md, &md_len);
+        EVP_MD_CTX_free(ctx);
+    }
+}
+
+// SHA224 for Trojan
+void crypto_sha224(const char *data, size_t len, unsigned char *md) {
+    unsigned int md_len;
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    if (ctx) {
+        EVP_DigestInit_ex(ctx, EVP_sha224(), NULL);
+        EVP_DigestUpdate(ctx, data, len);
+        EVP_DigestFinal_ex(ctx, md, &md_len);
+        EVP_MD_CTX_free(ctx);
+    }
 }
 
 void vmess_get_auth(const unsigned char *uuid, long long ts, unsigned char *out_auth) {
-    // Auth = MD5(UUID + Timestamp(8 bytes big endian))
     unsigned char buf[24];
     memcpy(buf, uuid, 16);
     for(int i=0; i<8; i++) buf[16+i] = (ts >> ((7-i)*8)) & 0xFF;
-    MD5(buf, 24, out_auth);
+    crypto_md5(buf, 24, out_auth);
 }
 
 void vmess_kdf_header(const unsigned char *uuid, unsigned char *out_key, unsigned char *out_iv) {
-    // Cmd Key = MD5(UUID + "c48619fe-8f02-49e0-b9e9-edf763e17e21")
     unsigned char k_buf[16 + 36];
     memcpy(k_buf, uuid, 16);
     memcpy(k_buf + 16, "c48619fe-8f02-49e0-b9e9-edf763e17e21", 36);
-    MD5(k_buf, 52, out_key);
+    crypto_md5(k_buf, 52, out_key);
 }
 
 void vmess_kdf_iv(long long ts, unsigned char *out_iv) {
-    // Cmd IV = MD5(TS + TS + TS + TS)
     unsigned char t_buf[32];
     unsigned char ts_bytes[8];
     for(int i=0; i<8; i++) ts_bytes[i] = (ts >> ((7-i)*8)) & 0xFF;
@@ -397,7 +413,7 @@ void vmess_kdf_iv(long long ts, unsigned char *out_iv) {
     memcpy(t_buf+8, ts_bytes, 8);
     memcpy(t_buf+16, ts_bytes, 8);
     memcpy(t_buf+24, ts_bytes, 8);
-    MD5(t_buf, 32, out_iv);
+    crypto_md5(t_buf, 32, out_iv);
 }
 
 unsigned int fnv1a_hash(const unsigned char *data, int len) {
@@ -410,20 +426,34 @@ unsigned int fnv1a_hash(const unsigned char *data, int len) {
     return hash;
 }
 
-void aes_cfb128_init(AesCfbCtx *ctx, const unsigned char *key, const unsigned char *iv) {
-    memcpy(ctx->key, key, 16);
-    memcpy(ctx->iv, iv, 16);
-    ctx->num = 0;
+// AES-128-CFB Implementation using EVP
+void aes_cfb128_init(AesCfbCtx *ctx, const unsigned char *key, const unsigned char *iv, int is_encrypt) {
+    ctx->ctx = EVP_CIPHER_CTX_new();
+    ctx->is_valid = (ctx->ctx != NULL);
+    if (ctx->is_valid) {
+        // CFB128 is 128-bit feedback, enc=1 for encrypt, enc=0 for decrypt
+        // Note: For CFB, encryption and decryption use the same logic if we use low-level,
+        // but high-level EVP API handles direction cleanly.
+        EVP_CipherInit_ex(ctx->ctx, EVP_aes_128_cfb(), NULL, key, iv, is_encrypt);
+    }
 }
 
 void aes_cfb128_encrypt(AesCfbCtx *ctx, const unsigned char *in, unsigned char *out, size_t len) {
-    AES_KEY aes_key;
-    AES_set_encrypt_key(ctx->key, 128, &aes_key);
-    AES_cfb128_encrypt(in, out, len, &aes_key, ctx->iv, &ctx->num, AES_ENCRYPT);
+    if (!ctx->is_valid) return;
+    int outl;
+    EVP_CipherUpdate(ctx->ctx, out, &outl, in, (int)len);
 }
 
 void aes_cfb128_decrypt(AesCfbCtx *ctx, const unsigned char *in, unsigned char *out, size_t len) {
-    AES_KEY aes_key;
-    AES_set_encrypt_key(ctx->key, 128, &aes_key);
-    AES_cfb128_encrypt(in, out, len, &aes_key, ctx->iv, &ctx->num, AES_DECRYPT);
+    if (!ctx->is_valid) return;
+    int outl;
+    EVP_CipherUpdate(ctx->ctx, out, &outl, in, (int)len);
+}
+
+void aes_cfb128_cleanup(AesCfbCtx *ctx) {
+    if (ctx->is_valid && ctx->ctx) {
+        EVP_CIPHER_CTX_free(ctx->ctx);
+        ctx->ctx = NULL;
+        ctx->is_valid = 0;
+    }
 }
