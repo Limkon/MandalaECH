@@ -40,8 +40,8 @@
 #define REG_PATH_PROXY L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings"
 #define CONFIG_FILE L"config.json"
 
-// [修复] 增大缓冲区到 1MB，解决 YouTube 等大流量视频播放失败的问题
-#define BUFFER_SIZE 1048576 
+// [重要修改] 将缓冲区增大到 8MB 以支持 YouTube 高清视频流
+#define BUFFER_SIZE 8388608 
 
 // Windows Messages
 #define WM_TRAY (WM_USER + 1)
@@ -152,7 +152,7 @@ extern char g_userAgentStr[512];
 extern const wchar_t* UA_PLATFORMS[];
 extern const char* UA_TEMPLATES[];
 
-// [新增] 日志开关
+// 日志开关
 extern BOOL g_enableLog;
 
 #endif // COMMON_H
