@@ -23,7 +23,6 @@ static cJSON* GetOrCreateObj(cJSON* parent, const char* name) {
     return item;
 }
 
-// ... (保留 ParseSSPlugin 函数，未修改) ...
 static void ParseSSPlugin(cJSON* outbound, const char* pluginParam) {
     if (!pluginParam || !outbound) return;
     char* pluginCopy = strdup(pluginParam);
@@ -65,8 +64,6 @@ static void ParseSSPlugin(cJSON* outbound, const char* pluginParam) {
     }
     free(pluginCopy);
 }
-
-// ... (保留 LoadSettings, SaveSettings, SetAutorun, IsAutorun, ParseTags, GetUniqueTagName, 略过未修改部分) ...
 
 void LoadSettings() {
     g_hotkeyModifiers = GetPrivateProfileIntW(L"Settings", L"Modifiers", MOD_CONTROL | MOD_ALT, g_iniFilePath);
@@ -198,12 +195,10 @@ char* GetUniqueTagName(cJSON* outbounds, const char* type, const char* base_name
     return final_tag;
 }
 
-// [关键修改] 解析 Transport.Type 到 g_proxyConfig.net
 void ParseNodeConfigToGlobal(cJSON *node) {
     if (!node) return;
     memset(&g_proxyConfig, 0, sizeof(ProxyConfig));
     strcpy(g_proxyConfig.path, "/"); 
-    // 默认 net 为 tcp，除非配置中指定
     strcpy(g_proxyConfig.net, "tcp");
 
     cJSON *server = cJSON_GetObjectItem(node, "server");
@@ -225,12 +220,18 @@ void ParseNodeConfigToGlobal(cJSON *node) {
     
     cJSON *trans = cJSON_GetObjectItem(node, "transport");
     if(trans) {
-        // [New] 读取 transport.type
         cJSON *ttype = cJSON_GetObjectItem(trans, "type");
         if(ttype && ttype->valuestring) strncpy(g_proxyConfig.net, ttype->valuestring, 31);
         
         cJSON *path = cJSON_GetObjectItem(trans, "path");
         if(path && path->valuestring) strcpy(g_proxyConfig.path, path->valuestring);
+
+        // [New] 解析 Host Header
+        cJSON *headers = cJSON_GetObjectItem(trans, "headers");
+        if (headers) {
+             cJSON *hHost = cJSON_GetObjectItem(headers, "Host");
+             if (hHost && hHost->valuestring) strcpy(g_proxyConfig.host_header, hHost->valuestring);
+        }
     }
     
     if (strlen(g_proxyConfig.sni) == 0) strcpy(g_proxyConfig.sni, g_proxyConfig.host);
@@ -245,8 +246,6 @@ void ParseNodeConfigToGlobal(cJSON *node) {
     log_msg("Node Config Loaded: %s:%d (Type: %s, Net: %s)", 
         g_proxyConfig.host, g_proxyConfig.port, g_proxyConfig.type, g_proxyConfig.net);
 }
-
-// ... (保留 SwitchNode, DeleteNode, AddNodeToConfig, Internal_BatchAddNodesFromText 等, 略过未修改部分) ...
 
 void SwitchNode(const wchar_t* tag) {
     wcsncpy(currentNode, tag, 63);
@@ -388,7 +387,6 @@ void ToggleTrayIcon() {
     SaveSettings();
 }
 
-// ... (保留 ParseSocks, ParseShadowsocks, ParseVmess, ParseVlessOrTrojan, 略过未修改部分) ...
 cJSON* ParseSocks(const char* link) {
     if (strncmp(link, "socks://", 8) != 0) return NULL;
     const char* p = link + 8; const char* at = strchr(p, '@'); if (!at) return NULL; 
