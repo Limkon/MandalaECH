@@ -13,13 +13,27 @@
 #endif
 
 extern int g_localPort; 
+extern BOOL g_enableLog; // [新增] 引用全局日志开关
 
-// --- 日志函数 (保持不变) ---
+// --- 日志函数 ---
 void log_msg(const char *format, ...) {
-    char buf[2048]; char time_buf[64]; SYSTEMTIME st; GetLocalTime(&st);
+    // [新增] 如果未开启日志，直接跳过
+    if (!g_enableLog) return;
+
+    char buf[2048]; 
+    char time_buf[64]; 
+    SYSTEMTIME st; 
+    GetLocalTime(&st);
     sprintf(time_buf, "[%02d:%02d:%02d] ", st.wHour, st.wMinute, st.wSecond);
-    va_list args; va_start(args, format); vsnprintf(buf, sizeof(buf)-64, format, args); va_end(args);
-    char final_msg[2200]; snprintf(final_msg, sizeof(final_msg), "%s%s\r\n", time_buf, buf);
+    
+    va_list args; 
+    va_start(args, format); 
+    vsnprintf(buf, sizeof(buf)-64, format, args); 
+    va_end(args);
+    
+    char final_msg[2200]; 
+    snprintf(final_msg, sizeof(final_msg), "%s%s\r\n", time_buf, buf);
+    
     OutputDebugStringA(final_msg);
     if (hLogViewerWnd && IsWindow(hLogViewerWnd)) {
         int wLen = MultiByteToWideChar(CP_UTF8, 0, final_msg, -1, NULL, 0);
@@ -37,7 +51,7 @@ void log_wsa_error(const char* context) {
     log_msg("[Error] %s Failed. Code: %d", context, err);
 }
 
-// --- 文件操作 (保持不变) ---
+// --- 文件操作 ---
 BOOL ReadFileToBuffer(const wchar_t* filename, char** buffer, long* fileSize) {
     FILE* f = NULL;
     if (_wfopen_s(&f, filename, L"rb") != 0 || !f) { *fileSize=0; return FALSE; }
@@ -57,7 +71,7 @@ BOOL WriteBufferToFile(const wchar_t* filename, const char* buffer) {
     fclose(f); return TRUE;
 }
 
-// --- 字符串处理 (保持不变) ---
+// --- 字符串处理 ---
 void TrimString(char* str) {
     if(!str) return;
     char* p = str; while(isspace((unsigned char)*p)) p++;
@@ -77,7 +91,7 @@ void UrlDecode(char* dst, const char* src) {
     *dst = '\0';
 }
 
-// --- [修复] GetQueryParam: 移除递归，改用循环，防止栈溢出 ---
+// [修复] 循环版 GetQueryParam，防止递归溢出
 char* GetQueryParam(const char* query, const char* key) {
     if (!query || !key) return NULL;
     char keyEq[128]; 
@@ -86,10 +100,8 @@ char* GetQueryParam(const char* query, const char* key) {
 
     const char* p = query;
     while ((p = strstr(p, keyEq)) != NULL) {
-        // 检查前缀字符，确保匹配的是完整的 key
-        // 匹配必须在字符串开头，或者前一个字符是 '&' 或 '?'
+        // 确保匹配的是完整的 key (前缀是开头或&或?)
         if (p == query || *(p - 1) == '&' || *(p - 1) == '?') {
-            // 找到匹配
             const char* start = p + keyEqLen;
             const char* end = strchr(start, '&');
             size_t len = end ? (size_t)(end - start) : strlen(start);
@@ -106,13 +118,12 @@ char* GetQueryParam(const char* query, const char* key) {
             free(value);
             return decoded;
         }
-        // 如果不是完整的 key (例如 searching "id", found "uid="), 继续查找下一个
         p += 1; 
     }
     return NULL;
 }
 
-// --- Base64 (保持不变) ---
+// --- Base64 ---
 static int GetBase64Val(char c) {
     if (c >= 'A' && c <= 'Z') return c - 'A';
     if (c >= 'a' && c <= 'z') return c - 'a' + 26;
@@ -188,7 +199,6 @@ typedef struct {
     int port;
 } URL_COMPONENTS_SIMPLE;
 
-// --- [修复] ParseUrl: 增加长度检查，防止缓冲区溢出 ---
 static BOOL ParseUrl(const char* url, URL_COMPONENTS_SIMPLE* out) {
     if (!url || !out) return FALSE;
     memset(out, 0, sizeof(URL_COMPONENTS_SIMPLE));
@@ -214,10 +224,7 @@ static BOOL ParseUrl(const char* url, URL_COMPONENTS_SIMPLE* out) {
 
     // Path
     if (slash) {
-        if (strlen(slash) >= sizeof(out->path)) {
-            // Path too long
-            return FALSE; 
-        }
+        if (strlen(slash) >= sizeof(out->path)) return FALSE; 
         strcpy(out->path, slash);
     } else {
         strcpy(out->path, "/");
@@ -225,13 +232,11 @@ static BOOL ParseUrl(const char* url, URL_COMPONENTS_SIMPLE* out) {
     return TRUE;
 }
 
-// --- InternalHttpsGet (保持不变) ---
+// --- OpenSSL 实现的 HTTPS GET ---
 static char* InternalHttpsGet(const char* url, BOOL useProxy) {
     URL_COMPONENTS_SIMPLE u;
-    // 使用修复后的 ParseUrl
     if (!ParseUrl(url, &u)) { log_msg("[Utils] Invalid URL or too long: %s", url); return NULL; }
 
-    // 初始化 OpenSSL (如果尚未初始化)
     static int ssl_inited = 0;
     if (!ssl_inited) {
         SSL_library_init();
@@ -258,7 +263,6 @@ static char* InternalHttpsGet(const char* url, BOOL useProxy) {
     s = socket(AF_INET, SOCK_STREAM, 0);
     if (s == INVALID_SOCKET) return NULL;
 
-    // 设置超时
     DWORD timeout = 10000; 
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
     setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (char*)&timeout, sizeof(timeout));
@@ -297,7 +301,7 @@ static char* InternalHttpsGet(const char* url, BOOL useProxy) {
         }
     }
 
-    // 3. SSL 握手 (彻底解决 12157)
+    // 3. SSL 握手
     ctx = SSL_CTX_new(TLS_client_method());
     if (!ctx) { closesocket(s); return NULL; }
     
@@ -327,7 +331,7 @@ static char* InternalHttpsGet(const char* url, BOOL useProxy) {
     if (SSL_write(ssl, request, (int)strlen(request)) <= 0) goto cleanup;
 
     // 5. 读取响应
-    int buffer_size = 65536; // 初始 64KB
+    int buffer_size = 65536; 
     int total_read = 0;
     char* resp_buf = (char*)malloc(buffer_size);
     if(!resp_buf) goto cleanup;
@@ -376,7 +380,7 @@ cleanup:
     return result;
 }
 
-// --- Utils_HttpGet (保持不变) ---
+// --- Utils_HttpGet ---
 char* Utils_HttpGet(const char* url) {
     if (!url) return NULL;
     
@@ -391,7 +395,7 @@ char* Utils_HttpGet(const char* url) {
     return InternalHttpsGet(url, FALSE);
 }
 
-// --- Windows 代理设置 (保持不变) ---
+// --- Windows 代理设置 (保留) ---
 BOOL IsWindows8OrGreater() {
     HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
     if (hKernel32 == NULL) return FALSE;
