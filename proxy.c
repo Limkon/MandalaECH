@@ -48,6 +48,7 @@ int send_all(SOCKET s, const char *buf, int len) {
         if (n == -1) {
             int err = WSAGetLastError();
             if (err == WSAEWOULDBLOCK) { Sleep(1); continue; }
+            log_msg("[Err] send_all fail: %d", err); // [新增] 错误日志
             return -1;
         }
         total += n; bytesleft -= n;
@@ -228,7 +229,10 @@ DWORD WINAPI client_handler(LPVOID p) {
         FD_ZERO(&fds); FD_SET(c, &fds); FD_SET(r, &fds);
         int pending = SSL_pending(tls.ssl);
         tv.tv_sec = 1; tv.tv_usec = 0;
-        if (pending > 0 || ws_buf_len > 0) { tv.tv_sec = 0; tv.tv_usec = 0; }
+        
+        // [修复] 只有在 OpenSSL 有缓冲数据时才跳过 select 等待
+        // 如果 ws_buf_len > 0 但不足一帧，我们需要等待网络数据，所以不能设为 0
+        if (pending > 0) { tv.tv_sec = 0; tv.tv_usec = 0; }
         
         int n = select(0, &fds, NULL, NULL, &tv);
         if (n < 0) break;
@@ -237,16 +241,31 @@ DWORD WINAPI client_handler(LPVOID p) {
         if (FD_ISSET(c, &fds)) {
             len = recv(c, c_buf, BUFFER_SIZE, 0);
             if (len > 0) {
+                // [启用调试日志] 查看浏览器发送的数据
+                log_hex_simple("[Tx] Browser -> Server", (unsigned char*)c_buf, len);
+                
                 flen = build_ws_frame(c_buf, len, ws_send_buf);
-                if (tls_write(&tls, ws_send_buf, flen) < 0) break;
-            } else if (WSAGetLastError() != WSAEWOULDBLOCK) break;
+                if (tls_write(&tls, ws_send_buf, flen) < 0) {
+                    log_msg("[Err] TLS Write Failed");
+                    break;
+                }
+            } else if (len == 0) {
+                // log_msg("[Info] Browser closed connection");
+                break;
+            } else if (WSAGetLastError() != WSAEWOULDBLOCK) {
+                log_msg("[Err] Recv Error: %d", WSAGetLastError());
+                break;
+            }
         }
         
         // [Proxy -> Browser]
         if (FD_ISSET(r, &fds) || pending > 0) {
+            // 只有当缓冲区未满时才读取
             if (ws_buf_len < BUFFER_SIZE) {
                 len = tls_read(&tls, ws_read_buf + ws_buf_len, BUFFER_SIZE - ws_buf_len);
-                if (len > 0) ws_buf_len += len;
+                if (len > 0) {
+                    ws_buf_len += len;
+                }
                 else if (len == -1) break; 
             }
         }
@@ -255,7 +274,10 @@ DWORD WINAPI client_handler(LPVOID p) {
         while (ws_buf_len > 0) {
             frame_total = check_ws_frame((unsigned char*)ws_read_buf, ws_buf_len, &hl, &pl);
             
-            if (frame_total < 0) goto cl_end; // 解析错误或包过大
+            if (frame_total < 0) {
+                log_msg("[Err] WS Frame check failed (Size mismatch or corrupted)");
+                goto cl_end; 
+            }
 
             if (frame_total > 0) {
                 int opcode = ws_read_buf[0] & 0x0F;
@@ -272,19 +294,24 @@ DWORD WINAPI client_handler(LPVOID p) {
                             int addon_len = (unsigned char)payload_ptr[1];
                             int head_size = 2 + addon_len;
                             if (payload_size >= head_size) {
-                                log_msg("[Rx] VLESS Header Stripped. Payload: %d bytes", payload_size - head_size);
+                                log_msg("[Rx] VLESS Header Stripped. Payload: %d bytes (Head: %d)", payload_size - head_size, head_size);
                                 payload_ptr += head_size;
                                 payload_size -= head_size;
                                 vless_response_header_stripped = 1;
                             } else {
-                                // 极其罕见情况：包太小
+                                // 极其罕见情况：包太小，可能是分片了
+                                // 这里先丢弃本次处理，等待下一帧（虽然 VLESS 头几乎不会跨帧）
                                 payload_size = 0; 
                             }
                         } else { payload_size = 0; }
                     }
 
                     if (payload_size > 0) {
-                        if (send_all(c, payload_ptr, payload_size) < 0) goto cl_end;
+                        // log_hex_simple("[Rx] Server -> Browser", (unsigned char*)payload_ptr, payload_size);
+                        if (send_all(c, payload_ptr, payload_size) < 0) {
+                            log_msg("[Err] Send to Browser failed");
+                            goto cl_end;
+                        }
                     }
                 }
                 
