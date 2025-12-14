@@ -48,7 +48,6 @@ int send_all(SOCKET s, const char *buf, int len) {
         if (n == -1) {
             int err = WSAGetLastError();
             if (err == WSAEWOULDBLOCK) { Sleep(1); continue; }
-            // [优化] 忽略连接被对方重置或中止的错误，这在代理中很常见
             if (err != WSAECONNRESET && err != WSAECONNABORTED) {
                 log_msg("[Err] send_all fail: %d", err); 
             }
@@ -71,7 +70,7 @@ void log_hex_simple(const char* tag, unsigned char* data, int len) {
 
 // --- 客户端处理线程 (核心逻辑) ---
 DWORD WINAPI client_handler(LPVOID p) {
-    // 变量声明前置，兼容性更好
+    // 变量声明
     SOCKET c = (SOCKET)(UINT_PTR)p; 
     TLSContext tls; 
     SOCKET r = INVALID_SOCKET;      
@@ -114,25 +113,33 @@ DWORD WINAPI client_handler(LPVOID p) {
     long long frame_total;
     int vless_response_header_stripped = 0;
     int err_code = 0;
-    int retry_count = 0; // 重试计数器
+    int retry_count = 0; 
+    DWORD start_tick;
 
     // 初始化
     memset(&tls, 0, sizeof(tls));
     
-    // 注意：BUFFER_SIZE 已经在 common.h 中增大到 8MB，这里会分配较大内存
     c_buf = (char*)malloc(BUFFER_SIZE); 
     ws_read_buf = (char*)malloc(BUFFER_SIZE); 
     ws_send_buf = (char*)malloc(BUFFER_SIZE + 4096); 
 
-    if (!c_buf || !ws_read_buf || !ws_send_buf) { goto cl_end; }
+    if (!c_buf || !ws_read_buf || !ws_send_buf) { 
+        log_msg("[Fatal] Malloc failed for client handler buffers");
+        goto cl_end; 
+    }
     
     setsockopt(c, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
     
-    // 1. 读取浏览器首包 (分析目标地址)
+    // 1. 读取浏览器首包
     browser_len = recv_timeout(c, c_buf, BUFFER_SIZE, 10);
-    if (browser_len <= 0) goto cl_end; 
+    if (browser_len <= 0) {
+        // 浏览器连接可能是空探测，不一定是错误，仅在 Verbose 模式下记录
+        // log_msg("[Debug] Browser recv failed or empty. Len: %d", browser_len);
+        goto cl_end; 
+    }
     c_buf[browser_len] = 0;
     
+    // 协议分析
     if (c_buf[0] == 0x05) { send(c, "\x05\x00", 2, 0); goto cl_end; } 
     else {
         if (sscanf(c_buf, "%15s %255s", method, host) == 2) {
@@ -151,16 +158,24 @@ DWORD WINAPI client_handler(LPVOID p) {
         } else { goto cl_end; }
     }
     
-    log_msg("[Access] %s %s:%d (%s)", method, host, port, g_proxyConfig.type);
+    log_msg("[Debug] Req: %s %s:%d (ProxyType: %s)", method, host, port, g_proxyConfig.type);
 
-    // 2. DNS 解析与连接代理服务器
+    // 2. DNS 解析
+    start_tick = GetTickCount();
     h = gethostbyname(g_proxyConfig.host);
-    if(!h) { log_msg("[Err] DNS Fail: %s", g_proxyConfig.host); goto cl_end; }
+    if(!h) { 
+        log_msg("[Err] DNS Fail: %s (Time: %dms)", g_proxyConfig.host, GetTickCount() - start_tick); 
+        goto cl_end; 
+    }
+    // log_msg("[Debug] DNS OK. Time: %dms", GetTickCount() - start_tick);
 
-    // [关键修改] 代理服务器连接重试循环 (最多重试 3 次，解决 GitHub 握手不稳问题)
+    // 3. 连接重试循环
     for (retry_count = 0; retry_count < 3; retry_count++) {
         r = socket(AF_INET, SOCK_STREAM, 0);
-        if (r == INVALID_SOCKET) goto cl_end;
+        if (r == INVALID_SOCKET) {
+             log_msg("[Err] socket() failed: %d", WSAGetLastError());
+             goto cl_end;
+        }
         
         setsockopt(r, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
         int timeout_ms = 5000;
@@ -170,23 +185,28 @@ DWORD WINAPI client_handler(LPVOID p) {
         memset(&a, 0, sizeof(a)); a.sin_family = AF_INET; a.sin_port = htons((unsigned short)g_proxyConfig.port);
         a.sin_addr = *(struct in_addr*)h->h_addr;
         
+        start_tick = GetTickCount();
+        log_msg("[Debug] Connecting to %s:%d (Attempt %d)...", g_proxyConfig.host, g_proxyConfig.port, retry_count + 1);
+        
         if (connect(r, (struct sockaddr*)&a, sizeof(a)) == 0) {
+            // TCP OK
             tls.sock = r;
             if (tls_init_connect(&tls) == 0) {
-                break; // 连接成功
+                // TLS OK
+                break; 
             } else {
-                log_msg("[Warn] TLS Handshake Fail. Retrying %d...", retry_count + 1);
+                log_msg("[Debug] TLS Handshake Failed (Time: %dms). Retrying...", GetTickCount() - start_tick);
                 tls_close(&tls);
             }
         } else {
-            log_msg("[Warn] TCP Connect Fail. Retrying %d...", retry_count + 1);
+            log_msg("[Debug] TCP Connect Failed: %d (Time: %dms). Retrying...", WSAGetLastError(), GetTickCount() - start_tick);
         }
         closesocket(r); r = INVALID_SOCKET;
         Sleep(200);
     }
 
     if (r == INVALID_SOCKET || tls.ssl == NULL) {
-        log_msg("[Err] Connection failed after 3 retries.");
+        log_msg("[Err] Connection failed after 3 retries. Giving up.");
         goto cl_end;
     }
     
@@ -208,7 +228,16 @@ DWORD WINAPI client_handler(LPVOID p) {
 
     // 读取 WS 响应
     len = tls_read(&tls, ws_read_buf, BUFFER_SIZE-1);
-    if (len <= 0 || !strstr(ws_read_buf, "101")) { log_msg("[Err] WS Handshake Fail (Not 101)"); goto cl_end; }
+    if (len <= 0) {
+        log_msg("[Err] WS Handshake Read Failed or Empty. Len: %d", len);
+        goto cl_end;
+    }
+    ws_read_buf[len] = 0; // null terminate for string check
+    if (!strstr(ws_read_buf, "101")) { 
+        log_msg("[Err] WS Handshake Fail. Server replied: %.50s...", ws_read_buf); // 打印前50字符
+        goto cl_end; 
+    }
+    // log_msg("[Debug] WS Handshake OK");
     
     // 5. 发送代理协议请求头
     is_vless = (_stricmp(g_proxyConfig.type, "vless") == 0);
@@ -263,7 +292,7 @@ DWORD WINAPI client_handler(LPVOID p) {
         flen = build_ws_frame((char*)proto_buf, proto_len, ws_send_buf);
         tls_write(&tls, ws_send_buf, flen);
     } else {
-        // [Socks5 Request]
+        // Socks5
         char resp_buf[512]; 
         char auth[] = {0x05, 0x01, 0x00}; 
         if (strlen(g_proxyConfig.user) > 0) auth[2] = 0x02; 
@@ -306,17 +335,19 @@ DWORD WINAPI client_handler(LPVOID p) {
     // 6. 响应浏览器
     if (is_connect_method) {
         const char *ok = "HTTP/1.1 200 Connection Established\r\n\r\n";
-        // 如果发送 200 OK 时浏览器已断开，直接退出
-        if (send(c, ok, strlen(ok), 0) == SOCKET_ERROR) { goto cl_end; }
+        if (send(c, ok, strlen(ok), 0) == SOCKET_ERROR) { 
+            // log_msg("[Debug] Browser closed connection early (10053)");
+            goto cl_end; 
+        }
         
         if (browser_len > header_len) {
             int extra_len = browser_len - header_len;
-            log_hex_simple("[Tx] Early Data", (unsigned char*)(c_buf + header_len), extra_len);
+            // log_hex_simple("[Tx] Early Data", (unsigned char*)(c_buf + header_len), extra_len);
             flen = build_ws_frame(c_buf + header_len, extra_len, ws_send_buf);
             tls_write(&tls, ws_send_buf, flen);
         }
     } else {
-        log_hex_simple("[Tx] Direct Data", (unsigned char*)c_buf, browser_len);
+        // log_hex_simple("[Tx] Direct Data", (unsigned char*)c_buf, browser_len);
         flen = build_ws_frame(c_buf, browser_len, ws_send_buf);
         tls_write(&tls, ws_send_buf, flen);
     }
@@ -324,6 +355,7 @@ DWORD WINAPI client_handler(LPVOID p) {
     // 7. 双向数据转发循环
     ioctlsocket(c, FIONBIO, &mode); ioctlsocket(r, FIONBIO, &mode);
     ws_buf_len = 0;
+    // log_msg("[Debug] Tunnel established. Transferring data...");
 
     while(1) {
         FD_ZERO(&fds); FD_SET(c, &fds); FD_SET(r, &fds);
@@ -367,7 +399,6 @@ DWORD WINAPI client_handler(LPVOID p) {
                 if ((opcode == 0x1 || opcode == 0x2) && pl > 0) {
                     char* payload_ptr = ws_read_buf + hl;
                     int payload_size = pl;
-                    // VLESS 头剥离
                     if (is_vless && !vless_response_header_stripped) {
                         if (payload_size >= 2) {
                             int addon_len = (unsigned char)payload_ptr[1];
