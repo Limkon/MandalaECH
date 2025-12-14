@@ -23,6 +23,7 @@ static cJSON* GetOrCreateObj(cJSON* parent, const char* name) {
     return item;
 }
 
+// --- SS Plugin 解析辅助函数 (处理分号分隔的参数) ---
 static void ParseSSPlugin(cJSON* outbound, const char* pluginParam) {
     if (!pluginParam || !outbound) return;
     char* pluginCopy = strdup(pluginParam);
@@ -65,6 +66,8 @@ static void ParseSSPlugin(cJSON* outbound, const char* pluginParam) {
     free(pluginCopy);
 }
 
+// --- 配置文件基础操作 ---
+
 void LoadSettings() {
     g_hotkeyModifiers = GetPrivateProfileIntW(L"Settings", L"Modifiers", MOD_CONTROL | MOD_ALT, g_iniFilePath);
     g_hotkeyVk = GetPrivateProfileIntW(L"Settings", L"VK", 'H', g_iniFilePath);
@@ -89,6 +92,7 @@ void LoadSettings() {
     if (wcslen(wUABuf) > 5) WideCharToMultiByte(CP_UTF8, 0, wUABuf, -1, g_userAgentStr, sizeof(g_userAgentStr), NULL, NULL);
     else strcpy(g_userAgentStr, UA_TEMPLATES[0]);
 
+    // [新增] 读取上次选择的节点
     GetPrivateProfileStringW(L"Settings", L"LastNode", L"", currentNode, 64, g_iniFilePath);
 
     g_subCount = GetPrivateProfileIntW(L"Subscriptions", L"Count", 0, g_iniFilePath);
@@ -120,6 +124,8 @@ void SaveSettings() {
     wsprintfW(buffer, L"%d", g_uaPlatformIndex); WritePrivateProfileStringW(L"Settings", L"UAPlatform", buffer, g_iniFilePath);
     wchar_t wUABuf[512] = {0}; MultiByteToWideChar(CP_UTF8, 0, g_userAgentStr, -1, wUABuf, 512);
     WritePrivateProfileStringW(L"Settings", L"UserAgent", wUABuf, g_iniFilePath);
+
+    // [新增] 保存当前选择的节点
     WritePrivateProfileStringW(L"Settings", L"LastNode", currentNode, g_iniFilePath);
 
     WritePrivateProfileStringW(L"Subscriptions", NULL, NULL, g_iniFilePath);
@@ -199,8 +205,6 @@ void ParseNodeConfigToGlobal(cJSON *node) {
     if (!node) return;
     memset(&g_proxyConfig, 0, sizeof(ProxyConfig));
     strcpy(g_proxyConfig.path, "/"); 
-    strcpy(g_proxyConfig.net, "tcp");
-
     cJSON *server = cJSON_GetObjectItem(node, "server");
     cJSON *port = cJSON_GetObjectItem(node, "server_port");
     cJSON *uuid = cJSON_GetObjectItem(node, "uuid");
@@ -211,31 +215,19 @@ void ParseNodeConfigToGlobal(cJSON *node) {
     cJSON *user = cJSON_GetObjectItem(node, "username"); cJSON *pass = cJSON_GetObjectItem(node, "password");
     if(user && user->valuestring) strcpy(g_proxyConfig.user, user->valuestring);
     if(pass && pass->valuestring) strcpy(g_proxyConfig.pass, pass->valuestring);
-    
     cJSON *tls = cJSON_GetObjectItem(node, "tls");
     if (tls) {
         cJSON *sni = cJSON_GetObjectItem(tls, "server_name");
         if (sni && sni->valuestring) strcpy(g_proxyConfig.sni, sni->valuestring);
     }
-    
     cJSON *trans = cJSON_GetObjectItem(node, "transport");
     if(trans) {
-        cJSON *ttype = cJSON_GetObjectItem(trans, "type");
-        if(ttype && ttype->valuestring) strncpy(g_proxyConfig.net, ttype->valuestring, 31);
-        
         cJSON *path = cJSON_GetObjectItem(trans, "path");
         if(path && path->valuestring) strcpy(g_proxyConfig.path, path->valuestring);
-
-        // [New] 解析 Host Header
-        cJSON *headers = cJSON_GetObjectItem(trans, "headers");
-        if (headers) {
-             cJSON *hHost = cJSON_GetObjectItem(headers, "Host");
-             if (hHost && hHost->valuestring) strcpy(g_proxyConfig.host_header, hHost->valuestring);
-        }
     }
-    
     if (strlen(g_proxyConfig.sni) == 0) strcpy(g_proxyConfig.sni, g_proxyConfig.host);
 
+    // 解析并保存协议类型
     cJSON *type = cJSON_GetObjectItem(node, "type");
     if (type && type->valuestring) {
         strncpy(g_proxyConfig.type, type->valuestring, 31);
@@ -243,8 +235,8 @@ void ParseNodeConfigToGlobal(cJSON *node) {
         strcpy(g_proxyConfig.type, "socks");
     }
 
-    log_msg("Node Config Loaded: %s:%d (Type: %s, Net: %s)", 
-        g_proxyConfig.host, g_proxyConfig.port, g_proxyConfig.type, g_proxyConfig.net);
+    log_msg("Node Config Loaded: %s:%d (Type: %s, SNI: %s)", 
+        g_proxyConfig.host, g_proxyConfig.port, g_proxyConfig.type, g_proxyConfig.sni);
 }
 
 void SwitchNode(const wchar_t* tag) {
@@ -263,6 +255,7 @@ void SwitchNode(const wchar_t* tag) {
     }
     if (targetNode) {
         StopProxyCore(); ParseNodeConfigToGlobal(targetNode); StartProxyCore();
+        // 保存设置
         SaveSettings(); 
         
         wchar_t tip[128]; wsprintfW(tip, L"已切换: %s", tag);
@@ -387,6 +380,7 @@ void ToggleTrayIcon() {
     SaveSettings();
 }
 
+// --- 协议解析函数 ---
 cJSON* ParseSocks(const char* link) {
     if (strncmp(link, "socks://", 8) != 0) return NULL;
     const char* p = link + 8; const char* at = strchr(p, '@'); if (!at) return NULL; 

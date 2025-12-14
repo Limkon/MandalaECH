@@ -32,7 +32,6 @@
 #include <openssl/bio.h>
 #include <openssl/x509.h>
 #include <openssl/pem.h>
-#include <openssl/evp.h> // [Fix] 引入 EVP
 
 // cJSON Header
 #include "cJSON.h"
@@ -41,7 +40,7 @@
 #define REG_PATH_PROXY L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings"
 #define CONFIG_FILE L"config.json"
 
-// [关键修改] 增大缓冲区到 8MB
+// [关键修改] 增大缓冲区到 8MB，解决 YouTube 视频播放中断问题
 #define BUFFER_SIZE 8388608 
 
 // Windows Messages
@@ -109,8 +108,6 @@ typedef struct {
     char user[128]; 
     char pass[128];
     char type[32]; 
-    char net[32];        // 传输协议 (ws, tcp)
-    char host_header[256]; // [New] WS Host Header
 } ProxyConfig;
 
 // --- 全局变量声明 (extern) ---
