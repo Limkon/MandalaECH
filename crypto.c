@@ -5,7 +5,6 @@
 #include <openssl/evp.h>
 
 // ---------------------- BIO Fragmentation Implementation ----------------------
-// (BIO 代码保持不变，请确保编译时包含)
 typedef struct {
     int first_packet_sent;
 } FragCtx;
@@ -234,9 +233,10 @@ int tls_init_connect(TLSContext *ctx) {
         int err = SSL_get_error(ctx->ssl, ret);
         unsigned long e = ERR_get_error();
         log_msg("[Debug] SSL_connect Fail. Ret: %d, SSL Err: %d, Sys Err: %lu", ret, err, e);
+        // [New] Print OpenSSL Error Stack
         char err_buf[256];
         ERR_error_string_n(e, err_buf, sizeof(err_buf));
-        log_msg("[Debug] OpenSSL Error String: %s", err_buf);
+        log_msg("[Debug] OpenSSL Error: %s", err_buf);
         return -1;
     }
 }
@@ -263,7 +263,17 @@ int tls_read(TLSContext *ctx, char *out, int max) {
     if (ret <= 0) {
         int err = SSL_get_error(ctx->ssl, ret);
         if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) return 0;
-        if (err == SSL_ERROR_ZERO_RETURN) return -1; 
+        if (err == SSL_ERROR_ZERO_RETURN) return -1; // Connection closed gracefully
+        
+        // [New] Log Syscall/SSL Errors
+        if (err == SSL_ERROR_SYSCALL || err == SSL_ERROR_SSL) {
+             unsigned long e = ERR_get_error();
+             if (e != 0) {
+                 char err_buf[256];
+                 ERR_error_string_n(e, err_buf, sizeof(err_buf));
+                 log_msg("[Error] SSL_read Error: %s", err_buf);
+             }
+        }
         return -1;
     }
     return ret;
