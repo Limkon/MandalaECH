@@ -5,7 +5,7 @@
 #include <openssl/evp.h>
 
 // ---------------------- BIO Fragmentation Implementation ----------------------
-// (保持原有 BIO 代码不变)
+// (BIO 代码保持不变)
 typedef struct {
     int first_packet_sent;
 } FragCtx;
@@ -131,7 +131,6 @@ void FreeGlobalSSLContext() {
 
 void init_openssl_global() {
     if (g_ssl_ctx) return;
-    // OpenSSL 3.0+ 不需要显式调用 SSL_library_init，但调用也无害
     SSL_library_init(); 
     OpenSSL_add_all_algorithms(); 
     SSL_load_error_strings();
@@ -157,7 +156,6 @@ void init_openssl_global() {
         log_msg("[Security] Standard OpenSSL Cipher Suites");
     }
 
-    // CA 载入逻辑保持不变...
     HRSRC hRes = FindResourceW(NULL, MAKEINTRESOURCEW(2), RT_RCDATA);
     if (hRes) {
         HGLOBAL hData = LoadResource(NULL, hRes);
@@ -431,9 +429,6 @@ void aes_cfb128_init(AesCfbCtx *ctx, const unsigned char *key, const unsigned ch
     ctx->ctx = EVP_CIPHER_CTX_new();
     ctx->is_valid = (ctx->ctx != NULL);
     if (ctx->is_valid) {
-        // CFB128 is 128-bit feedback, enc=1 for encrypt, enc=0 for decrypt
-        // Note: For CFB, encryption and decryption use the same logic if we use low-level,
-        // but high-level EVP API handles direction cleanly.
         EVP_CipherInit_ex(ctx->ctx, EVP_aes_128_cfb(), NULL, key, iv, is_encrypt);
     }
 }
