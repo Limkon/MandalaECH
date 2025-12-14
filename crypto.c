@@ -5,7 +5,7 @@
 #include <openssl/evp.h>
 
 // ---------------------- BIO Fragmentation Implementation ----------------------
-// (BIO 代码保持不变)
+// (BIO 代码保持不变，请确保编译时包含)
 typedef struct {
     int first_packet_sent;
 } FragCtx;
@@ -263,7 +263,7 @@ int tls_read(TLSContext *ctx, char *out, int max) {
     if (ret <= 0) {
         int err = SSL_get_error(ctx->ssl, ret);
         if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) return 0;
-        if (err == SSL_ERROR_ZERO_RETURN) return -1; // Connection closed
+        if (err == SSL_ERROR_ZERO_RETURN) return -1; 
         return -1;
     }
     return ret;
