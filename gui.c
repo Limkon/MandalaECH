@@ -48,7 +48,6 @@ DWORD WINAPI AutoUpdateThread(LPVOID lpParam) {
             if (hMgr && IsWindow(hMgr)) {
                 PostMessage(hMgr, WM_REFRESH_NODELIST, 0, 0);
             }
-            // 注意：不要在后台线程调用 SwitchNode，这会导致竞争条件崩溃
         }
     }
     return 0;
@@ -129,9 +128,11 @@ void LoadNodeToEdit(HWND hWnd, const wchar_t* tag) {
     cJSON_Delete(root);
 }
 
+// [修复] 保存节点时保留原始协议类型 (vless/trojan)，防止被误判为 vmess
 void SaveEditedNode(HWND hWnd) {
     wchar_t wTag[256], wAddr[256], wUser[256], wPass[256], wHost[256], wPath[256];
     char tag[256], addr[256], user[256], pass[256], host[256], path[256];
+    
     int port = GetDlgItemInt(hWnd, ID_EDIT_PORT, NULL, FALSE);
     GetDlgItemTextW(hWnd, ID_EDIT_TAG, wTag, 256);
     GetDlgItemTextW(hWnd, ID_EDIT_ADDR, wAddr, 256);
@@ -139,27 +140,69 @@ void SaveEditedNode(HWND hWnd) {
     GetDlgItemTextW(hWnd, ID_EDIT_PASS, wPass, 256);
     GetDlgItemTextW(hWnd, ID_EDIT_HOST, wHost, 256);
     GetDlgItemTextW(hWnd, ID_EDIT_PATH, wPath, 256);
+    
     WideCharToMultiByte(CP_UTF8, 0, wTag, -1, tag, 256, NULL, NULL);
     WideCharToMultiByte(CP_UTF8, 0, wAddr, -1, addr, 256, NULL, NULL);
     WideCharToMultiByte(CP_UTF8, 0, wUser, -1, user, 256, NULL, NULL);
     WideCharToMultiByte(CP_UTF8, 0, wPass, -1, pass, 256, NULL, NULL);
     WideCharToMultiByte(CP_UTF8, 0, wHost, -1, host, 256, NULL, NULL);
     WideCharToMultiByte(CP_UTF8, 0, wPath, -1, path, 256, NULL, NULL);
+    
     int netIdx = SendMessage(GetDlgItem(hWnd, ID_EDIT_NET), CB_GETCURSEL, 0, 0);
     int tlsIdx = SendMessage(GetDlgItem(hWnd, ID_EDIT_TLS), CB_GETCURSEL, 0, 0);
+
+    // 1. 读取配置文件，查找原始节点的类型
+    char originalType[64] = {0};
+    char* buffer = NULL; long size = 0;
+    if (ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) {
+        cJSON* root = cJSON_Parse(buffer); 
+        free(buffer);
+        if (root) {
+            cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
+            char oldTagUtf8[256];
+            WideCharToMultiByte(CP_UTF8, 0, g_editingTag, -1, oldTagUtf8, 256, NULL, NULL);
+            cJSON* node = NULL;
+            cJSON_ArrayForEach(node, outbounds) {
+                cJSON* t = cJSON_GetObjectItem(node, "tag");
+                if (t && strcmp(t->valuestring, oldTagUtf8) == 0) {
+                    cJSON* type = cJSON_GetObjectItem(node, "type");
+                    if (type && type->valuestring) strncpy(originalType, type->valuestring, 63);
+                    break;
+                }
+            }
+            cJSON_Delete(root);
+        }
+    }
+
+    // 2. 构建新节点
     cJSON* newNode = cJSON_CreateObject();
     cJSON_AddStringToObject(newNode, "tag", tag);
     cJSON_AddStringToObject(newNode, "server", addr);
     cJSON_AddNumberToObject(newNode, "server_port", port);
-    BOOL isVmess = (strlen(user) > 20); 
-    if (isVmess) {
-        cJSON_AddStringToObject(newNode, "type", "vmess");
-        cJSON_AddStringToObject(newNode, "uuid", user);
+
+    // 3. 智能设置类型 (优先使用原始类型)
+    if (strlen(originalType) > 0) {
+        cJSON_AddStringToObject(newNode, "type", originalType);
+        // 根据类型决定字段名
+        if (strcmp(originalType, "vless") == 0 || strcmp(originalType, "vmess") == 0) {
+             cJSON_AddStringToObject(newNode, "uuid", user);
+        } else {
+             if (strlen(user)>0) cJSON_AddStringToObject(newNode, "username", user);
+             if (strlen(pass)>0) cJSON_AddStringToObject(newNode, "password", pass);
+        }
     } else {
-        cJSON_AddStringToObject(newNode, "type", "socks");
-        if (strlen(user)>0) cJSON_AddStringToObject(newNode, "username", user);
-        if (strlen(pass)>0) cJSON_AddStringToObject(newNode, "password", pass);
+        // 如果没有原始类型 (可能是新节点或读取失败)，则尝试推断
+        // 注意：这种推断在 VLESS/VMESS 之间容易混淆，但这是最后的手段
+        if (strlen(user) > 20) {
+            cJSON_AddStringToObject(newNode, "type", "vmess");
+            cJSON_AddStringToObject(newNode, "uuid", user);
+        } else {
+            cJSON_AddStringToObject(newNode, "type", "socks");
+            if (strlen(user)>0) cJSON_AddStringToObject(newNode, "username", user);
+            if (strlen(pass)>0) cJSON_AddStringToObject(newNode, "password", pass);
+        }
     }
+
     if (netIdx == 1) { 
         cJSON* trans = cJSON_CreateObject();
         cJSON_AddStringToObject(trans, "type", "ws");
@@ -171,13 +214,15 @@ void SaveEditedNode(HWND hWnd) {
         }
         cJSON_AddItemToObject(newNode, "transport", trans);
     } else { cJSON_AddStringToObject(newNode, "network", "tcp"); }
+
     if (tlsIdx == 1) {
         cJSON* tlsObj = cJSON_CreateObject();
         cJSON_AddBoolToObject(tlsObj, "enabled", cJSON_True);
         if (strlen(host) > 0) cJSON_AddStringToObject(tlsObj, "server_name", host);
         cJSON_AddItemToObject(newNode, "tls", tlsObj);
     }
-    char* buffer = NULL; long size = 0;
+
+    // 4. 写入文件
     if (ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) {
         cJSON* root = cJSON_Parse(buffer); free(buffer);
         if (root) {
@@ -424,7 +469,7 @@ LRESULT CALLBACK SubWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 for(int i=0; i<g_subCount; i++) g_subs[i].enabled = ListView_GetCheckState(hSubList, i);
                 SaveSettings(); MessageBoxW(hWnd, L"订阅设置已保存", L"成功", MB_OK);
             }
-            else if (id == ID_SUB_UPD_BTN) { // [修复] 异步更新
+            else if (id == ID_SUB_UPD_BTN) { 
                 for(int i=0; i<g_subCount; i++) g_subs[i].enabled = ListView_GetCheckState(hSubList, i);
                 SaveSettings(); 
                 SetWindowTextW(hWnd, L"正在更新 (后台进行中)...");
@@ -433,7 +478,7 @@ LRESULT CALLBACK SubWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             break;
         }
-        case WM_UPDATE_FINISH: { // [新增] 处理更新完成消息
+        case WM_UPDATE_FINISH: { 
             int count = (int)wParam;
             EnableWindow(GetDlgItem(hWnd, ID_SUB_UPD_BTN), TRUE);
             SetWindowTextW(hWnd, L"订阅设置");
