@@ -104,6 +104,7 @@ typedef struct {
     char sni[256]; 
     char user[128]; 
     char pass[128];
+    char type[32]; // [新增] 用于存储协议类型 (vless, trojan, vmess, socks)
 } ProxyConfig;
 
 // --- 全局变量声明 (extern) ---
