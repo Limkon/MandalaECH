@@ -157,7 +157,7 @@ DWORD WINAPI client_handler(LPVOID p) {
     h = gethostbyname(g_proxyConfig.host);
     if(!h) { log_msg("[Err] DNS Fail: %s", g_proxyConfig.host); goto cl_end; }
 
-    // [新增] 代理服务器连接重试循环 (最多重试 3 次，解决 GitHub 握手不稳问题)
+    // [关键修改] 代理服务器连接重试循环 (最多重试 3 次，解决 GitHub 握手不稳问题)
     for (retry_count = 0; retry_count < 3; retry_count++) {
         r = socket(AF_INET, SOCK_STREAM, 0);
         if (r == INVALID_SOCKET) goto cl_end;
@@ -263,8 +263,7 @@ DWORD WINAPI client_handler(LPVOID p) {
         flen = build_ws_frame((char*)proto_buf, proto_len, ws_send_buf);
         tls_write(&tls, ws_send_buf, flen);
     } else {
-        // Socks5 ... (代码省略，保持与前文一致即可)
-        // 为节省篇幅，此处省略 Socks5 详细代码，实际编译请保留完整逻辑
+        // [Socks5 Request]
         char resp_buf[512]; 
         char auth[] = {0x05, 0x01, 0x00}; 
         if (strlen(g_proxyConfig.user) > 0) auth[2] = 0x02; 
@@ -283,6 +282,8 @@ DWORD WINAPI client_handler(LPVOID p) {
             tls_write(&tls, ws_send_buf, flen);
             if (ws_read_payload_exact(&tls, resp_buf, 2) < 2) { log_msg("[Err] Socks5 Auth Read Fail"); goto cl_end; }
             if (resp_buf[1] != 0x00) { log_msg("[Err] Socks5 Auth Failed"); goto cl_end; }
+        } else if (resp_buf[1] != 0x00) {
+            log_msg("[Err] Socks5 Auth Method Rejected: %02X", resp_buf[1]); goto cl_end;
         }
         int slen = 0;
         unsigned char socks_req[512];
@@ -305,7 +306,9 @@ DWORD WINAPI client_handler(LPVOID p) {
     // 6. 响应浏览器
     if (is_connect_method) {
         const char *ok = "HTTP/1.1 200 Connection Established\r\n\r\n";
+        // 如果发送 200 OK 时浏览器已断开，直接退出
         if (send(c, ok, strlen(ok), 0) == SOCKET_ERROR) { goto cl_end; }
+        
         if (browser_len > header_len) {
             int extra_len = browser_len - header_len;
             log_hex_simple("[Tx] Early Data", (unsigned char*)(c_buf + header_len), extra_len);
@@ -364,6 +367,7 @@ DWORD WINAPI client_handler(LPVOID p) {
                 if ((opcode == 0x1 || opcode == 0x2) && pl > 0) {
                     char* payload_ptr = ws_read_buf + hl;
                     int payload_size = pl;
+                    // VLESS 头剥离
                     if (is_vless && !vless_response_header_stripped) {
                         if (payload_size >= 2) {
                             int addon_len = (unsigned char)payload_ptr[1];
