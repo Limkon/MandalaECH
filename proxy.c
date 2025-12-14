@@ -3,7 +3,7 @@
 #include "utils.h"
 #include <time.h> 
 
-// --- 辅助函数：解析 UUID (支持带横杠或不带) ---
+// --- 辅助函数：解析 UUID ---
 void parse_uuid(const char* uuid_str, unsigned char* out) {
     const char* p = uuid_str;
     int i = 0;
@@ -100,6 +100,7 @@ DWORD WINAPI client_handler(LPVOID p) {
     struct sockaddr_in a;
     const char* sni_val;
     const char* req_path;
+    const char* req_host;
     int offset;
     int len;
 
@@ -125,7 +126,7 @@ DWORD WINAPI client_handler(LPVOID p) {
     
     // VMess 状态
     int vmess_response_header_stripped = 0; 
-    AesCfbCtx vmess_enc_ctx = {0}; // 初始化为 0
+    AesCfbCtx vmess_enc_ctx = {0}; 
     AesCfbCtx vmess_dec_ctx = {0};
     
     int retry_count = 0;
@@ -229,7 +230,8 @@ DWORD WINAPI client_handler(LPVOID p) {
     if (is_ws_transport) {
         sni_val = (strlen(g_proxyConfig.sni) > 0) ? g_proxyConfig.sni : g_proxyConfig.host;
         req_path = (strlen(g_proxyConfig.path) > 0) ? g_proxyConfig.path : "/";
-        
+        req_host = (strlen(g_proxyConfig.host_header) > 0) ? g_proxyConfig.host_header : sni_val;
+
         unsigned char rnd_key[16];
         char ws_key_str[32];
         for(int i=0; i<16; i++) rnd_key[i] = rand() % 256;
@@ -243,7 +245,7 @@ DWORD WINAPI client_handler(LPVOID p) {
             "Connection: Upgrade\r\n"
             "Sec-WebSocket-Key: %s\r\n"
             "Sec-WebSocket-Version: 13\r\n\r\n", 
-            req_path, sni_val, g_userAgentStr, ws_key_str);
+            req_path, req_host, g_userAgentStr, ws_key_str);
 
         if (tls_write(&tls, ws_send_buf, offset) <= 0) {
             log_msg("[Err] WS Handshake Write Fail");
@@ -253,7 +255,8 @@ DWORD WINAPI client_handler(LPVOID p) {
         // 读取 WS 响应 (带重试)
         int handshake_retry = 0;
         int total_read = 0;
-        while(handshake_retry < 10) { 
+        // [关键修改] 增加到 50 次重试 (5秒)，防止握手超时
+        while(handshake_retry < 50) { 
             int n = tls_read(&tls, ws_read_buf + total_read, BUFFER_SIZE - 1 - total_read);
             if (n > 0) {
                 total_read += n;
@@ -373,7 +376,7 @@ DWORD WINAPI client_handler(LPVOID p) {
         aes_cfb128_init(&head_enc_ctx, head_key, head_iv, 1);
         aes_cfb128_encrypt(&head_enc_ctx, cmd_buf, proto_buf + proto_len, cmd_len);
         proto_len += cmd_len;
-        aes_cfb128_cleanup(&head_enc_ctx); // Cleanup temp ctx
+        aes_cfb128_cleanup(&head_enc_ctx); 
         
         if (is_ws_transport) {
             flen = build_ws_frame((char*)proto_buf, proto_len, ws_send_buf);
@@ -386,15 +389,12 @@ DWORD WINAPI client_handler(LPVOID p) {
         aes_cfb128_init(&vmess_enc_ctx, req_key, req_iv, 1);
         
         unsigned char resp_key[16], resp_iv[16];
-        crypto_md5(req_key, 16, resp_key); // Use generic crypto wrapper
+        crypto_md5(req_key, 16, resp_key); 
         crypto_md5(req_iv, 16, resp_iv);
         aes_cfb128_init(&vmess_dec_ctx, resp_key, resp_iv, 0);
 
     } else if (is_trojan) {
         char hex_pass[56 + 1]; 
-        // Use new wrapper
-        crypto_sha224(g_proxyConfig.pass, strlen(g_proxyConfig.pass), (unsigned char*)hex_pass);
-        // SHA224 output is binary (28 bytes), need hex string (56 bytes)
         unsigned char digest[28];
         crypto_sha224(g_proxyConfig.pass, strlen(g_proxyConfig.pass), digest);
         for(int i=0; i<28; i++) sprintf(hex_pass + (i*2), "%02x", digest[i]);
@@ -439,7 +439,6 @@ DWORD WINAPI client_handler(LPVOID p) {
             tls_write(&tls, (char*)proto_buf, proto_len);
         }
     } else {
-        // Socks5 (Default)
         char auth[] = {0x05, 0x01, 0x00}; 
         if (strlen(g_proxyConfig.user) > 0) auth[2] = 0x02; 
         
@@ -703,42 +702,4 @@ cl_end:
     if (r != INVALID_SOCKET) closesocket(r); 
     if (c != INVALID_SOCKET) closesocket(c);
     return 0;
-}
-
-// 监听线程与管理函数 (保持不变)
-DWORD WINAPI server_thread(LPVOID p) {
-    g_listen_sock = socket(AF_INET, SOCK_STREAM, 0);
-    struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET; addr.sin_port = htons(g_localPort);
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    int opt = 1; setsockopt(g_listen_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
-    if (bind(g_listen_sock, (struct sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
-        log_msg("Port %d bind fail", g_localPort); g_proxyRunning = FALSE; return 0;
-    }
-    listen(g_listen_sock, 100);
-    log_msg("Proxy Started: 127.0.0.1:%d", g_localPort);
-    while(g_proxyRunning) {
-        SOCKET c = accept(g_listen_sock, NULL, NULL);
-        if (c != INVALID_SOCKET) {
-            HANDLE hClient = CreateThread(NULL, 0, client_handler, (LPVOID)(UINT_PTR)c, 0, NULL);
-            if (hClient) CloseHandle(hClient); else closesocket(c);
-        } else break;
-    }
-    return 0;
-}
-
-void StartProxyCore() {
-    if (g_proxyRunning) return;
-    g_proxyRunning = TRUE;
-    // 全局随机种子
-    srand((unsigned int)time(NULL));
-    hProxyThread = CreateThread(NULL, 0, server_thread, NULL, 0, NULL);
-    if (!hProxyThread) { log_msg("CreateThread Failed"); g_proxyRunning = FALSE; }
-}
-
-void StopProxyCore() {
-    g_proxyRunning = FALSE;
-    if (g_listen_sock != INVALID_SOCKET) { closesocket(g_listen_sock); g_listen_sock = INVALID_SOCKET; }
-    if (hProxyThread) { WaitForSingleObject(hProxyThread, 2000); CloseHandle(hProxyThread); hProxyThread = NULL; }
-    log_msg("Proxy Stopped");
 }
