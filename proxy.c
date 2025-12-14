@@ -81,9 +81,8 @@ DWORD WINAPI client_handler(LPVOID p) {
         } else { goto cl_end; }
     }
     
-    // --- [调试] 打印当前读取到的协议类型 ---
-    // 这行日志会告诉你程序到底读到了什么
-    // log_msg("[Debug] Processing connection. Node Type: '%s'", g_proxyConfig.type);
+    // [日志开启] 打印连接请求，证明浏览器正在使用代理
+    log_msg("[Access] %s %s:%d (%s)", method, host, port, g_proxyConfig.type);
 
     // 连接远程代理服务器
     struct hostent *h = gethostbyname(g_proxyConfig.host);
@@ -125,7 +124,6 @@ DWORD WINAPI client_handler(LPVOID p) {
     unsigned char proto_buf[1024];
     int proto_len = 0;
     
-    // 强制修正：如果 config 说是 vmess 但看起来像 VLESS，或者明确是 vless
     BOOL is_vless = (_stricmp(g_proxyConfig.type, "vless") == 0);
     BOOL is_trojan = (_stricmp(g_proxyConfig.type, "trojan") == 0);
     BOOL is_vmess = (_stricmp(g_proxyConfig.type, "vmess") == 0);
@@ -164,15 +162,13 @@ DWORD WINAPI client_handler(LPVOID p) {
         tls_write(&tls, ws_send_buf, flen);
 
     } else if (is_vmess) {
-        // --- VMess 协议 ---
+        // --- VMess 协议 (不支持) ---
         log_msg("[Error] Config type is 'vmess', which is NOT supported.");
         log_msg("[Error] Please checking your config.json or delete/re-import the node.");
-        log_msg("[Error] If this IS a VLESS node, your link must start with 'vless://'");
         goto cl_end;
 
     } else {
         // --- 默认: Socks5 ---
-        // 兼容旧配置或 socks 类型
         char auth[] = {0x05, 0x01, 0x00};
         if (strlen(g_proxyConfig.user) > 0) auth[2] = 0x02;
         flen = build_ws_frame(auth, 3, ws_send_buf);
@@ -228,6 +224,7 @@ DWORD WINAPI client_handler(LPVOID p) {
         int n = select(0, &fds, NULL, NULL, &tv);
         if (n < 0) break;
         
+        // 浏览器 -> 代理
         if (FD_ISSET(c, &fds)) {
             len = recv(c, c_buf, BUFFER_SIZE, 0);
             if (len > 0) {
@@ -236,6 +233,7 @@ DWORD WINAPI client_handler(LPVOID p) {
             } else if (WSAGetLastError() != WSAEWOULDBLOCK) break;
         }
         
+        // 代理 -> 浏览器
         if (FD_ISSET(r, &fds) || pending > 0) {
             if (ws_buf_len < BUFFER_SIZE) {
                 len = tls_read(&tls, ws_read_buf + ws_buf_len, BUFFER_SIZE - ws_buf_len);
@@ -253,6 +251,7 @@ DWORD WINAPI client_handler(LPVOID p) {
                     char* payload_ptr = ws_read_buf + hl;
                     int payload_size = pl;
 
+                    // VLESS 响应头剥离逻辑
                     if (is_vless && !vless_response_header_stripped) {
                         if (payload_size >= 2) {
                             int addon_len = (unsigned char)payload_ptr[1];
@@ -283,8 +282,6 @@ cl_end:
     if (r != INVALID_SOCKET) closesocket(r); if (c != INVALID_SOCKET) closesocket(c);
     return 0;
 }
-
-// [请将此代码追加到 proxy.c 的末尾]
 
 // 代理监听主线程
 DWORD WINAPI server_thread(LPVOID p) {
@@ -327,11 +324,7 @@ void StartProxyCore() {
 
 void StopProxyCore() {
     g_proxyRunning = FALSE;
-    // 强制关闭 Socket 以打破 accept 阻塞
     if (g_listen_sock != INVALID_SOCKET) { closesocket(g_listen_sock); g_listen_sock = INVALID_SOCKET; }
-    
-    // 等待线程结束
     if (hProxyThread) { WaitForSingleObject(hProxyThread, 2000); CloseHandle(hProxyThread); hProxyThread = NULL; }
-    
     log_msg("Proxy Stopped");
 }
