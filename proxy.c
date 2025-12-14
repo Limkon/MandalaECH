@@ -48,8 +48,8 @@ int send_all(SOCKET s, const char *buf, int len) {
         if (n == -1) {
             int err = WSAGetLastError();
             if (err == WSAEWOULDBLOCK) { Sleep(1); continue; }
-            // 忽略常见的连接断开错误，减少日志干扰
-            if (err != WSAECONNABORTED && err != WSAECONNRESET) {
+            // [优化] 忽略连接被对方重置或中止的错误，这在代理中很常见
+            if (err != WSAECONNRESET && err != WSAECONNABORTED) {
                 log_msg("[Err] send_all fail: %d", err); 
             }
             return -1;
@@ -71,7 +71,7 @@ void log_hex_simple(const char* tag, unsigned char* data, int len) {
 
 // --- 客户端处理线程 (核心逻辑) ---
 DWORD WINAPI client_handler(LPVOID p) {
-    // 变量声明全部移至顶部，符合 C89 标准，避免部分编译器报错
+    // 变量声明前置，兼容性更好
     SOCKET c = (SOCKET)(UINT_PTR)p; 
     TLSContext tls; 
     SOCKET r = INVALID_SOCKET;      
@@ -124,11 +124,12 @@ DWORD WINAPI client_handler(LPVOID p) {
 
     if (!c_buf || !ws_read_buf || !ws_send_buf) { goto cl_end; }
     
+    // 设置浏览器连接为无延迟
     setsockopt(c, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
     
     // 1. 读取浏览器首包 (分析目标地址)
     browser_len = recv_timeout(c, c_buf, BUFFER_SIZE, 10);
-    if (browser_len <= 0) goto cl_end; // 0=Closed, -1=Error, -2=Timeout
+    if (browser_len <= 0) goto cl_end; 
     c_buf[browser_len] = 0;
     
     // 简单的协议判断
@@ -235,10 +236,7 @@ DWORD WINAPI client_handler(LPVOID p) {
         tls_write(&tls, ws_send_buf, flen);
 
     } else if (is_shadowsocks) {
-        // [Shadowsocks Request]
-        // 注意：这里实现的是 SS Over TLS (Plain/None method)，即隧道内不再二次加密
-        // 格式: [AddrType][Addr][Port]
-        
+        // [Shadowsocks Request] SS Over TLS
         if (inet_pton(AF_INET, host, &ip4) == 1) {
              proto_buf[proto_len++] = 0x01; memcpy(proto_buf + proto_len, &ip4, 4); proto_len += 4;
         } else if (inet_pton(AF_INET6, host, &ip6) == 1) {
@@ -248,7 +246,6 @@ DWORD WINAPI client_handler(LPVOID p) {
              memcpy(proto_buf + proto_len, host, strlen(host)); proto_len += strlen(host);
         }
         proto_buf[proto_len++] = (port >> 8) & 0xFF; proto_buf[proto_len++] = port & 0xFF;
-        
         flen = build_ws_frame((char*)proto_buf, proto_len, ws_send_buf);
         tls_write(&tls, ws_send_buf, flen);
 
@@ -257,8 +254,8 @@ DWORD WINAPI client_handler(LPVOID p) {
         char resp_buf[512]; 
         
         // 1. 发送支持的认证方法
-        char auth[] = {0x05, 0x01, 0x00}; // 默认支持 No Auth
-        if (strlen(g_proxyConfig.user) > 0) auth[2] = 0x02; // 如果有用户，支持 User/Pass
+        char auth[] = {0x05, 0x01, 0x00}; 
+        if (strlen(g_proxyConfig.user) > 0) auth[2] = 0x02; 
         
         flen = build_ws_frame(auth, 3, ws_send_buf);
         tls_write(&tls, ws_send_buf, flen);
@@ -267,19 +264,17 @@ DWORD WINAPI client_handler(LPVOID p) {
         if (ws_read_payload_exact(&tls, resp_buf, 2) < 2) { log_msg("[Err] Socks5 Handshake Read Fail"); goto cl_end; }
         
         if (resp_buf[1] == 0x02) {
-            // 服务端选择了 User/Pass 认证
             int ulen = strlen(g_proxyConfig.user);
             int plen = strlen(g_proxyConfig.pass);
             unsigned char auth_pkg[512];
             int ap_len = 0;
-            auth_pkg[ap_len++] = 0x01; // Ver
+            auth_pkg[ap_len++] = 0x01; 
             auth_pkg[ap_len++] = ulen; memcpy(auth_pkg+ap_len, g_proxyConfig.user, ulen); ap_len += ulen;
             auth_pkg[ap_len++] = plen; memcpy(auth_pkg+ap_len, g_proxyConfig.pass, plen); ap_len += plen;
             
             flen = build_ws_frame((char*)auth_pkg, ap_len, ws_send_buf);
             tls_write(&tls, ws_send_buf, flen);
             
-            // 读取认证结果
             if (ws_read_payload_exact(&tls, resp_buf, 2) < 2) { log_msg("[Err] Socks5 Auth Read Fail"); goto cl_end; }
             if (resp_buf[1] != 0x00) { log_msg("[Err] Socks5 Auth Failed"); goto cl_end; }
         } else if (resp_buf[1] != 0x00) {
@@ -312,9 +307,9 @@ DWORD WINAPI client_handler(LPVOID p) {
     // 6. 响应浏览器并处理 Pipeline 数据
     if (is_connect_method) {
         const char *ok = "HTTP/1.1 200 Connection Established\r\n\r\n";
-        // [修改] 检查 send 返回值，如果客户端已断开(10053)，则不再继续
+        // [关键修复] 如果发送 200 OK 时浏览器已断开，直接退出，防止进入死循环
         if (send(c, ok, strlen(ok), 0) == SOCKET_ERROR) {
-            // 可以在此记录 Verbose 日志，但通常无需记录
+            // log_msg("[Info] Browser closed connection early");
             goto cl_end;
         }
         
@@ -356,7 +351,7 @@ DWORD WINAPI client_handler(LPVOID p) {
                 break;
             } else if (WSAGetLastError() != WSAEWOULDBLOCK) {
                 err_code = WSAGetLastError();
-                // [修改] 过滤 10053 和 10054 错误，减少日志干扰
+                // [优化] 过滤 10053 和 10054 错误，减少日志干扰
                 if (err_code != WSAECONNABORTED && err_code != WSAECONNRESET) {
                     log_msg("[Err] Recv Error: %d", err_code);
                 }
@@ -404,6 +399,7 @@ DWORD WINAPI client_handler(LPVOID p) {
                                 payload_size -= head_size;
                                 vless_response_header_stripped = 1;
                             } else {
+                                // [优化] 数据不足以剥离头时，暂时当作空处理，等待下一包
                                 payload_size = 0; 
                             }
                         } else { payload_size = 0; }
@@ -411,7 +407,7 @@ DWORD WINAPI client_handler(LPVOID p) {
 
                     if (payload_size > 0) {
                         if (send_all(c, payload_ptr, payload_size) < 0) {
-                            // send_all 内部已处理日志，此处直接退出
+                            // send_all 内部已处理日志（忽略 10053/10054），此处直接退出
                             goto cl_end;
                         }
                     }
