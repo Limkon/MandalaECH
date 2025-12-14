@@ -45,17 +45,7 @@ int send_all(SOCKET s, const char *buf, int len) {
     return total;
 }
 
-// 调试日志
-void log_hex_simple(const char* tag, unsigned char* data, int len) {
-    if (len <= 0) return;
-    char buf[64] = {0};
-    int max = len > 6 ? 6 : len;
-    int p = 0;
-    for(int i=0; i<max; i++) p += sprintf(buf+p, "%02X ", data[i]);
-    log_msg("%s %d bytes: %s...", tag, len, buf);
-}
-
-// --- Base64 编码 (用于生成随机 WS Key) ---
+// --- Base64 编码 ---
 void base64_encode_key(const unsigned char* src, char* dst) {
     const char* table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     for(int i=0; i<16; i+=3) {
@@ -70,7 +60,7 @@ void base64_encode_key(const unsigned char* src, char* dst) {
     *dst = 0;
 }
 
-// --- 客户端处理线程 (核心逻辑) ---
+// --- 客户端处理线程 ---
 DWORD WINAPI client_handler(LPVOID p) {
     SOCKET c = (SOCKET)(UINT_PTR)p; 
     TLSContext tls; 
@@ -80,7 +70,6 @@ DWORD WINAPI client_handler(LPVOID p) {
     char *ws_read_buf = NULL; 
     char *ws_send_buf = NULL; 
     
-    // VMess 专用缓冲区
     unsigned char *vmess_chunk_buf = NULL; 
     unsigned char *vmess_recv_plain = NULL;
     int vmess_recv_rem_len = 0; 
@@ -123,15 +112,13 @@ DWORD WINAPI client_handler(LPVOID p) {
     int hl, pl;
     long long frame_total;
     int vless_response_header_stripped = 0;
-    
-    // VMess 状态
     int vmess_response_header_stripped = 0; 
+    
     AesCfbCtx vmess_enc_ctx = {0}; 
     AesCfbCtx vmess_dec_ctx = {0};
     
     int retry_count = 0;
     
-    // 初始化
     memset(&tls, 0, sizeof(tls));
     srand((unsigned int)time(NULL) ^ (unsigned int)GetCurrentThreadId());
 
@@ -147,48 +134,40 @@ DWORD WINAPI client_handler(LPVOID p) {
     }
     setsockopt(c, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
     
-    // 1. 读取浏览器首包
+    // 1. 读取浏览器请求
     browser_len = recv_timeout(c, c_buf, BUFFER_SIZE, 10);
     if (browser_len <= 0) goto cl_end; 
     c_buf[browser_len] = 0;
     
-    // 协议判断
     if (c_buf[0] == 0x05) { 
         send(c, "\x05\x00", 2, 0); 
         is_socks5 = 1;
         int n = recv_timeout(c, c_buf, BUFFER_SIZE, 10);
         if (n <= 0) goto cl_end;
         browser_len = n;
-        if (c_buf[1] == 0x01) { // CONNECT
+        if (c_buf[1] == 0x01) { 
              if (c_buf[3] == 0x01) {
                  struct in_addr* addr_ptr = (struct in_addr*)&c_buf[4];
                  port = ntohs(*(unsigned short*)&c_buf[8]);
                  inet_ntop(AF_INET, addr_ptr, host, sizeof(host));
-             } else if (c_buf[3] == 0x03) { // Domain
+             } else if (c_buf[3] == 0x03) { 
                  int dlen = c_buf[4];
                  memcpy(host, &c_buf[5], dlen);
                  host[dlen] = 0;
                  port = ntohs(*(unsigned short*)&c_buf[5+dlen]);
              }
              strcpy(method, "SOCKS5");
-        } else {
-             goto cl_end; 
-        }
+        } else { goto cl_end; }
     } 
     else {
         if (sscanf(c_buf, "%15s %255s", method, host) == 2) {
             char *p = strchr(host, ':');
             if (p) { *p = 0; port = atoi(p+1); }
             else if(stricmp(method, "CONNECT")==0) port = 443;
-            
             if (stricmp(method, "CONNECT") == 0) is_connect_method = 1;
-            
             header_end = strstr(c_buf, "\r\n\r\n");
-            if (header_end) {
-                header_len = (int)(header_end - c_buf) + 4;
-            } else {
-                header_len = browser_len;
-            }
+            if (header_end) header_len = (int)(header_end - c_buf) + 4;
+            else header_len = browser_len;
         } else { goto cl_end; }
     }
     
@@ -199,7 +178,6 @@ DWORD WINAPI client_handler(LPVOID p) {
     for (retry_count = 0; retry_count < 3; retry_count++) {
         r = socket(AF_INET, SOCK_STREAM, 0);
         if (r == INVALID_SOCKET) goto cl_end;
-        
         setsockopt(r, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
         int timeout_ms = 5000;
         setsockopt(r, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout_ms, sizeof(int));
@@ -219,25 +197,19 @@ DWORD WINAPI client_handler(LPVOID p) {
 
     if (r == INVALID_SOCKET || tls.ssl == NULL) goto cl_end;
     
-    // Determine Transport
-    if (_stricmp(g_proxyConfig.net, "ws") == 0 || _stricmp(g_proxyConfig.net, "websocket") == 0) {
-        is_ws_transport = TRUE;
-    } else {
-        is_ws_transport = FALSE;
-    }
+    if (_stricmp(g_proxyConfig.net, "ws") == 0 || _stricmp(g_proxyConfig.net, "websocket") == 0) is_ws_transport = TRUE;
 
-    // 3. WebSocket 握手 (仅当是 WS 模式时)
+    // 3. WebSocket 握手
     if (is_ws_transport) {
         sni_val = (strlen(g_proxyConfig.sni) > 0) ? g_proxyConfig.sni : g_proxyConfig.host;
         req_path = (strlen(g_proxyConfig.path) > 0) ? g_proxyConfig.path : "/";
         req_host = (strlen(g_proxyConfig.host_header) > 0) ? g_proxyConfig.host_header : sni_val;
 
-        unsigned char rnd_key[16];
-        char ws_key_str[32];
+        unsigned char rnd_key[16]; char ws_key_str[32];
         for(int i=0; i<16; i++) rnd_key[i] = rand() % 256;
         base64_encode_key(rnd_key, ws_key_str);
 
-        // [Fix] 增加 Origin 头部，这是关键修复点
+        // [Fix] Origin Header Added
         offset = snprintf(ws_send_buf, BUFFER_SIZE, 
             "GET %s HTTP/1.1\r\n"
             "Host: %s\r\n"
@@ -247,40 +219,38 @@ DWORD WINAPI client_handler(LPVOID p) {
             "Sec-WebSocket-Key: %s\r\n"
             "Sec-WebSocket-Version: 13\r\n"
             "Origin: https://%s\r\n\r\n", 
-            req_path, req_host, g_userAgentStr, ws_key_str, req_host); // 注意这里增加了 req_host 参数
+            req_path, req_host, g_userAgentStr, ws_key_str, req_host);
 
         log_msg("[Debug] Sending WS Request (Path='%s', Host='%s')", req_path, req_host);
-
         if (tls_write(&tls, ws_send_buf, offset) <= 0) {
-            log_msg("[Err] WS Handshake Write Fail");
-            goto cl_end;
+            log_msg("[Err] WS Handshake Write Fail"); goto cl_end;
         }
 
-        // 读取 WS 响应 (带重试)
-        int handshake_retry = 0;
-        int total_read = 0;
-        
+        int handshake_retry = 0; int total_read = 0;
         while(handshake_retry < 50) { 
             int n = tls_read(&tls, ws_read_buf + total_read, BUFFER_SIZE - 1 - total_read);
             if (n > 0) {
-                total_read += n;
-                ws_read_buf[total_read] = 0;
+                total_read += n; ws_read_buf[total_read] = 0;
                 if (strstr(ws_read_buf, "\r\n\r\n")) break; 
             } else if (n == 0) {
-                // [Fix] 如果 n==0，说明服务器已关闭连接(EOF)，没有必要重试，直接退出
-                log_msg("[Err] Server closed connection during handshake.");
+                log_msg("[Err] Handshake: Server closed connection (EOF).");
                 break; 
             } else {
-                // 真正需要重试的是 WouldBlock 状态（视 tls_read 实现而定），或者其他临时错误
-                // 如果 tls_read 封装了 SSL_read，返回负数通常是严重错误
-                Sleep(100); 
-                handshake_retry++;
-                continue; 
+                Sleep(100); handshake_retry++; continue; 
             }
         }
         
+        // [Debug] Print Server Response
+        if (total_read > 0) {
+            char debug_resp[128];
+            strncpy(debug_resp, ws_read_buf, 127); debug_resp[127] = 0;
+            // 移除换行符以便日志打印
+            for(int k=0; k<127 && debug_resp[k]; k++) if(debug_resp[k]=='\r' || debug_resp[k]=='\n') debug_resp[k]=' ';
+            log_msg("[Debug] WS Response: %s", debug_resp);
+        }
+
         if (total_read <= 0 || !strstr(ws_read_buf, "101")) { 
-            log_msg("[Err] WS Handshake Fail. Read: %d", total_read);
+            log_msg("[Err] WS Handshake Fail. Status not 101.");
             goto cl_end; 
         }
 
@@ -288,8 +258,7 @@ DWORD WINAPI client_handler(LPVOID p) {
         ws_buf_len = 0;
         if (body_start) {
             body_start += 4; 
-            int header_bytes = (int)(body_start - ws_read_buf);
-            int remaining = total_read - header_bytes;
+            int remaining = total_read - (int)(body_start - ws_read_buf);
             if (remaining > 0) {
                 memmove(ws_read_buf, body_start, remaining);
                 ws_buf_len = remaining;
@@ -297,17 +266,17 @@ DWORD WINAPI client_handler(LPVOID p) {
         }
     }
     
-    // 4. 发送代理协议头
+    // 4. 发送代理协议头 (VMess Legacy)
     is_vless = (_stricmp(g_proxyConfig.type, "vless") == 0);
     is_trojan = (_stricmp(g_proxyConfig.type, "trojan") == 0);
     is_shadowsocks = (_stricmp(g_proxyConfig.type, "shadowsocks") == 0);
     is_vmess = (_stricmp(g_proxyConfig.type, "vmess") == 0);
 
     if (is_vless) {
+        // ... VLESS Code ...
         proto_buf[proto_len++] = 0x00; 
         parse_uuid(g_proxyConfig.user, proto_buf + proto_len); proto_len += 16; 
-        proto_buf[proto_len++] = 0x00; 
-        proto_buf[proto_len++] = 0x01; 
+        proto_buf[proto_len++] = 0x00; proto_buf[proto_len++] = 0x01; 
         proto_buf[proto_len++] = (port >> 8) & 0xFF; proto_buf[proto_len++] = port & 0xFF;        
         if (inet_pton(AF_INET, host, &ip4) == 1) {
             proto_buf[proto_len++] = 0x01; memcpy(proto_buf + proto_len, &ip4, 4); proto_len += 4;
@@ -317,49 +286,32 @@ DWORD WINAPI client_handler(LPVOID p) {
             proto_buf[proto_len++] = 0x02; proto_buf[proto_len++] = (unsigned char)strlen(host);
             memcpy(proto_buf + proto_len, host, strlen(host)); proto_len += (int)strlen(host);
         }
-        
         if (is_ws_transport) {
             flen = build_ws_frame((char*)proto_buf, proto_len, ws_send_buf);
             tls_write(&tls, ws_send_buf, flen);
-        } else {
-            tls_write(&tls, (char*)proto_buf, proto_len);
-        }
+        } else { tls_write(&tls, (char*)proto_buf, proto_len); }
 
     } else if (is_vmess) {
-        unsigned char uuid[16];
-        parse_uuid(g_proxyConfig.user, uuid);
+        // VMess Legacy Header Construction
+        unsigned char uuid[16]; parse_uuid(g_proxyConfig.user, uuid);
         long long ts = (long long)time(NULL);
-        unsigned char req_iv[16];
-        unsigned char req_key[16];
-        for(int i=0; i<16; i++) req_iv[i] = rand() % 256;
-        for(int i=0; i<16; i++) req_key[i] = rand() % 256;
+        unsigned char req_iv[16], req_key[16];
+        for(int i=0; i<16; i++) { req_iv[i] = rand() % 256; req_key[i] = rand() % 256; }
         
         unsigned char head_key[16], head_iv[16];
-        vmess_kdf_header(uuid, head_key, head_iv); 
-        vmess_kdf_iv(ts, head_iv); 
+        vmess_kdf_header(uuid, head_key, head_iv); vmess_kdf_iv(ts, head_iv); 
 
-        unsigned char auth[16];
-        vmess_get_auth(uuid, ts, auth);
-        memcpy(proto_buf, auth, 16);
-        proto_len = 16;
+        unsigned char auth[16]; vmess_get_auth(uuid, ts, auth);
+        memcpy(proto_buf, auth, 16); proto_len = 16;
 
-        unsigned char cmd_buf[512];
-        int cmd_len = 0;
-        
+        unsigned char cmd_buf[512]; int cmd_len = 0;
         cmd_buf[cmd_len++] = 1; 
         memcpy(cmd_buf + cmd_len, req_iv, 16); cmd_len += 16;
         memcpy(cmd_buf + cmd_len, req_key, 16); cmd_len += 16;
-        cmd_buf[cmd_len++] = rand() % 256; 
-        cmd_buf[cmd_len++] = 0x01; 
-        
+        cmd_buf[cmd_len++] = rand() % 256; cmd_buf[cmd_len++] = 0x01; 
         int pad_len = rand() % 16;
-        cmd_buf[cmd_len++] = (pad_len << 4) | 0x00; 
-        cmd_buf[cmd_len++] = 0; 
-        cmd_buf[cmd_len++] = 1; 
-        
-        cmd_buf[cmd_len++] = (port >> 8) & 0xFF; 
-        cmd_buf[cmd_len++] = port & 0xFF;
-        
+        cmd_buf[cmd_len++] = (pad_len << 4) | 0x00; cmd_buf[cmd_len++] = 0; cmd_buf[cmd_len++] = 1; 
+        cmd_buf[cmd_len++] = (port >> 8) & 0xFF; cmd_buf[cmd_len++] = port & 0xFF;
         if (inet_pton(AF_INET, host, &ip4) == 1) {
             cmd_buf[cmd_len++] = 0x01; memcpy(cmd_buf + cmd_len, &ip4, 4); cmd_len += 4;
         } else if (inet_pton(AF_INET6, host, &ip6) == 1) {
@@ -368,18 +320,12 @@ DWORD WINAPI client_handler(LPVOID p) {
             cmd_buf[cmd_len++] = 0x02; cmd_buf[cmd_len++] = (unsigned char)strlen(host);
             memcpy(cmd_buf + cmd_len, host, strlen(host)); cmd_len += strlen(host);
         }
-        
-        if (pad_len > 0) {
-            for(int i=0; i<pad_len; i++) cmd_buf[cmd_len++] = rand() % 256;
-        }
+        if (pad_len > 0) for(int i=0; i<pad_len; i++) cmd_buf[cmd_len++] = rand() % 256;
         
         unsigned int f = fnv1a_hash(cmd_buf, cmd_len);
-        cmd_buf[cmd_len++] = (f >> 24) & 0xFF;
-        cmd_buf[cmd_len++] = (f >> 16) & 0xFF;
-        cmd_buf[cmd_len++] = (f >> 8) & 0xFF;
-        cmd_buf[cmd_len++] = f & 0xFF;
+        cmd_buf[cmd_len++] = (f >> 24) & 0xFF; cmd_buf[cmd_len++] = (f >> 16) & 0xFF;
+        cmd_buf[cmd_len++] = (f >> 8) & 0xFF; cmd_buf[cmd_len++] = f & 0xFF;
         
-        // Encrypt Command
         AesCfbCtx head_enc_ctx = {0};
         aes_cfb128_init(&head_enc_ctx, head_key, head_iv, 1);
         aes_cfb128_encrypt(&head_enc_ctx, cmd_buf, proto_buf + proto_len, cmd_len);
@@ -392,22 +338,17 @@ DWORD WINAPI client_handler(LPVOID p) {
         } else {
             if (tls_write(&tls, (char*)proto_buf, proto_len) <= 0) goto cl_end;
         }
-        
-        // Init Body Crypto
         aes_cfb128_init(&vmess_enc_ctx, req_key, req_iv, 1);
-        
         unsigned char resp_key[16], resp_iv[16];
-        crypto_md5(req_key, 16, resp_key); 
-        crypto_md5(req_iv, 16, resp_iv);
+        crypto_md5(req_key, 16, resp_key); crypto_md5(req_iv, 16, resp_iv);
         aes_cfb128_init(&vmess_dec_ctx, resp_key, resp_iv, 0);
 
     } else if (is_trojan) {
-        char hex_pass[56 + 1]; 
-        unsigned char digest[28];
+        // ... Trojan Code ...
+        char hex_pass[56 + 1]; unsigned char digest[28];
         crypto_sha224(g_proxyConfig.pass, strlen(g_proxyConfig.pass), digest);
         for(int i=0; i<28; i++) sprintf(hex_pass + (i*2), "%02x", digest[i]);
         hex_pass[56] = 0;
-
         memcpy(proto_buf, hex_pass, 56); proto_len = 56;
         proto_buf[proto_len++] = 0x0D; proto_buf[proto_len++] = 0x0A;
         proto_buf[proto_len++] = 0x01; 
@@ -421,15 +362,12 @@ DWORD WINAPI client_handler(LPVOID p) {
         }
         proto_buf[proto_len++] = (port >> 8) & 0xFF; proto_buf[proto_len++] = port & 0xFF;
         proto_buf[proto_len++] = 0x0D; proto_buf[proto_len++] = 0x0A;
-        
         if (is_ws_transport) {
             flen = build_ws_frame((char*)proto_buf, proto_len, ws_send_buf);
             tls_write(&tls, ws_send_buf, flen);
-        } else {
-            tls_write(&tls, (char*)proto_buf, proto_len);
-        }
-
+        } else { tls_write(&tls, (char*)proto_buf, proto_len); }
     } else if (is_shadowsocks) {
+        // ... SS Code ...
         if (inet_pton(AF_INET, host, &ip4) == 1) {
              proto_buf[proto_len++] = 0x01; memcpy(proto_buf + proto_len, &ip4, 4); proto_len += 4;
         } else if (inet_pton(AF_INET6, host, &ip6) == 1) {
@@ -439,26 +377,21 @@ DWORD WINAPI client_handler(LPVOID p) {
              memcpy(proto_buf + proto_len, host, strlen(host)); proto_len += strlen(host);
         }
         proto_buf[proto_len++] = (port >> 8) & 0xFF; proto_buf[proto_len++] = port & 0xFF;
-        
         if (is_ws_transport) {
             flen = build_ws_frame((char*)proto_buf, proto_len, ws_send_buf);
             tls_write(&tls, ws_send_buf, flen);
-        } else {
-            tls_write(&tls, (char*)proto_buf, proto_len);
-        }
+        } else { tls_write(&tls, (char*)proto_buf, proto_len); }
     } else {
+        // Socks or others
         char auth[] = {0x05, 0x01, 0x00}; 
         if (strlen(g_proxyConfig.user) > 0) auth[2] = 0x02; 
-        
         if(is_ws_transport) {
             flen = build_ws_frame(auth, 3, ws_send_buf);
             tls_write(&tls, ws_send_buf, flen);
-        } else {
-            tls_write(&tls, auth, 3);
-        }
+        } else { tls_write(&tls, auth, 3); }
     }
     
-    // 5. 响应浏览器
+    // 5. 响应浏览器 (Connection Established)
     if (is_socks5) {
         unsigned char s5_ok[] = {0x05, 0x00, 0x00, 0x01, 0,0,0,0, 0,0};
         send(c, (char*)s5_ok, 10, 0);
@@ -468,52 +401,40 @@ DWORD WINAPI client_handler(LPVOID p) {
         if (browser_len > header_len) {
             int extra_len = browser_len - header_len;
             if (is_vmess) {
-                // Chunk Encrypt
-                vmess_chunk_buf[0] = (extra_len >> 8) & 0xFF;
-                vmess_chunk_buf[1] = extra_len & 0xFF;
+                vmess_chunk_buf[0] = (extra_len >> 8) & 0xFF; vmess_chunk_buf[1] = extra_len & 0xFF;
                 memcpy(vmess_chunk_buf + 2, c_buf + header_len, extra_len);
                 aes_cfb128_encrypt(&vmess_enc_ctx, vmess_chunk_buf, vmess_chunk_buf, extra_len + 2);
-                
                 if (is_ws_transport) {
                     flen = build_ws_frame((char*)vmess_chunk_buf, extra_len + 2, ws_send_buf);
                     tls_write(&tls, ws_send_buf, flen);
-                } else {
-                    tls_write(&tls, (char*)vmess_chunk_buf, extra_len + 2);
-                }
+                } else { tls_write(&tls, (char*)vmess_chunk_buf, extra_len + 2); }
             } else {
                 if (is_ws_transport) {
                     flen = build_ws_frame(c_buf + header_len, extra_len, ws_send_buf);
                     tls_write(&tls, ws_send_buf, flen);
-                } else {
-                    tls_write(&tls, c_buf + header_len, extra_len);
-                }
+                } else { tls_write(&tls, c_buf + header_len, extra_len); }
             }
         }
     } else {
         if (is_vmess) {
-            vmess_chunk_buf[0] = (browser_len >> 8) & 0xFF;
-            vmess_chunk_buf[1] = browser_len & 0xFF;
+            vmess_chunk_buf[0] = (browser_len >> 8) & 0xFF; vmess_chunk_buf[1] = browser_len & 0xFF;
             memcpy(vmess_chunk_buf + 2, c_buf, browser_len);
             aes_cfb128_encrypt(&vmess_enc_ctx, vmess_chunk_buf, vmess_chunk_buf, browser_len + 2);
-            
             if (is_ws_transport) {
                 flen = build_ws_frame((char*)vmess_chunk_buf, browser_len + 2, ws_send_buf);
                 tls_write(&tls, ws_send_buf, flen);
-            } else {
-                tls_write(&tls, (char*)vmess_chunk_buf, browser_len + 2);
-            }
+            } else { tls_write(&tls, (char*)vmess_chunk_buf, browser_len + 2); }
         } else {
             if (is_ws_transport) {
                 flen = build_ws_frame(c_buf, browser_len, ws_send_buf);
                 tls_write(&tls, ws_send_buf, flen);
-            } else {
-                tls_write(&tls, c_buf, browser_len);
-            }
+            } else { tls_write(&tls, c_buf, browser_len); }
         }
     }
     
     // 6. 转发循环
     ioctlsocket(c, FIONBIO, &mode); ioctlsocket(r, FIONBIO, &mode);
+    log_msg("[Debug] Entering Forwarding Loop.");
 
     while(1) {
         FD_ZERO(&fds); FD_SET(c, &fds); FD_SET(r, &fds);
@@ -522,35 +443,29 @@ DWORD WINAPI client_handler(LPVOID p) {
         if (pending > 0 || ws_buf_len > 0) { tv.tv_sec = 0; tv.tv_usec = 0; }
         
         int n = select(0, &fds, NULL, NULL, &tv);
-        if (n < 0) break;
+        if (n < 0) { log_msg("[Err] Select fail"); break; }
         
         if (FD_ISSET(c, &fds)) {
             len = recv(c, c_buf, BUFFER_SIZE, 0);
             if (len > 0) {
                 if (is_vmess) {
-                    vmess_chunk_buf[0] = (len >> 8) & 0xFF;
-                    vmess_chunk_buf[1] = len & 0xFF;
+                    vmess_chunk_buf[0] = (len >> 8) & 0xFF; vmess_chunk_buf[1] = len & 0xFF;
                     memcpy(vmess_chunk_buf + 2, c_buf, len);
                     aes_cfb128_encrypt(&vmess_enc_ctx, vmess_chunk_buf, vmess_chunk_buf, len + 2);
-                    
                     if (is_ws_transport) {
                         flen = build_ws_frame((char*)vmess_chunk_buf, len + 2, ws_send_buf);
                         if (tls_write(&tls, ws_send_buf, flen) < 0) break;
-                    } else {
-                        if (tls_write(&tls, (char*)vmess_chunk_buf, len + 2) < 0) break;
-                    }
+                    } else { if (tls_write(&tls, (char*)vmess_chunk_buf, len + 2) < 0) break; }
                 } else {
                     if (is_ws_transport) {
                         flen = build_ws_frame(c_buf, len, ws_send_buf);
                         if (tls_write(&tls, ws_send_buf, flen) < 0) break;
-                    } else {
-                         if (tls_write(&tls, c_buf, len) < 0) break;
-                    }
+                    } else { if (tls_write(&tls, c_buf, len) < 0) break; }
                 }
             } else if (len == 0) {
-                break;
+                 break; // Client closed
             } else if (WSAGetLastError() != WSAEWOULDBLOCK) {
-                break;
+                 break;
             }
         }
         
@@ -558,16 +473,20 @@ DWORD WINAPI client_handler(LPVOID p) {
             if (ws_buf_len < BUFFER_SIZE) {
                 len = tls_read(&tls, ws_read_buf + ws_buf_len, BUFFER_SIZE - ws_buf_len);
                 if (len > 0) ws_buf_len += len;
-                else if (len == -1) break; 
+                else if (len == -1) { 
+                    log_msg("[Err] Server socket read -1 (Closed or Err)."); break; 
+                } else if (len == 0 && pending == 0) { 
+                    // 这里通常意味着对端关闭
+                    log_msg("[Debug] Server closed socket (Read 0)."); break; 
+                }
             }
         }
         
-        // --- 接收处理逻辑 ---
+        // WS Frame Parsing & Decryption ... (保持原样)
         if (is_ws_transport) {
-            // WS Mode
             while (ws_buf_len > 0) {
                 frame_total = check_ws_frame((unsigned char*)ws_read_buf, ws_buf_len, &hl, &pl);
-                if (frame_total < 0) goto cl_end;
+                if (frame_total < 0) { log_msg("[Err] WS Frame Error"); goto cl_end; }
                 if (frame_total > 0) {
                     int opcode = ws_read_buf[0] & 0x0F;
                     if (opcode == 0x8) goto cl_end; 
@@ -580,8 +499,7 @@ DWORD WINAPI client_handler(LPVOID p) {
                                 int addon_len = (unsigned char)payload_ptr[1];
                                 int head_size = 2 + addon_len;
                                 if (payload_size >= head_size) {
-                                    payload_ptr += head_size;
-                                    payload_size -= head_size;
+                                    payload_ptr += head_size; payload_size -= head_size;
                                     vless_response_header_stripped = 1;
                                 } else { payload_size = 0; }
                             } else { payload_size = 0; }
@@ -598,95 +516,56 @@ DWORD WINAPI client_handler(LPVOID p) {
                                     int cmd_len = (unsigned char)p_scan[3];
                                     int head_size = 4 + cmd_len;
                                     if (total_plain >= head_size) {
-                                        p_scan += head_size;
-                                        total_plain -= head_size;
+                                        p_scan += head_size; total_plain -= head_size;
                                         vmess_response_header_stripped = 1;
-                                    } else {
-                                        vmess_recv_rem_len = total_plain;
-                                        goto vmess_ws_skip_send;
-                                    }
-                                } else {
-                                    vmess_recv_rem_len = total_plain;
-                                    goto vmess_ws_skip_send;
-                                }
+                                    } else { vmess_recv_rem_len = total_plain; goto vmess_ws_skip_send; }
+                                } else { vmess_recv_rem_len = total_plain; goto vmess_ws_skip_send; }
                             }
-
                             while (total_plain > 2) {
                                 int chunk_len = (p_scan[0] << 8) | p_scan[1];
                                 if (total_plain >= 2 + chunk_len) {
                                     if (chunk_len > 0) send_all(c, (char*)p_scan + 2, chunk_len);
-                                    p_scan += (2 + chunk_len);
-                                    total_plain -= (2 + chunk_len);
-                                } else {
-                                    break; 
-                                }
+                                    p_scan += (2 + chunk_len); total_plain -= (2 + chunk_len);
+                                } else { break; }
                             }
-                            
-                            if (total_plain > 0) {
-                                memmove(vmess_recv_plain, p_scan, total_plain);
-                            }
+                            if (total_plain > 0) memmove(vmess_recv_plain, p_scan, total_plain);
                             vmess_recv_rem_len = total_plain;
-                            vmess_ws_skip_send:; 
-                            payload_size = 0; 
+                            vmess_ws_skip_send:; payload_size = 0; 
                         }
-
-                        if (payload_size > 0) {
-                            if (send_all(c, payload_ptr, payload_size) < 0) goto cl_end;
-                        }
+                        if (payload_size > 0) if (send_all(c, payload_ptr, payload_size) < 0) goto cl_end;
                     }
-                    if (frame_total < ws_buf_len) {
-                        memmove(ws_read_buf, ws_read_buf + frame_total, ws_buf_len - frame_total);
-                    }
+                    if (frame_total < ws_buf_len) memmove(ws_read_buf, ws_read_buf + frame_total, ws_buf_len - frame_total);
                     ws_buf_len -= (int)frame_total;
-                } else { 
-                    if (ws_buf_len >= BUFFER_SIZE) goto cl_end; 
-                    break; 
-                }
+                } else { if (ws_buf_len >= BUFFER_SIZE) goto cl_end; break; }
             }
         } else {
             // TCP Mode
             if (ws_buf_len > 0) {
                 if (is_vmess) {
-                    aes_cfb128_decrypt(&vmess_dec_ctx, (unsigned char*)ws_read_buf, 
+                     aes_cfb128_decrypt(&vmess_dec_ctx, (unsigned char*)ws_read_buf, 
                                        vmess_recv_plain + vmess_recv_rem_len, ws_buf_len);
-                    int total_plain = vmess_recv_rem_len + ws_buf_len;
-                    unsigned char* p_scan = vmess_recv_plain;
-                    
-                    if (!vmess_response_header_stripped) {
+                     int total_plain = vmess_recv_rem_len + ws_buf_len;
+                     unsigned char* p_scan = vmess_recv_plain;
+                     if (!vmess_response_header_stripped) {
                          if (total_plain >= 4) {
                              int cmd_len = (unsigned char)p_scan[3];
                              int head_size = 4 + cmd_len;
                              if (total_plain >= head_size) {
-                                 p_scan += head_size;
-                                 total_plain -= head_size;
+                                 p_scan += head_size; total_plain -= head_size;
                                  vmess_response_header_stripped = 1;
-                             } else {
-                                 vmess_recv_rem_len = total_plain;
-                                 goto vmess_tcp_skip_send;
-                             }
-                         } else {
-                             vmess_recv_rem_len = total_plain;
-                             goto vmess_tcp_skip_send;
-                         }
-                    }
-                    
-                    while (total_plain > 2) {
+                             } else { vmess_recv_rem_len = total_plain; goto vmess_tcp_skip_send; }
+                         } else { vmess_recv_rem_len = total_plain; goto vmess_tcp_skip_send; }
+                     }
+                     while (total_plain > 2) {
                         int chunk_len = (p_scan[0] << 8) | p_scan[1];
                         if (total_plain >= 2 + chunk_len) {
                             if (chunk_len > 0) send_all(c, (char*)p_scan + 2, chunk_len);
-                            p_scan += (2 + chunk_len);
-                            total_plain -= (2 + chunk_len);
-                        } else {
-                            break; 
-                        }
-                    }
-                    
-                    if (total_plain > 0) {
-                        memmove(vmess_recv_plain, p_scan, total_plain);
-                    }
-                    vmess_recv_rem_len = total_plain;
-                    vmess_tcp_skip_send:;
-
+                            p_scan += (2 + chunk_len); total_plain -= (2 + chunk_len);
+                        } else { break; }
+                     }
+                     if (total_plain > 0) memmove(vmess_recv_plain, p_scan, total_plain);
+                     vmess_recv_rem_len = total_plain;
+                     vmess_tcp_skip_send:;
                 } else {
                     if (send_all(c, ws_read_buf, ws_buf_len) < 0) goto cl_end;
                 }
@@ -701,11 +580,8 @@ cl_end:
     if (ws_send_buf) free(ws_send_buf); 
     if (vmess_chunk_buf) free(vmess_chunk_buf);
     if (vmess_recv_plain) free(vmess_recv_plain);
-    
-    // 清理 EVP Context
     aes_cfb128_cleanup(&vmess_enc_ctx);
     aes_cfb128_cleanup(&vmess_dec_ctx);
-    
     tls_close(&tls);
     if (r != INVALID_SOCKET) closesocket(r); 
     if (c != INVALID_SOCKET) closesocket(c);
@@ -737,7 +613,6 @@ DWORD WINAPI server_thread(LPVOID p) {
 void StartProxyCore() {
     if (g_proxyRunning) return;
     g_proxyRunning = TRUE;
-    // 全局随机种子
     srand((unsigned int)time(NULL));
     hProxyThread = CreateThread(NULL, 0, server_thread, NULL, 0, NULL);
     if (!hProxyThread) { log_msg("CreateThread Failed"); g_proxyRunning = FALSE; }
