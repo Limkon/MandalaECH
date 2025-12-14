@@ -247,6 +247,9 @@ DWORD WINAPI client_handler(LPVOID p) {
             "Sec-WebSocket-Version: 13\r\n\r\n", 
             req_path, req_host, g_userAgentStr, ws_key_str);
 
+        // [New] Debug Log for WS Request
+        log_msg("[Debug] Sending WS Request (Path='%s', Host='%s')", req_path, req_host);
+
         if (tls_write(&tls, ws_send_buf, offset) <= 0) {
             log_msg("[Err] WS Handshake Write Fail");
             goto cl_end;
