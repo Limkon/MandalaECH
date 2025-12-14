@@ -108,6 +108,7 @@ typedef struct {
     char user[128]; 
     char pass[128];
     char type[32]; 
+    char net[32]; // [New] 传输协议 (ws, tcp)
 } ProxyConfig;
 
 // --- 全局变量声明 (extern) ---
