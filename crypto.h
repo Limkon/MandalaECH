@@ -22,7 +22,7 @@ int ws_read_payload_exact(TLSContext *tls, char *out_buf, int expected_len);
 
 // --- VMess/Trojan 协议加密辅助函数 (EVP Based) ---
 void crypto_md5(const unsigned char *d, size_t n, unsigned char *md);
-void crypto_sha224(const char *data, size_t len, unsigned char *md); // 新增：用于 Trojan
+void crypto_sha224(const char *data, size_t len, unsigned char *md); 
 
 void vmess_get_auth(const unsigned char *uuid, long long ts, unsigned char *out_auth);
 void vmess_kdf_header(const unsigned char *uuid, unsigned char *out_key, unsigned char *out_iv);
@@ -39,6 +39,6 @@ typedef struct {
 void aes_cfb128_init(AesCfbCtx *ctx, const unsigned char *key, const unsigned char *iv, int is_encrypt);
 void aes_cfb128_encrypt(AesCfbCtx *ctx, const unsigned char *in, unsigned char *out, size_t len);
 void aes_cfb128_decrypt(AesCfbCtx *ctx, const unsigned char *in, unsigned char *out, size_t len);
-void aes_cfb128_cleanup(AesCfbCtx *ctx); // 必须调用以释放内存
+void aes_cfb128_cleanup(AesCfbCtx *ctx); 
 
 #endif // CRYPTO_H
