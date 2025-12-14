@@ -10,10 +10,61 @@ Subscription g_subs[MAX_SUBS];
 int g_subCount = 0;
 
 // --- 内部辅助函数声明 ---
-// 核心函数：解析文本并将生成的节点直接添加到内存中的 JSON 数组
 int Internal_BatchAddNodesFromText(const char* text, cJSON* outbounds);
-// 核心函数：为新节点生成唯一 Tag
 char* GetUniqueTagName(cJSON* outbounds, const char* type, const char* base_name);
+
+// --- 辅助：安全获取或创建 JSON 对象 ---
+static cJSON* GetOrCreateObj(cJSON* parent, const char* name) {
+    cJSON* item = cJSON_GetObjectItem(parent, name);
+    if (!item) {
+        item = cJSON_CreateObject();
+        cJSON_AddItemToObject(parent, name, item);
+    }
+    return item;
+}
+
+// --- SS Plugin 解析辅助函数 (处理分号分隔的参数) ---
+static void ParseSSPlugin(cJSON* outbound, const char* pluginParam) {
+    if (!pluginParam || !outbound) return;
+    char* pluginCopy = strdup(pluginParam);
+    if (!pluginCopy) return;
+
+    char host[256] = {0}; char path[256] = {0}; char sni[256] = {0}; char mode[64] = {0};
+    BOOL isTls = FALSE;
+    BOOL isV2ray = (strstr(pluginCopy, "v2ray-plugin") != NULL);
+    BOOL isObfs = (strstr(pluginCopy, "obfs-local") != NULL || strstr(pluginCopy, "simple-obfs") != NULL);
+    
+    char* ctx = NULL; char* token = strtok_s(pluginCopy, ";", &ctx);
+    while (token) {
+        if (strncmp(token, "host=", 5) == 0) strncpy(host, token+5, 255);
+        else if (strncmp(token, "obfs-host=", 10) == 0) strncpy(host, token+10, 255);
+        else if (strncmp(token, "path=", 5) == 0) strncpy(path, token+5, 255);
+        else if (strncmp(token, "sni=", 4) == 0) strncpy(sni, token+4, 255);
+        else if (strncmp(token, "mode=", 5) == 0) strncpy(mode, token+5, 63);
+        else if (strcmp(token, "tls") == 0) isTls = TRUE;
+        else if (strncmp(token, "obfs=", 5) == 0) { if (strcmp(token+5, "tls") == 0) isTls = TRUE; }
+        token = strtok_s(NULL, ";", &ctx);
+    }
+
+    if (isTls) {
+        cJSON* tlsObj = GetOrCreateObj(outbound, "tls");
+        cJSON_AddBoolToObject(tlsObj, "enabled", cJSON_True);
+        if (strlen(sni) > 0) cJSON_AddStringToObject(tlsObj, "server_name", sni);
+        else if (strlen(host) > 0 && !cJSON_HasObjectItem(tlsObj, "server_name")) cJSON_AddStringToObject(tlsObj, "server_name", host);
+    }
+
+    if (isV2ray && strcmp(mode, "quic") != 0) {
+        cJSON* trans = GetOrCreateObj(outbound, "transport");
+        // 只有当没有设置 type 时才设置，避免覆盖
+        if (!cJSON_HasObjectItem(trans, "type")) cJSON_AddStringToObject(trans, "type", "ws");
+        if (strlen(path) > 0) cJSON_AddStringToObject(trans, "path", path);
+        if (strlen(host) > 0) {
+            cJSON* headers = GetOrCreateObj(trans, "headers");
+            cJSON_AddStringToObject(headers, "Host", host);
+        }
+    }
+    free(pluginCopy);
+}
 
 // --- 配置文件基础操作 ---
 
@@ -26,41 +77,26 @@ void LoadSettings() {
     g_enableChromeCiphers = GetPrivateProfileIntW(L"Settings", L"ChromeCiphers", 1, g_iniFilePath);
     g_enableALPN = GetPrivateProfileIntW(L"Settings", L"EnableALPN", 1, g_iniFilePath);
     g_enableFragment = GetPrivateProfileIntW(L"Settings", L"EnableFragment", 0, g_iniFilePath);
-    
     g_fragSizeMin = GetPrivateProfileIntW(L"Settings", L"FragMin", 5, g_iniFilePath);
     g_fragSizeMax = GetPrivateProfileIntW(L"Settings", L"FragMax", 20, g_iniFilePath);
     g_fragDelayMs = GetPrivateProfileIntW(L"Settings", L"FragDelay", 2, g_iniFilePath);
-
     g_enablePadding = GetPrivateProfileIntW(L"Settings", L"EnablePadding", 0, g_iniFilePath);
     g_padSizeMin = GetPrivateProfileIntW(L"Settings", L"PadMin", 100, g_iniFilePath);
     g_padSizeMax = GetPrivateProfileIntW(L"Settings", L"PadMax", 500, g_iniFilePath);
 
-    // 边界检查
-    if (g_fragSizeMin < 1) g_fragSizeMin = 1;
-    if (g_fragSizeMax < g_fragSizeMin) g_fragSizeMax = g_fragSizeMin;
-    if (g_fragDelayMs < 0) g_fragDelayMs = 0;
-    if (g_padSizeMin < 0) g_padSizeMin = 0;
-    if (g_padSizeMax < g_padSizeMin) g_padSizeMax = g_padSizeMin;
+    if (g_fragSizeMin < 1) g_fragSizeMin = 1; if (g_fragSizeMax < g_fragSizeMin) g_fragSizeMax = g_fragSizeMin;
+    if (g_fragDelayMs < 0) g_fragDelayMs = 0; if (g_padSizeMin < 0) g_padSizeMin = 0; if (g_padSizeMax < g_padSizeMin) g_padSizeMax = g_padSizeMin;
 
     g_uaPlatformIndex = GetPrivateProfileIntW(L"Settings", L"UAPlatform", 0, g_iniFilePath);
-    
-    wchar_t wUABuf[512] = {0};
-    GetPrivateProfileStringW(L"Settings", L"UserAgent", L"", wUABuf, 512, g_iniFilePath);
-    if (wcslen(wUABuf) > 5) {
-        WideCharToMultiByte(CP_UTF8, 0, wUABuf, -1, g_userAgentStr, sizeof(g_userAgentStr), NULL, NULL);
-    } else {
-        strcpy(g_userAgentStr, UA_TEMPLATES[0]);
-    }
+    wchar_t wUABuf[512] = {0}; GetPrivateProfileStringW(L"Settings", L"UserAgent", L"", wUABuf, 512, g_iniFilePath);
+    if (wcslen(wUABuf) > 5) WideCharToMultiByte(CP_UTF8, 0, wUABuf, -1, g_userAgentStr, sizeof(g_userAgentStr), NULL, NULL);
+    else strcpy(g_userAgentStr, UA_TEMPLATES[0]);
 
-    // --- 读取订阅列表 ---
     g_subCount = GetPrivateProfileIntW(L"Subscriptions", L"Count", 0, g_iniFilePath);
     if (g_subCount > MAX_SUBS) g_subCount = MAX_SUBS;
-    
     for (int i = 0; i < g_subCount; i++) {
         wchar_t wKeyEn[32], wKeyUrl[32], wUrl[512];
-        wsprintfW(wKeyEn, L"Sub%d_Enabled", i);
-        wsprintfW(wKeyUrl, L"Sub%d_Url", i);
-        
+        wsprintfW(wKeyEn, L"Sub%d_Enabled", i); wsprintfW(wKeyUrl, L"Sub%d_Url", i);
         g_subs[i].enabled = GetPrivateProfileIntW(L"Subscriptions", wKeyEn, 1, g_iniFilePath);
         GetPrivateProfileStringW(L"Subscriptions", wKeyUrl, L"", wUrl, 512, g_iniFilePath);
         WideCharToMultiByte(CP_UTF8, 0, wUrl, -1, g_subs[i].url, 512, NULL, NULL);
@@ -69,58 +105,30 @@ void LoadSettings() {
 
 void SaveSettings() {
     wchar_t buffer[16];
-    wsprintfW(buffer, L"%u", g_hotkeyModifiers);
-    WritePrivateProfileStringW(L"Settings", L"Modifiers", buffer, g_iniFilePath);
-    wsprintfW(buffer, L"%u", g_hotkeyVk);
-    WritePrivateProfileStringW(L"Settings", L"VK", buffer, g_iniFilePath);
-    wsprintfW(buffer, L"%d", g_localPort);
-    WritePrivateProfileStringW(L"Settings", L"LocalPort", buffer, g_iniFilePath);
-    wsprintfW(buffer, L"%d", g_hideTrayStart);
-    WritePrivateProfileStringW(L"Settings", L"HideTray", buffer, g_iniFilePath);
-    
-    wsprintfW(buffer, L"%d", g_enableChromeCiphers);
-    WritePrivateProfileStringW(L"Settings", L"ChromeCiphers", buffer, g_iniFilePath);
-    wsprintfW(buffer, L"%d", g_enableALPN);
-    WritePrivateProfileStringW(L"Settings", L"EnableALPN", buffer, g_iniFilePath);
-    wsprintfW(buffer, L"%d", g_enableFragment);
-    WritePrivateProfileStringW(L"Settings", L"EnableFragment", buffer, g_iniFilePath);
-    
-    wsprintfW(buffer, L"%d", g_fragSizeMin);
-    WritePrivateProfileStringW(L"Settings", L"FragMin", buffer, g_iniFilePath);
-    wsprintfW(buffer, L"%d", g_fragSizeMax);
-    WritePrivateProfileStringW(L"Settings", L"FragMax", buffer, g_iniFilePath);
-    wsprintfW(buffer, L"%d", g_fragDelayMs);
-    WritePrivateProfileStringW(L"Settings", L"FragDelay", buffer, g_iniFilePath);
-
-    wsprintfW(buffer, L"%d", g_enablePadding);
-    WritePrivateProfileStringW(L"Settings", L"EnablePadding", buffer, g_iniFilePath);
-    wsprintfW(buffer, L"%d", g_padSizeMin);
-    WritePrivateProfileStringW(L"Settings", L"PadMin", buffer, g_iniFilePath);
-    wsprintfW(buffer, L"%d", g_padSizeMax);
-    WritePrivateProfileStringW(L"Settings", L"PadMax", buffer, g_iniFilePath);
-
-    wsprintfW(buffer, L"%d", g_uaPlatformIndex);
-    WritePrivateProfileStringW(L"Settings", L"UAPlatform", buffer, g_iniFilePath);
-    
-    wchar_t wUABuf[512] = {0};
-    MultiByteToWideChar(CP_UTF8, 0, g_userAgentStr, -1, wUABuf, 512);
+    wsprintfW(buffer, L"%u", g_hotkeyModifiers); WritePrivateProfileStringW(L"Settings", L"Modifiers", buffer, g_iniFilePath);
+    wsprintfW(buffer, L"%u", g_hotkeyVk); WritePrivateProfileStringW(L"Settings", L"VK", buffer, g_iniFilePath);
+    wsprintfW(buffer, L"%d", g_localPort); WritePrivateProfileStringW(L"Settings", L"LocalPort", buffer, g_iniFilePath);
+    wsprintfW(buffer, L"%d", g_hideTrayStart); WritePrivateProfileStringW(L"Settings", L"HideTray", buffer, g_iniFilePath);
+    wsprintfW(buffer, L"%d", g_enableChromeCiphers); WritePrivateProfileStringW(L"Settings", L"ChromeCiphers", buffer, g_iniFilePath);
+    wsprintfW(buffer, L"%d", g_enableALPN); WritePrivateProfileStringW(L"Settings", L"EnableALPN", buffer, g_iniFilePath);
+    wsprintfW(buffer, L"%d", g_enableFragment); WritePrivateProfileStringW(L"Settings", L"EnableFragment", buffer, g_iniFilePath);
+    wsprintfW(buffer, L"%d", g_fragSizeMin); WritePrivateProfileStringW(L"Settings", L"FragMin", buffer, g_iniFilePath);
+    wsprintfW(buffer, L"%d", g_fragSizeMax); WritePrivateProfileStringW(L"Settings", L"FragMax", buffer, g_iniFilePath);
+    wsprintfW(buffer, L"%d", g_fragDelayMs); WritePrivateProfileStringW(L"Settings", L"FragDelay", buffer, g_iniFilePath);
+    wsprintfW(buffer, L"%d", g_enablePadding); WritePrivateProfileStringW(L"Settings", L"EnablePadding", buffer, g_iniFilePath);
+    wsprintfW(buffer, L"%d", g_padSizeMin); WritePrivateProfileStringW(L"Settings", L"PadMin", buffer, g_iniFilePath);
+    wsprintfW(buffer, L"%d", g_padSizeMax); WritePrivateProfileStringW(L"Settings", L"PadMax", buffer, g_iniFilePath);
+    wsprintfW(buffer, L"%d", g_uaPlatformIndex); WritePrivateProfileStringW(L"Settings", L"UAPlatform", buffer, g_iniFilePath);
+    wchar_t wUABuf[512] = {0}; MultiByteToWideChar(CP_UTF8, 0, g_userAgentStr, -1, wUABuf, 512);
     WritePrivateProfileStringW(L"Settings", L"UserAgent", wUABuf, g_iniFilePath);
 
-    // 保存订阅列表
-    WritePrivateProfileStringW(L"Subscriptions", NULL, NULL, g_iniFilePath); // 清空 Section
-    wsprintfW(buffer, L"%d", g_subCount);
-    WritePrivateProfileStringW(L"Subscriptions", L"Count", buffer, g_iniFilePath);
-    
+    WritePrivateProfileStringW(L"Subscriptions", NULL, NULL, g_iniFilePath);
+    wsprintfW(buffer, L"%d", g_subCount); WritePrivateProfileStringW(L"Subscriptions", L"Count", buffer, g_iniFilePath);
     for (int i = 0; i < g_subCount; i++) {
         wchar_t wKeyEn[32], wKeyUrl[32], wUrl[512], wVal[2];
-        wsprintfW(wKeyEn, L"Sub%d_Enabled", i);
-        wsprintfW(wKeyUrl, L"Sub%d_Url", i);
-        
-        wsprintfW(wVal, L"%d", g_subs[i].enabled);
-        WritePrivateProfileStringW(L"Subscriptions", wKeyEn, wVal, g_iniFilePath);
-        
-        MultiByteToWideChar(CP_UTF8, 0, g_subs[i].url, -1, wUrl, 512);
-        WritePrivateProfileStringW(L"Subscriptions", wKeyUrl, wUrl, g_iniFilePath);
+        wsprintfW(wKeyEn, L"Sub%d_Enabled", i); wsprintfW(wKeyUrl, L"Sub%d_Url", i);
+        wsprintfW(wVal, L"%d", g_subs[i].enabled); WritePrivateProfileStringW(L"Subscriptions", wKeyEn, wVal, g_iniFilePath);
+        MultiByteToWideChar(CP_UTF8, 0, g_subs[i].url, -1, wUrl, 512); WritePrivateProfileStringW(L"Subscriptions", wKeyUrl, wUrl, g_iniFilePath);
     }
 }
 
@@ -144,8 +152,6 @@ BOOL IsAutorun() {
     return FALSE;
 }
 
-// --- 节点 Tag 管理 ---
-
 void ParseTags() {
     if (nodeTags) { for(int i=0; i<nodeCount; i++) free(nodeTags[i]); free(nodeTags); }
     nodeCount = 0; nodeTags = NULL;
@@ -168,24 +174,17 @@ void ParseTags() {
     cJSON_Delete(root);
 }
 
-// 生成唯一 Tag (辅助函数)
 char* GetUniqueTagName(cJSON* outbounds, const char* type, const char* base_name) {
-    static char final_tag[512];
-    char candidate[450];
+    static char final_tag[512]; char candidate[450];
     const char* safe_name = (base_name && strlen(base_name) > 0) ? base_name : "Unnamed";
     char prefix[64]; snprintf(prefix, sizeof(prefix), "%s-", type);
-    
-    // 如果名字已经包含了类型前缀，就不再重复添加
     if (_strnicmp(safe_name, prefix, strlen(prefix)) == 0) snprintf(candidate, sizeof(candidate), "%s", safe_name);
     else snprintf(candidate, sizeof(candidate), "%s-%s", type, safe_name);
-    
     int index = 0;
     while (1) {
         if (index == 0) snprintf(final_tag, sizeof(final_tag), "%s", candidate);
         else snprintf(final_tag, sizeof(final_tag), "%s (%d)", candidate, index);
-        
-        BOOL exists = FALSE;
-        cJSON* item = NULL;
+        BOOL exists = FALSE; cJSON* item = NULL;
         cJSON_ArrayForEach(item, outbounds) {
             cJSON* t = cJSON_GetObjectItem(item, "tag");
             if (t && t->valuestring && strcmp(t->valuestring, final_tag) == 0) { exists = TRUE; break; }
@@ -196,12 +195,9 @@ char* GetUniqueTagName(cJSON* outbounds, const char* type, const char* base_name
     return final_tag;
 }
 
-// --- 节点切换与配置 ---
-
 void ParseNodeConfigToGlobal(cJSON *node) {
     if (!node) return;
     memset(&g_proxyConfig, 0, sizeof(ProxyConfig));
-    
     strcpy(g_proxyConfig.path, "/"); 
     cJSON *server = cJSON_GetObjectItem(node, "server");
     cJSON *port = cJSON_GetObjectItem(node, "server_port");
@@ -209,12 +205,8 @@ void ParseNodeConfigToGlobal(cJSON *node) {
     if (!uuid) uuid = cJSON_GetObjectItem(node, "password"); 
     if (server && server->valuestring) strcpy(g_proxyConfig.host, server->valuestring);
     if (port) g_proxyConfig.port = port->valueint;
-    if (uuid && uuid->valuestring) {
-        strcpy(g_proxyConfig.user, uuid->valuestring); 
-        strcpy(g_proxyConfig.pass, uuid->valuestring); 
-    }
-    cJSON *user = cJSON_GetObjectItem(node, "username");
-    cJSON *pass = cJSON_GetObjectItem(node, "password");
+    if (uuid && uuid->valuestring) { strcpy(g_proxyConfig.user, uuid->valuestring); strcpy(g_proxyConfig.pass, uuid->valuestring); }
+    cJSON *user = cJSON_GetObjectItem(node, "username"); cJSON *pass = cJSON_GetObjectItem(node, "password");
     if(user && user->valuestring) strcpy(g_proxyConfig.user, user->valuestring);
     if(pass && pass->valuestring) strcpy(g_proxyConfig.pass, pass->valuestring);
     cJSON *tls = cJSON_GetObjectItem(node, "tls");
@@ -239,23 +231,16 @@ void SwitchNode(const wchar_t* tag) {
     if (!root) return;
     cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
     cJSON* targetNode = NULL;
-    char tagUtf8[256];
-    WideCharToMultiByte(CP_UTF8, 0, tag, -1, tagUtf8, 256, NULL, NULL);
+    char tagUtf8[256]; WideCharToMultiByte(CP_UTF8, 0, tag, -1, tagUtf8, 256, NULL, NULL);
     cJSON* node;
     cJSON_ArrayForEach(node, outbounds) {
         cJSON* t = cJSON_GetObjectItem(node, "tag");
-        if (t && strcmp(t->valuestring, tagUtf8) == 0) {
-            targetNode = node; break;
-        }
+        if (t && strcmp(t->valuestring, tagUtf8) == 0) { targetNode = node; break; }
     }
     if (targetNode) {
-        StopProxyCore();
-        ParseNodeConfigToGlobal(targetNode);
-        StartProxyCore();
+        StopProxyCore(); ParseNodeConfigToGlobal(targetNode); StartProxyCore();
         wchar_t tip[128]; wsprintfW(tip, L"已切换: %s", tag);
-        wcsncpy(nid.szInfo, tip, 127);
-        wcsncpy(nid.szInfoTitle, L"Mandala Client", 63);
-        nid.uFlags |= NIF_INFO;
+        wcsncpy(nid.szInfo, tip, 127); wcsncpy(nid.szInfoTitle, L"Mandala Client", 63); nid.uFlags |= NIF_INFO;
         Shell_NotifyIconW(NIM_MODIFY, &nid);
     }
     cJSON_Delete(root);
@@ -267,271 +252,228 @@ void DeleteNode(const wchar_t* tag) {
     cJSON* root = cJSON_Parse(buffer); free(buffer);
     if (!root) return;
     cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
-    char tagUtf8[256];
-    WideCharToMultiByte(CP_UTF8, 0, tag, -1, tagUtf8, 256, NULL, NULL);
-    int idx = 0;
-    cJSON* node;
+    char tagUtf8[256]; WideCharToMultiByte(CP_UTF8, 0, tag, -1, tagUtf8, 256, NULL, NULL);
+    int idx = 0; cJSON* node;
     cJSON_ArrayForEach(node, outbounds) {
         cJSON* t = cJSON_GetObjectItem(node, "tag");
-        if (t && strcmp(t->valuestring, tagUtf8) == 0) {
-            cJSON_DeleteItemFromArray(outbounds, idx);
-            break;
-        }
+        if (t && strcmp(t->valuestring, tagUtf8) == 0) { cJSON_DeleteItemFromArray(outbounds, idx); break; }
         idx++;
     }
-    char* out = cJSON_Print(root);
-    WriteBufferToFile(CONFIG_FILE, out);
-    free(out); cJSON_Delete(root);
+    char* out = cJSON_Print(root); WriteBufferToFile(CONFIG_FILE, out); free(out); cJSON_Delete(root);
     ParseTags(); 
 }
 
-// --- 单个节点添加 (现在调用内部批量函数，虽然只加一个，但复用了逻辑) ---
 BOOL AddNodeToConfig(cJSON* newNode) {
     if (!newNode) return FALSE;
     char* buffer = NULL; long size = 0; cJSON* root = NULL;
-    
-    // 读取
     if (ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) { root = cJSON_Parse(buffer); free(buffer); }
     if (!root) { root = cJSON_CreateObject(); cJSON_AddItemToObject(root, "outbounds", cJSON_CreateArray()); }
-    
     cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
     if (!outbounds) { outbounds = cJSON_CreateArray(); cJSON_AddItemToObject(root, "outbounds", outbounds); }
-    
-    // 处理 Tag 唯一性
     cJSON* jsonType = cJSON_GetObjectItem(newNode, "type");
     const char* typeStr = (jsonType && jsonType->valuestring) ? jsonType->valuestring : "proxy";
     cJSON* jsonTag = cJSON_GetObjectItem(newNode, "tag");
     const char* originalTag = (jsonTag && jsonTag->valuestring) ? jsonTag->valuestring : "NewNode";
     char* uniqueTag = GetUniqueTagName(outbounds, typeStr, originalTag);
-    
     if (cJSON_HasObjectItem(newNode, "tag")) cJSON_ReplaceItemInObject(newNode, "tag", cJSON_CreateString(uniqueTag));
     else cJSON_AddStringToObject(newNode, "tag", uniqueTag);
-    
-    // 添加
     cJSON_AddItemToArray(outbounds, newNode);
-    
-    // 写入
-    char* out = cJSON_Print(root);
-    BOOL ret = WriteBufferToFile(CONFIG_FILE, out);
-    free(out); cJSON_Delete(root);
+    char* out = cJSON_Print(root); BOOL ret = WriteBufferToFile(CONFIG_FILE, out); free(out); cJSON_Delete(root);
     return ret;
 }
 
-// --- 批量导入核心逻辑 (内存操作，无 IO) ---
-// 返回值：添加成功的节点数量
 int Internal_BatchAddNodesFromText(const char* text, cJSON* outbounds) {
     if (!text || !outbounds) return 0;
-    
-    int count = 0;
-    // 尝试 Base64 解码，因为订阅链接内容通常是 Base64 编码的
-    size_t decLen = 0;
-    unsigned char* decoded = Base64Decode(text, &decLen);
-    
+    int count = 0; size_t decLen = 0; unsigned char* decoded = Base64Decode(text, &decLen);
     char* sourceText = NULL;
-    if (decoded && decLen > 0) {
-        sourceText = (char*)decoded;
-    } else {
-        sourceText = strdup(text); 
-        if (decoded) free(decoded);
-    }
-    
+    if (decoded && decLen > 0) sourceText = (char*)decoded; else { sourceText = strdup(text); if (decoded) free(decoded); }
     if (!sourceText) return 0;
-
-    char* context = NULL;
-    // 使用统一的分隔符：换行、空格、逗号
-    char* line = strtok_s(sourceText, "\r\n ,", &context);
+    char* context = NULL; char* line = strtok_s(sourceText, "\r\n ,", &context);
     while (line) {
         TrimString(line);
         if (strlen(line) > 0) {
             cJSON* node = NULL;
-            // 根据前缀判断协议
             if (_strnicmp(line, "vmess://", 8) == 0) node = ParseVmess(line);
             else if (_strnicmp(line, "ss://", 5) == 0) node = ParseShadowsocks(line);
             else if (_strnicmp(line, "vless://", 8) == 0) node = ParseVlessOrTrojan(line);
             else if (_strnicmp(line, "trojan://", 9) == 0) node = ParseVlessOrTrojan(line);
             else if (_strnicmp(line, "socks://", 8) == 0) node = ParseSocks(line);
-            
             if (node) {
-                // 处理 Tag 唯一性
                 cJSON* jsonType = cJSON_GetObjectItem(node, "type");
                 const char* typeStr = (jsonType && jsonType->valuestring) ? jsonType->valuestring : "proxy";
                 cJSON* jsonTag = cJSON_GetObjectItem(node, "tag");
                 const char* originalTag = (jsonTag && jsonTag->valuestring) ? jsonTag->valuestring : "Auto";
-                
                 char* uniqueTag = GetUniqueTagName(outbounds, typeStr, originalTag);
-                
                 if (cJSON_HasObjectItem(node, "tag")) cJSON_ReplaceItemInObject(node, "tag", cJSON_CreateString(uniqueTag));
                 else cJSON_AddStringToObject(node, "tag", uniqueTag);
-
-                cJSON_AddItemToArray(outbounds, node);
-                count++;
+                cJSON_AddItemToArray(outbounds, node); count++;
             }
         }
         line = strtok_s(NULL, "\r\n ,", &context);
     }
-    free(sourceText);
-    return count;
+    free(sourceText); return count;
 }
 
-// --- 外部接口：从剪贴板导入 (重构后使用批量逻辑) ---
 int ImportFromClipboard() {
-    char* text = GetClipboardText(); 
-    if (!text) return 0;
-
-    // 1. 读取当前配置
+    char* text = GetClipboardText(); if (!text) return 0;
     char* buffer = NULL; long size = 0; cJSON* root = NULL;
     if (ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) { root = cJSON_Parse(buffer); free(buffer); }
     if (!root) { root = cJSON_CreateObject(); cJSON_AddItemToObject(root, "outbounds", cJSON_CreateArray()); }
-    
     cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
     if (!outbounds) { outbounds = cJSON_CreateArray(); cJSON_AddItemToObject(root, "outbounds", outbounds); }
-
-    // 2. 批量处理内存数据
     int successCount = Internal_BatchAddNodesFromText(text, outbounds);
-
-    // 3. 一次性写入
-    if (successCount > 0) {
-        char* out = cJSON_Print(root);
-        WriteBufferToFile(CONFIG_FILE, out);
-        free(out);
-        ParseTags(); // 刷新全局 Tag 列表
-    }
-    
-    cJSON_Delete(root);
-    free(text);
-    return successCount;
+    if (successCount > 0) { char* out = cJSON_Print(root); WriteBufferToFile(CONFIG_FILE, out); free(out); ParseTags(); }
+    cJSON_Delete(root); free(text); return successCount;
 }
 
-// --- 外部接口：更新所有订阅 (重构后解决 IO 性能问题) ---
 int UpdateAllSubscriptions(BOOL forceMsg) {
     int activeSubs = 0;
-    for(int i=0; i<g_subCount; i++) {
-        if(g_subs[i].enabled && strlen(g_subs[i].url) > 4) activeSubs++;
-    }
-
-    if (activeSubs == 0) {
-        if (forceMsg) log_msg("[Sub] No active subscriptions found.");
-        return 0;
-    }
-
+    for(int i=0; i<g_subCount; i++) if(g_subs[i].enabled && strlen(g_subs[i].url) > 4) activeSubs++;
+    if (activeSubs == 0) { if (forceMsg) log_msg("[Sub] No active subscriptions found."); return 0; }
     log_msg("[Sub] Starting update for %d subscriptions...", activeSubs);
-
-    // 1. 下载所有订阅内容 (IO 操作，网络)
-    // 为了避免下载时间过长阻塞 UI，实际生产环境建议用线程，这里先保持同步但优化逻辑
-    char* rawData[MAX_SUBS] = {0};
-    int downloadSuccess = 0;
-
+    char* rawData[MAX_SUBS] = {0}; int downloadSuccess = 0;
     for (int i = 0; i < g_subCount; i++) {
         if (g_subs[i].enabled && strlen(g_subs[i].url) > 4) {
             log_msg("[Sub] Downloading (%d/%d): %s", i+1, g_subCount, g_subs[i].url);
             char* data = Utils_HttpGet(g_subs[i].url);
-            if (data) {
-                rawData[i] = data;
-                downloadSuccess++;
-            } else {
-                log_msg("[Sub] Download failed: %s", g_subs[i].url);
-            }
+            if (data) { rawData[i] = data; downloadSuccess++; } else log_msg("[Sub] Download failed: %s", g_subs[i].url);
         }
     }
-
-    if (downloadSuccess == 0) {
-        log_msg("[Error] All downloads failed. Config not updated.");
-        return 0;
-    }
-
-    // 2. 准备配置文件 (IO 操作，文件读取 - 仅一次)
+    if (downloadSuccess == 0) { log_msg("[Error] All downloads failed. Config not updated."); return 0; }
     char* buffer = NULL; long size = 0; cJSON* root = NULL;
     if (ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) { root = cJSON_Parse(buffer); free(buffer); }
     if (!root) { root = cJSON_CreateObject(); }
-
-    // 3. 清空旧节点 (按照原逻辑，更新订阅会覆盖旧节点)
-    // 注意：如果想保留手动添加的节点，逻辑会复杂很多，这里暂时保持“更新即重置”的原有逻辑
-    if (cJSON_HasObjectItem(root, "outbounds")) {
-        cJSON_DeleteItemFromObject(root, "outbounds");
-    }
-    cJSON* outbounds = cJSON_CreateArray();
-    cJSON_AddItemToObject(root, "outbounds", outbounds);
-
-    // 4. 批量添加节点 (内存操作)
+    if (cJSON_HasObjectItem(root, "outbounds")) cJSON_DeleteItemFromObject(root, "outbounds");
+    cJSON* outbounds = cJSON_CreateArray(); cJSON_AddItemToObject(root, "outbounds", outbounds);
     int totalNewNodes = 0;
     for (int i = 0; i < g_subCount; i++) {
-        if (rawData[i]) {
-            int count = Internal_BatchAddNodesFromText(rawData[i], outbounds);
-            totalNewNodes += count;
-            free(rawData[i]); // 释放下载的文本
-            rawData[i] = NULL;
-        }
+        if (rawData[i]) { int count = Internal_BatchAddNodesFromText(rawData[i], outbounds); totalNewNodes += count; free(rawData[i]); }
     }
-
-    // 5. 保存文件 (IO 操作，文件写入 - 仅一次)
     log_msg("[Sub] Total nodes parsed: %d. Saving config...", totalNewNodes);
-    char* out = cJSON_Print(root);
-    WriteBufferToFile(CONFIG_FILE, out);
-    free(out);
-    cJSON_Delete(root);
-
-    // 6. 刷新界面用的 Tag 列表
-    ParseTags();
-    
-    log_msg("[Sub] Update complete.");
+    char* out = cJSON_Print(root); WriteBufferToFile(CONFIG_FILE, out); free(out); cJSON_Delete(root);
+    ParseTags(); log_msg("[Sub] Update complete.");
     return totalNewNodes;
 }
 
 void ToggleTrayIcon() {
-    if (g_isIconVisible) { 
-        Shell_NotifyIconW(NIM_DELETE, &nid); 
-        g_isIconVisible = FALSE; 
-        g_hideTrayStart = 1;
-    }
-    else { 
-        nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
-        Shell_NotifyIconW(NIM_ADD, &nid); 
-        g_isIconVisible = TRUE; 
-        g_hideTrayStart = 0;
-    }
+    if (g_isIconVisible) { Shell_NotifyIconW(NIM_DELETE, &nid); g_isIconVisible = FALSE; g_hideTrayStart = 1; }
+    else { nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP; Shell_NotifyIconW(NIM_ADD, &nid); g_isIconVisible = TRUE; g_hideTrayStart = 0; }
     SaveSettings();
 }
 
-// --- 协议解析函数 (保持不变) ---
+// --- 协议解析函数 ---
+
 cJSON* ParseSocks(const char* link) {
     if (strncmp(link, "socks://", 8) != 0) return NULL;
     const char* p = link + 8; const char* at = strchr(p, '@'); if (!at) return NULL; 
     int authLen = (int)(at - p); char* authBase64 = (char*)malloc(authLen + 1); strncpy(authBase64, p, authLen); authBase64[authLen] = 0;
-    size_t decLen; unsigned char* decoded = Base64Decode(authBase64, &decLen); free(authBase64);
-    if (!decoded) return NULL;
+    size_t decLen; unsigned char* decoded = Base64Decode(authBase64, &decLen); free(authBase64); if (!decoded) return NULL;
     char* user = (char*)decoded; char* pass = strchr(user, ':'); if (pass) { *pass = 0; pass++; } else pass = "";
     p = at + 1; const char* colon = strchr(p, ':'); const char* qMark = strchr(p, '?'); const char* hash = strchr(p, '#');
     const char* portStart = colon ? colon + 1 : NULL; const char* hostEnd = colon ? colon : (qMark ? qMark : (hash ? hash : p + strlen(p)));
     int hostLen = (int)(hostEnd - p); char* host = (char*)malloc(hostLen + 1); strncpy(host, p, hostLen); host[hostLen] = 0;
     int portNum = portStart ? atoi(portStart) : 443;
-    char* tag = hash ? (char*)malloc(strlen(hash+1)+1) : strdup("Socks-Import");
-    if(hash) UrlDecode(tag, hash+1);
+    char* tag = hash ? (char*)malloc(strlen(hash+1)+1) : strdup("Socks-Import"); if(hash) UrlDecode(tag, hash+1);
     const char* query = qMark ? qMark + 1 : NULL;
-    char* sni = GetQueryParam(query, "sni");
-    char* path = GetQueryParam(query, "path"); 
-    char* transport = GetQueryParam(query, "transport");
+    char* sni = GetQueryParam(query, "sni"); if (!sni) sni = GetQueryParam(query, "peer");
+    char* path = GetQueryParam(query, "path"); char* type = GetQueryParam(query, "type"); if (!type) type = GetQueryParam(query, "transport");
+    char* security = GetQueryParam(query, "security"); char* hostHeader = GetQueryParam(query, "host");
     cJSON* outbound = cJSON_CreateObject();
-    cJSON_AddStringToObject(outbound, "type", "socks_tls");
-    cJSON_AddStringToObject(outbound, "tag", tag);
-    cJSON_AddStringToObject(outbound, "server", host);
-    cJSON_AddNumberToObject(outbound, "server_port", portNum);
-    cJSON_AddStringToObject(outbound, "username", user);
-    cJSON_AddStringToObject(outbound, "password", pass);
-    if (sni) {
-        cJSON* tls = cJSON_CreateObject(); cJSON_AddStringToObject(tls, "server_name", sni);
-        cJSON_AddItemToObject(outbound, "tls", tls); free(sni);
+    cJSON_AddStringToObject(outbound, "type", "socks_tls"); cJSON_AddStringToObject(outbound, "tag", tag);
+    cJSON_AddStringToObject(outbound, "server", host); cJSON_AddNumberToObject(outbound, "server_port", portNum);
+    cJSON_AddStringToObject(outbound, "username", user); cJSON_AddStringToObject(outbound, "password", pass);
+    BOOL enableTls = (security && strcmp(security, "tls") == 0) || sni != NULL;
+    if (enableTls) {
+        cJSON* tls = cJSON_CreateObject(); cJSON_AddBoolToObject(tls, "enabled", cJSON_True);
+        if (sni) cJSON_AddStringToObject(tls, "server_name", sni); else cJSON_AddStringToObject(tls, "server_name", host);
+        cJSON_AddItemToObject(outbound, "tls", tls);
     }
-    if (transport && strcmp(transport, "ws") == 0) {
+    if (type && strcmp(type, "ws") == 0) {
         cJSON* trans = cJSON_CreateObject(); cJSON_AddStringToObject(trans, "type", "ws");
         if (path) cJSON_AddStringToObject(trans, "path", path);
-        if (sni) { 
-             cJSON* headers = cJSON_CreateObject(); cJSON_AddStringToObject(headers, "Host", host); 
-             cJSON_AddItemToObject(trans, "headers", headers);
-        }
-        cJSON_AddItemToObject(outbound, "transport", trans);
+        cJSON* headers = cJSON_CreateObject(); 
+        if (hostHeader) cJSON_AddStringToObject(headers, "Host", hostHeader); else cJSON_AddStringToObject(headers, "Host", host);
+        cJSON_AddItemToObject(trans, "headers", headers); cJSON_AddItemToObject(outbound, "transport", trans);
     }
-    if (path) free(path); if (transport) free(transport); free(host); free(tag); free(decoded);
-    return outbound;
+    if (sni) free(sni); if (path) free(path); if (type) free(type); if (security) free(security); if (hostHeader) free(hostHeader);
+    free(host); free(tag); free(decoded); return outbound;
+}
+
+// [增强修复] SS 解析: 同时支持 plugin 和直接参数解析
+cJSON* ParseShadowsocks(const char* link) {
+    if (strncmp(link, "ss://", 5) != 0) return NULL;
+    const char* p = link + 5; 
+    const char* hash = strchr(p, '#'); char* tag = hash ? (char*)malloc(strlen(hash+1)+1) : strdup("SS");
+    if(hash) UrlDecode(tag, hash+1); else strcpy(tag, "SS");
+    const char* qMark = strchr(p, '?');
+    const char* endOfMain = qMark ? qMark : (hash ? hash : p + strlen(p));
+    size_t mainLen = (size_t)(endOfMain - p);
+    char* mainPart = (char*)malloc(mainLen + 1); strncpy(mainPart, p, mainLen); mainPart[mainLen] = 0;
+    char serverPort[256] = {0}, methodPass[256] = {0}; char* at = strchr(mainPart, '@');
+    if (!at) {
+        size_t decLen; unsigned char* decoded = Base64Decode(mainPart, &decLen);
+        if(!decoded) { free(mainPart); free(tag); return NULL; }
+        char* dStr = (char*)decoded; at = strchr(dStr, '@');
+        if (at) { strncpy(serverPort, at+1, 255); strncpy(methodPass, dStr, at-dStr); methodPass[at-dStr]=0; }
+        free(decoded);
+    } else {
+        strncpy(serverPort, at+1, 255); char b64User[256]; strncpy(b64User, mainPart, at-mainPart); b64User[at-mainPart] = 0;
+        size_t decLen; unsigned char* decoded = Base64Decode(b64User, &decLen);
+        if(decoded) { strncpy(methodPass, (char*)decoded, 255); free(decoded); } else strncpy(methodPass, b64User, 255);
+    }
+    free(mainPart);
+    char* colon = strrchr(serverPort, ':'); if (!colon) { free(tag); return NULL; }
+    int port = atoi(colon + 1); *colon = 0;
+    char* pass = strchr(methodPass, ':'); if (!pass) { free(tag); return NULL; } *pass = 0; pass++;
+
+    cJSON* outbound = cJSON_CreateObject();
+    cJSON_AddStringToObject(outbound, "type", "shadowsocks"); cJSON_AddStringToObject(outbound, "tag", tag);
+    cJSON_AddStringToObject(outbound, "server", serverPort); cJSON_AddNumberToObject(outbound, "server_port", port);
+    cJSON_AddStringToObject(outbound, "method", methodPass); cJSON_AddStringToObject(outbound, "password", pass);
+
+    if (qMark) {
+        const char* qStart = qMark + 1; size_t qLen = hash ? (size_t)(hash - qStart) : strlen(qStart);
+        char* queryStr = (char*)malloc(qLen + 1); strncpy(queryStr, qStart, qLen); queryStr[qLen] = 0;
+        
+        // 1. 尝试解析 Plugin (优先级高，或作为基础)
+        char* pluginVal = GetQueryParam(queryStr, "plugin");
+        if (pluginVal) { UrlDecode(pluginVal, pluginVal); ParseSSPlugin(outbound, pluginVal); free(pluginVal); }
+
+        // 2. 补充解析裸参 (兼容不带 plugin 的格式)
+        char* directSni = GetQueryParam(queryStr, "sni");
+        char* directHost = GetQueryParam(queryStr, "host"); if(!directHost) directHost = GetQueryParam(queryStr, "obfs-host");
+        char* directPath = GetQueryParam(queryStr, "path");
+        char* directMode = GetQueryParam(queryStr, "mode"); if(!directMode) directMode = GetQueryParam(queryStr, "type");
+        char* directSecurity = GetQueryParam(queryStr, "security"); // e.g., "tls"
+
+        // 检查是否需要补充 TLS
+        BOOL needTls = (directSecurity && strcmp(directSecurity, "tls") == 0) || directSni != NULL;
+        if (needTls) {
+            cJSON* tlsObj = GetOrCreateObj(outbound, "tls");
+            if (!cJSON_HasObjectItem(tlsObj, "enabled")) cJSON_AddBoolToObject(tlsObj, "enabled", cJSON_True);
+            if (directSni && !cJSON_HasObjectItem(tlsObj, "server_name")) cJSON_AddStringToObject(tlsObj, "server_name", directSni);
+            else if (directHost && !cJSON_HasObjectItem(tlsObj, "server_name")) cJSON_AddStringToObject(tlsObj, "server_name", directHost);
+        }
+
+        // 检查是否需要补充 Transport (如 WebSocket)
+        // 只有当 plugin 没设置 transport 或者裸参明确指定了 ws 时
+        BOOL isWs = (directMode && strcmp(directMode, "ws") == 0);
+        if (isWs) {
+             cJSON* trans = GetOrCreateObj(outbound, "transport");
+             if (!cJSON_HasObjectItem(trans, "type")) cJSON_AddStringToObject(trans, "type", "ws");
+             if (directPath && !cJSON_HasObjectItem(trans, "path")) cJSON_AddStringToObject(trans, "path", directPath);
+             if (directHost) {
+                 cJSON* headers = GetOrCreateObj(trans, "headers");
+                 if (!cJSON_HasObjectItem(headers, "Host")) cJSON_AddStringToObject(headers, "Host", directHost);
+             }
+        }
+
+        if(directSni) free(directSni); if(directHost) free(directHost); if(directPath) free(directPath);
+        if(directMode) free(directMode); if(directSecurity) free(directSecurity);
+        free(queryStr);
+    }
+    
+    free(tag); return outbound;
 }
 
 cJSON* ParseVmess(const char* link) {
@@ -581,10 +523,8 @@ cJSON* ParseVlessOrTrojan(const char* link) {
     char* tag = hash ? (char*)malloc(strlen(hash+1)+1) : strdup(protocol);
     if(hash) UrlDecode(tag, hash+1);
     cJSON* outbound = cJSON_CreateObject();
-    cJSON_AddStringToObject(outbound, "type", protocol);
-    cJSON_AddStringToObject(outbound, "tag", tag);
-    cJSON_AddStringToObject(outbound, "server", host);
-    cJSON_AddNumberToObject(outbound, "server_port", portNum);
+    cJSON_AddStringToObject(outbound, "type", protocol); cJSON_AddStringToObject(outbound, "tag", tag);
+    cJSON_AddStringToObject(outbound, "server", host); cJSON_AddNumberToObject(outbound, "server_port", portNum);
     if (strcmp(protocol, "vless") == 0) cJSON_AddStringToObject(outbound, "uuid", uuid);
     else cJSON_AddStringToObject(outbound, "password", uuid);
     const char* query = qMark ? qMark + 1 : NULL;
@@ -611,41 +551,4 @@ cJSON* ParseVlessOrTrojan(const char* link) {
     }
     if (security) free(security);
     free(uuid); free(host); free(tag); return outbound;
-}
-
-cJSON* ParseShadowsocks(const char* link) {
-    if (strncmp(link, "ss://", 5) != 0) return NULL;
-    const char* p = link + 5; const char* hash = strchr(p, '#');
-    char* tag = hash ? (char*)malloc(strlen(hash+1)+1) : strdup("SS");
-    if(hash) UrlDecode(tag, hash+1);
-    size_t mainLen = hash ? (size_t)(hash - p) : strlen(p);
-    char* mainPart = (char*)malloc(mainLen + 1); strncpy(mainPart, p, mainLen); mainPart[mainLen] = 0;
-    char serverPort[256] = {0}, methodPass[256] = {0};
-    char* at = strchr(mainPart, '@');
-    if (!at) {
-        size_t decLen; unsigned char* decoded = Base64Decode(mainPart, &decLen);
-        if(!decoded) { free(mainPart); free(tag); return NULL; }
-        char* dStr = (char*)decoded;
-        at = strchr(dStr, '@');
-        if (at) { strncpy(serverPort, at+1, 255); strncpy(methodPass, dStr, at-dStr); }
-        free(decoded);
-    } else {
-        strncpy(serverPort, at+1, 255);
-        char tmp[256]; strncpy(tmp, mainPart, at-mainPart); tmp[at-mainPart]=0;
-        size_t decLen; unsigned char* decoded = Base64Decode(tmp, &decLen);
-        if(decoded) { strncpy(methodPass, (char*)decoded, 255); free(decoded); }
-    }
-    free(mainPart);
-    char* colon = strrchr(serverPort, ':'); if (!colon) { free(tag); return NULL; }
-    int port = atoi(colon + 1); *colon = 0;
-    char* pass = strchr(methodPass, ':'); if (!pass) { free(tag); return NULL; }
-    *pass = 0; pass++;
-    cJSON* outbound = cJSON_CreateObject();
-    cJSON_AddStringToObject(outbound, "type", "shadowsocks");
-    cJSON_AddStringToObject(outbound, "tag", tag);
-    cJSON_AddStringToObject(outbound, "server", serverPort);
-    cJSON_AddNumberToObject(outbound, "server_port", port);
-    cJSON_AddStringToObject(outbound, "method", methodPass);
-    cJSON_AddStringToObject(outbound, "password", pass);
-    free(tag); return outbound;
 }
