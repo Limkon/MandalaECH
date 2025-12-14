@@ -65,46 +65,6 @@ void log_hex_simple(const char* tag, unsigned char* data, int len) {
     log_msg("%s %d bytes: %s...", tag, len, buf);
 }
 
-// [修复] 正确解析 WebSocket 帧长度，支持大数据包
-// 返回值: 帧总长度 (Header + Payload)。如果数据不足返回 0，出错返回 -1
-long long check_ws_frame(unsigned char *in, int len, int *head_len, int *payload_len) {
-    if(len < 2) return 0;
-    
-    int hl = 2; 
-    unsigned long long pl = in[1] & 0x7F;
-
-    if (pl == 126) { 
-        if (len < 4) return 0; 
-        hl = 4; 
-        pl = ((unsigned long long)in[2] << 8) | in[3]; 
-    } 
-    else if (pl == 127) { 
-        if (len < 10) return 0; 
-        hl = 10; 
-        // 解析 64 位长度 (Big Endian)
-        pl = 0;
-        for(int i = 0; i < 8; i++) {
-            pl = (pl << 8) | in[2 + i];
-        }
-    }
-    
-    if (in[1] & 0x80) hl += 4; // Mask key present
-
-    // [安全检查] 检查包大小是否超过缓冲区限制
-    if (pl > BUFFER_SIZE) {
-        log_msg("[Err] WS Frame too large: %llu (Max: %d). Dropping connection.", pl, BUFFER_SIZE);
-        return -1; 
-    }
-
-    // 检查是否有足够的数据
-    if ((unsigned long long)len < (unsigned long long)hl + pl) return 0;
-    
-    *head_len = hl; 
-    *payload_len = (int)pl; // 安全转换为 int，因为上面已检查 pl <= BUFFER_SIZE
-    
-    return (long long)(hl + pl); 
-}
-
 // --- 客户端处理线程 (核心逻辑) ---
 DWORD WINAPI client_handler(LPVOID p) {
     SOCKET c = (SOCKET)(UINT_PTR)p; 
@@ -261,7 +221,7 @@ DWORD WINAPI client_handler(LPVOID p) {
     fd_set fds; struct timeval tv; u_long mode = 1;
     ioctlsocket(c, FIONBIO, &mode); ioctlsocket(r, FIONBIO, &mode);
     ws_buf_len = 0; int hl, pl;
-    long long frame_total; // 改为 long long 以匹配 check_ws_frame
+    long long frame_total;
     int vless_response_header_stripped = 0;
 
     while(1) {
@@ -317,10 +277,7 @@ DWORD WINAPI client_handler(LPVOID p) {
                                 payload_size -= head_size;
                                 vless_response_header_stripped = 1;
                             } else {
-                                // 数据包不足以剥离头部，这种情况下非常罕见。
-                                // 简单策略：本次丢弃，等待重试（实际应缓存）
-                                // 但由于 check_ws_frame 保证了帧完整性，这种情况意味着
-                                // 服务器在一个 WS 帧里发了不到完整的 VLESS 头，极不可能。
+                                // 极其罕见情况：包太小
                                 payload_size = 0; 
                             }
                         } else { payload_size = 0; }
@@ -332,7 +289,6 @@ DWORD WINAPI client_handler(LPVOID p) {
                 }
                 
                 // 移动缓冲区剩余数据
-                // frame_total 可能很大，确保 ws_buf_len 足够
                 if (frame_total < ws_buf_len) {
                     memmove(ws_read_buf, ws_read_buf + frame_total, ws_buf_len - frame_total);
                 }
