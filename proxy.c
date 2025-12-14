@@ -71,7 +71,7 @@ DWORD WINAPI client_handler(LPVOID p) {
     char method[16], host[256]; int port = 80; int is_connect_method = 0;
     
     // 简单的协议判断
-    if (c_buf[0] == 0x05) { send(c, "\x05\x00", 2, 0); goto cl_end; } // 不支持 SOCKS5 握手，直接关闭
+    if (c_buf[0] == 0x05) { send(c, "\x05\x00", 2, 0); goto cl_end; }
     else {
         if (sscanf(c_buf, "%15s %255s", method, host) == 2) {
             char *p = strchr(host, ':');
@@ -81,11 +81,13 @@ DWORD WINAPI client_handler(LPVOID p) {
         } else { goto cl_end; }
     }
     
-    // log_msg("[Access] %s %s:%d (%s)", method, host, port, g_proxyConfig.type);
-    
+    // --- [调试] 打印当前读取到的协议类型 ---
+    // 这行日志会告诉你程序到底读到了什么
+    // log_msg("[Debug] Processing connection. Node Type: '%s'", g_proxyConfig.type);
+
     // 连接远程代理服务器
     struct hostent *h = gethostbyname(g_proxyConfig.host);
-    if(!h) { log_msg("[DNS] Fail"); goto cl_end; }
+    if(!h) { log_msg("[DNS] Fail: %s", g_proxyConfig.host); goto cl_end; }
     
     r = socket(AF_INET, SOCK_STREAM, 0);
     if (r == INVALID_SOCKET) goto cl_end;
@@ -118,28 +120,33 @@ DWORD WINAPI client_handler(LPVOID p) {
     int len = tls_read(&tls, ws_read_buf, BUFFER_SIZE-1);
     if (len <= 0 || !strstr(ws_read_buf, "101 Switching Protocols")) { log_msg("[WS Error] Handshake failed"); goto cl_end; }
     
-    // --- 协议分流 ---
+    // --- 协议分流 (使用 _stricmp 忽略大小写) ---
     int flen = 0;
     unsigned char proto_buf[1024];
     int proto_len = 0;
+    
+    // 强制修正：如果 config 说是 vmess 但看起来像 VLESS，或者明确是 vless
+    BOOL is_vless = (_stricmp(g_proxyConfig.type, "vless") == 0);
+    BOOL is_trojan = (_stricmp(g_proxyConfig.type, "trojan") == 0);
+    BOOL is_vmess = (_stricmp(g_proxyConfig.type, "vmess") == 0);
 
-    if (strcmp(g_proxyConfig.type, "vless") == 0) {
-        // --- VLESS 协议封装 ---
+    if (is_vless) {
+        // --- VLESS 协议 ---
         proto_buf[proto_len++] = 0x00; // Version
-        parse_uuid(g_proxyConfig.user, proto_buf + proto_len); proto_len += 16; // UUID
-        proto_buf[proto_len++] = 0x00; // Addons Len (0)
-        proto_buf[proto_len++] = 0x01; // Command: TCP
+        parse_uuid(g_proxyConfig.user, proto_buf + proto_len); proto_len += 16; 
+        proto_buf[proto_len++] = 0x00; // Addons Len
+        proto_buf[proto_len++] = 0x01; // Cmd: TCP
         proto_buf[proto_len++] = (port >> 8) & 0xFF; 
         proto_buf[proto_len++] = port & 0xFF;        
-        proto_buf[proto_len++] = 0x03; // Address Type: Domain
+        proto_buf[proto_len++] = 0x03; // Type: Domain
         proto_buf[proto_len++] = (unsigned char)strlen(host);
         memcpy(proto_buf + proto_len, host, strlen(host)); proto_len += (int)strlen(host);
         
         flen = build_ws_frame((char*)proto_buf, proto_len, ws_send_buf);
         tls_write(&tls, ws_send_buf, flen);
 
-    } else if (strcmp(g_proxyConfig.type, "trojan") == 0) {
-        // --- Trojan 协议封装 ---
+    } else if (is_trojan) {
+        // --- Trojan 协议 ---
         char hex_pass[56 + 1];
         trojan_password_hash(g_proxyConfig.pass, hex_pass);
         
@@ -156,14 +163,16 @@ DWORD WINAPI client_handler(LPVOID p) {
         flen = build_ws_frame((char*)proto_buf, proto_len, ws_send_buf);
         tls_write(&tls, ws_send_buf, flen);
 
-    } else if (strcmp(g_proxyConfig.type, "vmess") == 0) {
-        // --- VMess 协议 (未实现) ---
-        log_msg("[Error] VMess protocol is not implemented in this lightweight client.");
-        log_msg("[Error] Please use VLESS or Trojan nodes instead.");
+    } else if (is_vmess) {
+        // --- VMess 协议 ---
+        log_msg("[Error] Config type is 'vmess', which is NOT supported.");
+        log_msg("[Error] Please checking your config.json or delete/re-import the node.");
+        log_msg("[Error] If this IS a VLESS node, your link must start with 'vless://'");
         goto cl_end;
 
     } else {
-        // --- 默认: Socks5 (兼容 Shadowsocks/Socks) ---
+        // --- 默认: Socks5 ---
+        // 兼容旧配置或 socks 类型
         char auth[] = {0x05, 0x01, 0x00};
         if (strlen(g_proxyConfig.user) > 0) auth[2] = 0x02;
         flen = build_ws_frame(auth, 3, ws_send_buf);
@@ -194,7 +203,7 @@ DWORD WINAPI client_handler(LPVOID p) {
         if (ws_read_payload_exact(&tls, resp_buf, 4) < 4 || resp_buf[1] != 0x00) goto cl_end;
     }
     
-    // 响应客户端 (本地浏览器)
+    // 响应浏览器
     if (is_connect_method) {
         const char *ok = "HTTP/1.1 200 Connection Established\r\n\r\n";
         send(c, ok, strlen(ok), 0);
@@ -203,7 +212,7 @@ DWORD WINAPI client_handler(LPVOID p) {
         tls_write(&tls, ws_send_buf, flen);
     }
     
-    // 进入数据转发循环
+    // 数据转发循环
     fd_set fds; struct timeval tv; u_long mode = 1;
     ioctlsocket(c, FIONBIO, &mode); ioctlsocket(r, FIONBIO, &mode);
     ws_buf_len = 0; int hl, pl, frame_total;
@@ -244,8 +253,7 @@ DWORD WINAPI client_handler(LPVOID p) {
                     char* payload_ptr = ws_read_buf + hl;
                     int payload_size = pl;
 
-                    // [VLESS 特殊处理] 剥离服务器返回的响应头
-                    if (strcmp(g_proxyConfig.type, "vless") == 0 && !vless_response_header_stripped) {
+                    if (is_vless && !vless_response_header_stripped) {
                         if (payload_size >= 2) {
                             int addon_len = (unsigned char)payload_ptr[1];
                             int head_size = 2 + addon_len;
@@ -274,50 +282,4 @@ cl_end:
     free(c_buf); free(ws_read_buf); free(ws_send_buf); tls_close(&tls);
     if (r != INVALID_SOCKET) closesocket(r); if (c != INVALID_SOCKET) closesocket(c);
     return 0;
-}
-
-// 代理监听主线程 (保持不变)
-DWORD WINAPI server_thread(LPVOID p) {
-    g_listen_sock = socket(AF_INET, SOCK_STREAM, 0);
-    struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET; addr.sin_port = htons(g_localPort);
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    
-    int opt = 1; setsockopt(g_listen_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
-    
-    if (bind(g_listen_sock, (struct sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
-        log_msg("Port %d bind fail", g_localPort); g_proxyRunning = FALSE; return 0;
-    }
-    
-    listen(g_listen_sock, 100);
-    log_msg("Proxy Started: 127.0.0.1:%d", g_localPort);
-    
-    while(g_proxyRunning) {
-        SOCKET c = accept(g_listen_sock, NULL, NULL);
-        if (c != INVALID_SOCKET) {
-            HANDLE hClient = CreateThread(NULL, 0, client_handler, (LPVOID)(UINT_PTR)c, 0, NULL);
-            if (hClient) {
-                CloseHandle(hClient);
-            } else {
-                log_msg("[Error] Failed to create client thread, dropping connection.");
-                closesocket(c);
-            }
-        }
-        else break;
-    }
-    return 0;
-}
-
-void StartProxyCore() {
-    if (g_proxyRunning) return;
-    g_proxyRunning = TRUE;
-    hProxyThread = CreateThread(NULL, 0, server_thread, NULL, 0, NULL);
-    if (!hProxyThread) { log_msg("CreateThread Failed"); g_proxyRunning = FALSE; }
-}
-
-void StopProxyCore() {
-    g_proxyRunning = FALSE;
-    if (g_listen_sock != INVALID_SOCKET) { closesocket(g_listen_sock); g_listen_sock = INVALID_SOCKET; }
-    if (hProxyThread) { WaitForSingleObject(hProxyThread, 2000); CloseHandle(hProxyThread); hProxyThread = NULL; }
-    log_msg("Proxy Stopped");
 }
