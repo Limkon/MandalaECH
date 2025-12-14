@@ -220,7 +220,17 @@ void ParseNodeConfigToGlobal(cJSON *node) {
         if(path && path->valuestring) strcpy(g_proxyConfig.path, path->valuestring);
     }
     if (strlen(g_proxyConfig.sni) == 0) strcpy(g_proxyConfig.sni, g_proxyConfig.host);
-    log_msg("Node Config Loaded: %s:%d (SNI: %s)", g_proxyConfig.host, g_proxyConfig.port, g_proxyConfig.sni);
+
+    // [修改] 解析并保存协议类型
+    cJSON *type = cJSON_GetObjectItem(node, "type");
+    if (type && type->valuestring) {
+        strncpy(g_proxyConfig.type, type->valuestring, 31);
+    } else {
+        strcpy(g_proxyConfig.type, "socks");
+    }
+
+    log_msg("Node Config Loaded: %s:%d (Type: %s, SNI: %s)", 
+        g_proxyConfig.host, g_proxyConfig.port, g_proxyConfig.type, g_proxyConfig.sni);
 }
 
 void SwitchNode(const wchar_t* tag) {
@@ -399,7 +409,6 @@ cJSON* ParseSocks(const char* link) {
     free(host); free(tag); free(decoded); return outbound;
 }
 
-// [增强修复] SS 解析: 同时支持 plugin 和直接参数解析
 cJSON* ParseShadowsocks(const char* link) {
     if (strncmp(link, "ss://", 5) != 0) return NULL;
     const char* p = link + 5; 
@@ -435,18 +444,15 @@ cJSON* ParseShadowsocks(const char* link) {
         const char* qStart = qMark + 1; size_t qLen = hash ? (size_t)(hash - qStart) : strlen(qStart);
         char* queryStr = (char*)malloc(qLen + 1); strncpy(queryStr, qStart, qLen); queryStr[qLen] = 0;
         
-        // 1. 尝试解析 Plugin (优先级高，或作为基础)
         char* pluginVal = GetQueryParam(queryStr, "plugin");
         if (pluginVal) { UrlDecode(pluginVal, pluginVal); ParseSSPlugin(outbound, pluginVal); free(pluginVal); }
 
-        // 2. 补充解析裸参 (兼容不带 plugin 的格式)
         char* directSni = GetQueryParam(queryStr, "sni");
         char* directHost = GetQueryParam(queryStr, "host"); if(!directHost) directHost = GetQueryParam(queryStr, "obfs-host");
         char* directPath = GetQueryParam(queryStr, "path");
         char* directMode = GetQueryParam(queryStr, "mode"); if(!directMode) directMode = GetQueryParam(queryStr, "type");
-        char* directSecurity = GetQueryParam(queryStr, "security"); // e.g., "tls"
+        char* directSecurity = GetQueryParam(queryStr, "security"); 
 
-        // 检查是否需要补充 TLS
         BOOL needTls = (directSecurity && strcmp(directSecurity, "tls") == 0) || directSni != NULL;
         if (needTls) {
             cJSON* tlsObj = GetOrCreateObj(outbound, "tls");
@@ -455,8 +461,6 @@ cJSON* ParseShadowsocks(const char* link) {
             else if (directHost && !cJSON_HasObjectItem(tlsObj, "server_name")) cJSON_AddStringToObject(tlsObj, "server_name", directHost);
         }
 
-        // 检查是否需要补充 Transport (如 WebSocket)
-        // 只有当 plugin 没设置 transport 或者裸参明确指定了 ws 时
         BOOL isWs = (directMode && strcmp(directMode, "ws") == 0);
         if (isWs) {
              cJSON* trans = GetOrCreateObj(outbound, "transport");
