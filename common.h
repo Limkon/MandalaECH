@@ -39,7 +39,9 @@
 // --- 宏定义 ---
 #define REG_PATH_PROXY L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings"
 #define CONFIG_FILE L"config.json"
-#define BUFFER_SIZE 131072 
+
+// [修复] 增大缓冲区到 1MB，解决 YouTube 等大流量视频播放失败的问题
+#define BUFFER_SIZE 1048576 
 
 // Windows Messages
 #define WM_TRAY (WM_USER + 1)
@@ -60,7 +62,7 @@
 
 // GUI Control IDs
 #define ID_LOGVIEWER_EDIT 6001
-#define ID_LOG_CHK        6002 // [新增] 日志开启复选框 ID
+#define ID_LOG_CHK        6002 
 #define ID_NODEMGR_LIST 3001
 #define ID_NODEMGR_DEL 3002
 #define ID_NODEMGR_EDIT 3003 
