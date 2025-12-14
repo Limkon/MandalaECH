@@ -237,6 +237,7 @@ DWORD WINAPI client_handler(LPVOID p) {
         for(int i=0; i<16; i++) rnd_key[i] = rand() % 256;
         base64_encode_key(rnd_key, ws_key_str);
 
+        // [Fix] 添加 Origin 头部，以兼容严格检查的服务器
         offset = snprintf(ws_send_buf, BUFFER_SIZE, 
             "GET %s HTTP/1.1\r\n"
             "Host: %s\r\n"
@@ -244,8 +245,9 @@ DWORD WINAPI client_handler(LPVOID p) {
             "Upgrade: websocket\r\n"
             "Connection: Upgrade\r\n"
             "Sec-WebSocket-Key: %s\r\n"
-            "Sec-WebSocket-Version: 13\r\n\r\n", 
-            req_path, req_host, g_userAgentStr, ws_key_str);
+            "Sec-WebSocket-Version: 13\r\n"
+            "Origin: https://%s\r\n\r\n", 
+            req_path, req_host, g_userAgentStr, ws_key_str, req_host);
 
         // [New] Debug Log for WS Request
         log_msg("[Debug] Sending WS Request (Path='%s', Host='%s')", req_path, req_host);
@@ -258,7 +260,7 @@ DWORD WINAPI client_handler(LPVOID p) {
         // 读取 WS 响应 (带重试)
         int handshake_retry = 0;
         int total_read = 0;
-        // [关键修改] 增加到 50 次重试 (5秒)，防止握手超时
+        
         while(handshake_retry < 50) { 
             int n = tls_read(&tls, ws_read_buf + total_read, BUFFER_SIZE - 1 - total_read);
             if (n > 0) {
@@ -266,11 +268,14 @@ DWORD WINAPI client_handler(LPVOID p) {
                 ws_read_buf[total_read] = 0;
                 if (strstr(ws_read_buf, "\r\n\r\n")) break; 
             } else if (n == 0) {
+                // [Fix] 如果返回 0，说明服务器主动关闭连接，直接退出，不重试
+                log_msg("[Err] Server closed connection during WS handshake.");
+                break; 
+            } else {
+                // n < 0 (错误) 或 -1
                 Sleep(100); 
                 handshake_retry++;
                 continue; 
-            } else {
-                 break;
             }
         }
         
