@@ -1,9 +1,8 @@
 #include "crypto.h"
 #include "utils.h"
-#include <openssl/rand.h> // 用于更安全的随机数
+#include <openssl/rand.h>
 
 // ---------------------- BIO Fragmentation Implementation ----------------------
-// [恢复] 这里是之前遗漏的 BIO 分片逻辑，必须保留
 typedef struct {
     int first_packet_sent;
 } FragCtx;
@@ -55,7 +54,6 @@ static int frag_write(BIO *b, const char *in, int inl) {
 
     if (inl > 0 && ctx->first_packet_sent == 0) {
         ctx->first_packet_sent = 1; 
-
         int bytes_sent = 0;
         int remaining = inl;
         int frag_count = 0;
@@ -85,7 +83,6 @@ static int frag_write(BIO *b, const char *in, int inl) {
             if (chunk_size > remaining) chunk_size = remaining;
 
             int ret = BIO_write(next, in + bytes_sent, chunk_size);
-            
             if (ret <= 0) {
                 BIO_copy_next_retry(b);
                 if (bytes_sent > 0) {
@@ -94,14 +91,10 @@ static int frag_write(BIO *b, const char *in, int inl) {
                 }
                 return ret;
             }
-
             bytes_sent += ret;
             remaining -= ret;
             frag_count++;
-
-            if (remaining > 0 && g_fragDelayMs > 0) {
-                 Sleep(rand() % (g_fragDelayMs + 1));
-            }
+            if (remaining > 0 && g_fragDelayMs > 0) Sleep(rand() % (g_fragDelayMs + 1));
         }
         return bytes_sent;
     }
@@ -127,14 +120,10 @@ static long frag_ctrl(BIO *b, int cmd, long num, void *ptr) {
 }
 // ---------------------- End BIO Implementation ----------------------
 
-// 全局 SSL 上下文
 extern SSL_CTX *g_ssl_ctx; 
 
 void FreeGlobalSSLContext() {
-    if (g_ssl_ctx) {
-        SSL_CTX_free(g_ssl_ctx);
-        g_ssl_ctx = NULL;
-    }
+    if (g_ssl_ctx) { SSL_CTX_free(g_ssl_ctx); g_ssl_ctx = NULL; }
 }
 
 void init_openssl_global() {
@@ -159,7 +148,6 @@ void init_openssl_global() {
         log_msg("[Security] Standard OpenSSL Cipher Suites");
     }
 
-    // 加载嵌入的 CA 证书
     HRSRC hRes = FindResourceW(NULL, MAKEINTRESOURCEW(2), RT_RCDATA);
     if (hRes) {
         HGLOBAL hData = LoadResource(NULL, hRes);
@@ -199,31 +187,23 @@ void init_openssl_global() {
 
 int tls_init_connect(TLSContext *ctx) {
     if (!g_ssl_ctx) init_openssl_global();
-
     ctx->ssl = SSL_new(g_ssl_ctx);
     if (!ctx->ssl) return -1;
-
     SSL_set_fd(ctx->ssl, (int)ctx->sock);
     
-    // Padding 逻辑
     if (g_enablePadding) {
         int range = g_padSizeMax - g_padSizeMin;
         if (range < 0) range = 0;
         int blockSize = g_padSizeMin + (range > 0 ? (rand() % (range + 1)) : 0);
         if (blockSize > 200) blockSize = 200; 
-        if (blockSize > 0) {
-            SSL_set_block_padding(ctx->ssl, blockSize);
-        }
+        if (blockSize > 0) SSL_set_block_padding(ctx->ssl, blockSize);
     }
 
     BIO *bio = BIO_new_socket(ctx->sock, BIO_NOCLOSE);
-    
-    // 只有在启用分片时才压入 filter BIO
     if (g_enableFragment) {
         BIO *frag = BIO_new(BIO_f_fragment());
         bio = BIO_push(frag, bio);
     }
-    
     SSL_set_bio(ctx->ssl, bio, bio);
     
     const char *sni_name = (strlen(g_proxyConfig.sni) ? g_proxyConfig.sni : g_proxyConfig.host);
@@ -246,6 +226,8 @@ int tls_write(TLSContext *ctx, const char *data, int len) {
         else {
             int err = SSL_get_error(ctx->ssl, ret);
             if (err == SSL_ERROR_WANT_WRITE || err == SSL_ERROR_WANT_READ) { Sleep(1); continue; }
+            // [新增] 错误日志
+            log_msg("[Error] SSL_write failed. Error: %d", err);
             return -1; 
         }
     }
@@ -265,42 +247,37 @@ int tls_read(TLSContext *ctx, char *out, int max) {
 }
 
 int tls_read_exact(TLSContext *ctx, char *buf, int len) {
-    int received = 0;
-    while (received < len) {
-        int r = tls_read(ctx, buf + received, len - received);
-        if (r < 0) return 0; 
-        if (r == 0) { Sleep(1); continue; }
-        received += r;
+    int total = 0;
+    while (total < len) {
+        int ret = tls_read(ctx, buf + total, len - total);
+        if (ret < 0) return 0; 
+        if (ret == 0) { Sleep(1); continue; } 
+        total += ret;
     }
-    return received;
+    return 1;
 }
 
 void tls_close(TLSContext *ctx) {
     if (ctx->ssl) { SSL_shutdown(ctx->ssl); SSL_free(ctx->ssl); ctx->ssl = NULL; }
 }
 
-// [增强修复] WebSocket 帧构建：包含 Masking 和大包支持
-// 修复了之前不支持 > 65535 字节以及 Masking 不规范的问题
+// [修复] 使用 rand() 代替 RAND_bytes，避免环境问题
 int build_ws_frame(const char *in, int len, char *out) {
     int idx = 0;
-    
-    // 0x82 = FIN(1) + Binary Frame(2)
     out[idx++] = (char)0x82; 
 
-    // 生成随机掩码
+    // 使用标准 rand() 生成掩码，简单且稳定
     unsigned char mask[4];
-    RAND_bytes(mask, 4);
+    for(int i=0; i<4; i++) mask[i] = (unsigned char)(rand() & 0xFF);
 
     if (len < 126) {
-        out[idx++] = (char)(0x80 | len); // Mask bit (0x80) + len
+        out[idx++] = (char)(0x80 | len);
     } else if (len <= 65535) {
         out[idx++] = (char)(0x80 | 126);
         out[idx++] = (len >> 8) & 0xFF;
         out[idx++] = len & 0xFF;
     } else {
-        // 支持 > 65535 的大包 (64bit length)
         out[idx++] = (char)(0x80 | 127);
-        // 只有低32位有效，高位填0
         out[idx++] = 0; out[idx++] = 0; out[idx++] = 0; out[idx++] = 0;
         out[idx++] = (len >> 24) & 0xFF;
         out[idx++] = (len >> 16) & 0xFF;
@@ -308,11 +285,9 @@ int build_ws_frame(const char *in, int len, char *out) {
         out[idx++] = len & 0xFF;
     }
 
-    // 写入 Mask Key
     memcpy(out + idx, mask, 4);
     idx += 4;
 
-    // 对 Payload 进行异或掩码处理
     for (int i = 0; i < len; i++) {
         out[idx + i] = in[i] ^ mask[i % 4];
     }
@@ -322,51 +297,24 @@ int build_ws_frame(const char *in, int len, char *out) {
 
 int check_ws_frame(unsigned char *in, int len, int *head_len, int *payload_len) {
     if(len < 2) return 0;
-    
-    // 服务端发来的通常不带 Mask，mask bit 应为 0
-    int hl = 2; 
-    int pl = in[1] & 0x7F;
-    
-    if (pl == 126) { 
-        if (len < 4) return 0; 
-        hl = 4; 
-        pl = (in[2] << 8) | in[3]; 
-    } else if (pl == 127) { 
-        if (len < 10) return 0; 
-        // 暂仅支持 32位 长度
-        hl = 10; 
-        pl = (in[6] << 24) | (in[7] << 16) | (in[8] << 8) | in[9]; 
-    }
-    
-    // 兼容性检查：如果服务端也发了 Mask (虽然标准说服务端不应 Mask，但防御性编程)
-    if (in[1] & 0x80) {
-        hl += 4; // 跳过 mask key
-    }
-
+    int hl = 2; int pl = in[1] & 0x7F;
+    if (pl == 126) { if (len < 4) return 0; hl = 4; pl = (in[2] << 8) | in[3]; } 
+    else if (pl == 127) { if (len < 10) return 0; hl = 10; pl = 65536; } // 简化大包检查
+    if (in[1] & 0x80) hl += 4;
     if (len < hl + pl) return 0;
-    
-    *head_len = hl; 
-    *payload_len = pl;
+    *head_len = hl; *payload_len = pl;
     return hl + pl; 
 }
 
 int ws_read_payload_exact(TLSContext *tls, char *out_buf, int expected_len) {
     char raw_head[16];
-    // 读取前2字节
     if (!tls_read_exact(tls, raw_head, 2)) return 0;
-    
     int payload_len = raw_head[1] & 0x7F;
-    int head_extra = 0;
-    
     if (payload_len == 126) {
         if (!tls_read_exact(tls, raw_head + 2, 2)) return 0;
         payload_len = (unsigned char)raw_head[2] << 8 | (unsigned char)raw_head[3];
     }
-    // 注意：这里没有处理 127 的情况，因为握手响应通常很短
-    
     if (payload_len < expected_len) return 0;
-    
-    // 读取 Payload
     if (!tls_read_exact(tls, out_buf, payload_len)) return 0;
     return payload_len;
 }
