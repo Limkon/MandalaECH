@@ -238,6 +238,7 @@ DWORD WINAPI client_handler(LPVOID p) {
         base64_encode_key(rnd_key, ws_key_str);
 
         // [Fix] 添加 Origin 头部，以兼容严格检查的服务器
+        // 关键修改：Origin: https://<host>
         offset = snprintf(ws_send_buf, BUFFER_SIZE, 
             "GET %s HTTP/1.1\r\n"
             "Host: %s\r\n"
@@ -249,7 +250,7 @@ DWORD WINAPI client_handler(LPVOID p) {
             "Origin: https://%s\r\n\r\n", 
             req_path, req_host, g_userAgentStr, ws_key_str, req_host);
 
-        // [New] Debug Log for WS Request
+        // [Debug] Log for WS Request
         log_msg("[Debug] Sending WS Request (Path='%s', Host='%s')", req_path, req_host);
 
         if (tls_write(&tls, ws_send_buf, offset) <= 0) {
@@ -269,7 +270,7 @@ DWORD WINAPI client_handler(LPVOID p) {
                 if (strstr(ws_read_buf, "\r\n\r\n")) break; 
             } else if (n == 0) {
                 // [Fix] 如果返回 0，说明服务器主动关闭连接，直接退出，不重试
-                log_msg("[Err] Server closed connection during WS handshake.");
+                log_msg("[Err] Server closed connection during WS handshake. Check Headers/Path.");
                 break; 
             } else {
                 // n < 0 (错误) 或 -1
