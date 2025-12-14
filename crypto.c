@@ -1,6 +1,7 @@
 #include "crypto.h"
 #include "utils.h"
 #include <openssl/rand.h>
+#include <openssl/err.h> // 引入 ERR 头文件
 
 // ---------------------- BIO Fragmentation Implementation ----------------------
 typedef struct {
@@ -133,14 +134,19 @@ void init_openssl_global() {
     SSL_load_error_strings();
     
     g_ssl_ctx = SSL_CTX_new(TLS_client_method());
-    if (!g_ssl_ctx) return;
+    if (!g_ssl_ctx) {
+        log_msg("[Fatal] SSL_CTX_new failed");
+        return;
+    }
 
     SSL_CTX_set_min_proto_version(g_ssl_ctx, TLS1_2_VERSION);
     SSL_CTX_set_max_proto_version(g_ssl_ctx, TLS1_3_VERSION);
 
     if (g_enableChromeCiphers) {
         const char *chrome_ciphers = "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-RSA-AES128-SHA";
-        SSL_CTX_set_cipher_list(g_ssl_ctx, chrome_ciphers);
+        if (SSL_CTX_set_cipher_list(g_ssl_ctx, chrome_ciphers) != 1) {
+             log_msg("[Warning] Failed to set Chrome ciphers");
+        }
         SSL_CTX_set_options(g_ssl_ctx, SSL_OP_NO_COMPRESSION | SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION);
         SSL_CTX_set_session_cache_mode(g_ssl_ctx, SSL_SESS_CACHE_CLIENT);
         log_msg("[Security] Chrome Cipher Suites Enabled");
@@ -188,7 +194,10 @@ void init_openssl_global() {
 int tls_init_connect(TLSContext *ctx) {
     if (!g_ssl_ctx) init_openssl_global();
     ctx->ssl = SSL_new(g_ssl_ctx);
-    if (!ctx->ssl) return -1;
+    if (!ctx->ssl) {
+        log_msg("[Err] SSL_new failed");
+        return -1;
+    }
     SSL_set_fd(ctx->ssl, (int)ctx->sock);
     
     if (g_enablePadding) {
@@ -213,8 +222,22 @@ int tls_init_connect(TLSContext *ctx) {
         unsigned char alpn_protos[] = { 8, 'h', 't', 't', 'p', '/', '1', '.', '1' };
         SSL_set_alpn_protos(ctx->ssl, alpn_protos, sizeof(alpn_protos));
     }
-
-    return (SSL_connect(ctx->ssl) == 1) ? 0 : -1;
+    
+    // [Debug] 增加详细的 SSL 连接日志
+    log_msg("[Debug] SSL_connect starting to %s...", sni_name);
+    int ret = SSL_connect(ctx->ssl);
+    if (ret == 1) {
+        log_msg("[Debug] SSL_connect Success. Cipher: %s", SSL_get_cipher_name(ctx->ssl));
+        return 0;
+    } else {
+        int err = SSL_get_error(ctx->ssl, ret);
+        unsigned long e = ERR_get_error();
+        log_msg("[Debug] SSL_connect Fail. Ret: %d, SSL Err: %d, Sys Err: %lu", ret, err, e);
+        char err_buf[256];
+        ERR_error_string_n(e, err_buf, sizeof(err_buf));
+        log_msg("[Debug] OpenSSL Error String: %s", err_buf);
+        return -1;
+    }
 }
 
 int tls_write(TLSContext *ctx, const char *data, int len) {
@@ -239,7 +262,7 @@ int tls_read(TLSContext *ctx, char *out, int max) {
     if (ret <= 0) {
         int err = SSL_get_error(ctx->ssl, ret);
         if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) return 0;
-        if (err == SSL_ERROR_ZERO_RETURN) return -1;
+        if (err == SSL_ERROR_ZERO_RETURN) return -1; // Connection closed
         return -1;
     }
     return ret;
@@ -260,12 +283,10 @@ void tls_close(TLSContext *ctx) {
     if (ctx->ssl) { SSL_shutdown(ctx->ssl); SSL_free(ctx->ssl); ctx->ssl = NULL; }
 }
 
-// [更新] 使用 rand() 代替 RAND_bytes，避免环境问题
 int build_ws_frame(const char *in, int len, char *out) {
     int idx = 0;
     out[idx++] = (char)0x82; 
 
-    // 使用标准 rand() 生成掩码，简单且稳定
     unsigned char mask[4];
     for(int i=0; i<4; i++) mask[i] = (unsigned char)(rand() & 0xFF);
 
@@ -294,7 +315,6 @@ int build_ws_frame(const char *in, int len, char *out) {
     return idx + len;
 }
 
-// [更新] 正确解析 64 位长度 WebSocket 帧
 long long check_ws_frame(unsigned char *in, int len, int *head_len, int *payload_len) {
     if(len < 2) return 0;
     
@@ -309,22 +329,19 @@ long long check_ws_frame(unsigned char *in, int len, int *head_len, int *payload
     else if (pl == 127) { 
         if (len < 10) return 0; 
         hl = 10; 
-        // 解析 64 位长度 (Big Endian)
         pl = 0;
         for(int i = 0; i < 8; i++) {
             pl = (pl << 8) | in[2 + i];
         }
     }
     
-    if (in[1] & 0x80) hl += 4; // Mask key present
+    if (in[1] & 0x80) hl += 4; 
 
-    // [安全检查] 检查包大小是否超过缓冲区限制 (BUFFER_SIZE from common.h)
     if (pl > BUFFER_SIZE) {
         log_msg("[Err] WS Frame too large: %llu (Max: %d). Dropping connection.", pl, BUFFER_SIZE);
         return -1; 
     }
 
-    // 检查是否有足够的数据
     if ((unsigned long long)len < (unsigned long long)hl + pl) return 0;
     
     *head_len = hl; 
