@@ -60,6 +60,7 @@
 
 // GUI Control IDs
 #define ID_LOGVIEWER_EDIT 6001
+#define ID_LOG_CHK        6002 // [新增] 日志开启复选框 ID
 #define ID_NODEMGR_LIST 3001
 #define ID_NODEMGR_DEL 3002
 #define ID_NODEMGR_EDIT 3003 
@@ -104,7 +105,7 @@ typedef struct {
     char sni[256]; 
     char user[128]; 
     char pass[128];
-    char type[32]; // [新增] 用于存储协议类型 (vless, trojan, vmess, socks)
+    char type[32]; 
 } ProxyConfig;
 
 // --- 全局变量声明 (extern) ---
@@ -148,5 +149,8 @@ extern char g_userAgentStr[512];
 
 extern const wchar_t* UA_PLATFORMS[];
 extern const char* UA_TEMPLATES[];
+
+// [新增] 日志开关
+extern BOOL g_enableLog;
 
 #endif // COMMON_H
