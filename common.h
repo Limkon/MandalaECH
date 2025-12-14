@@ -40,7 +40,7 @@
 #define REG_PATH_PROXY L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings"
 #define CONFIG_FILE L"config.json"
 
-// [重要修改] 将缓冲区增大到 8MB 以支持 YouTube 高清视频流
+// [关键修改] 增大缓冲区到 8MB，解决 YouTube 视频播放中断问题
 #define BUFFER_SIZE 8388608 
 
 // Windows Messages
