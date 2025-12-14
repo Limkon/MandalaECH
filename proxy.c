@@ -111,13 +111,7 @@ DWORD WINAPI client_handler(LPVOID p) {
     
     log_msg("[Access] %s %s:%d (%s)", method, host, port, g_proxyConfig.type);
 
-    // [Shadowsocks 检查]
-    if (_stricmp(g_proxyConfig.type, "shadowsocks") == 0) {
-        log_msg("[Err] Shadowsocks protocol is not fully supported yet (Missing crypto).");
-        // 可以在此直接返回，或者尝试走 Socks5 (如果用户配置的其实是 SS 伪装的 Socks)
-        // 为避免混淆，暂时中断
-        goto cl_end;
-    }
+    // [Shadowsocks 检查已移除，整合至下方协议处理流程]
 
     // 2. DNS 解析与连接代理服务器
     struct hostent *h = gethostbyname(g_proxyConfig.host);
@@ -156,13 +150,16 @@ DWORD WINAPI client_handler(LPVOID p) {
     int len = tls_read(&tls, ws_read_buf, BUFFER_SIZE-1);
     if (len <= 0 || !strstr(ws_read_buf, "101")) { log_msg("[Err] WS Handshake Fail (Not 101)"); goto cl_end; }
     
-    // 5. 发送代理协议请求头 (VLESS/Trojan/Socks)
+    // 5. 发送代理协议请求头 (VLESS/Trojan/Socks/Shadowsocks)
     int flen = 0;
     unsigned char proto_buf[1024];
     int proto_len = 0;
     
     BOOL is_vless = (_stricmp(g_proxyConfig.type, "vless") == 0);
     BOOL is_trojan = (_stricmp(g_proxyConfig.type, "trojan") == 0);
+    BOOL is_shadowsocks = (_stricmp(g_proxyConfig.type, "shadowsocks") == 0);
+
+    struct in_addr ip4; struct in6_addr ip6;
 
     if (is_vless) {
         // [VLESS Request]
@@ -172,8 +169,6 @@ DWORD WINAPI client_handler(LPVOID p) {
         proto_buf[proto_len++] = 0x01; // Cmd: TCP
         proto_buf[proto_len++] = (port >> 8) & 0xFF; proto_buf[proto_len++] = port & 0xFF;        
         
-        // 智能地址类型判断
-        struct in_addr ip4; struct in6_addr ip6;
         if (inet_pton(AF_INET, host, &ip4) == 1) {
             proto_buf[proto_len++] = 0x01; memcpy(proto_buf + proto_len, &ip4, 4); proto_len += 4;
         } else if (inet_pton(AF_INET6, host, &ip6) == 1) {
@@ -192,7 +187,6 @@ DWORD WINAPI client_handler(LPVOID p) {
         proto_buf[proto_len++] = 0x0D; proto_buf[proto_len++] = 0x0A;
         proto_buf[proto_len++] = 0x01; // TCP
         
-        struct in_addr ip4; struct in6_addr ip6;
         if (inet_pton(AF_INET, host, &ip4) == 1) {
              proto_buf[proto_len++] = 0x01; memcpy(proto_buf + proto_len, &ip4, 4); proto_len += 4;
         } else if (inet_pton(AF_INET6, host, &ip6) == 1) {
@@ -203,6 +197,24 @@ DWORD WINAPI client_handler(LPVOID p) {
         }
         proto_buf[proto_len++] = (port >> 8) & 0xFF; proto_buf[proto_len++] = port & 0xFF;
         proto_buf[proto_len++] = 0x0D; proto_buf[proto_len++] = 0x0A;
+        flen = build_ws_frame((char*)proto_buf, proto_len, ws_send_buf);
+        tls_write(&tls, ws_send_buf, flen);
+
+    } else if (is_shadowsocks) {
+        // [Shadowsocks Request]
+        // 格式: [AddrType][Addr][Port]
+        // 注意: 标准SS需要在此处加密(AEAD)。此处实现的是 SS-over-TLS (Method: none/plain) 协议结构。
+        
+        if (inet_pton(AF_INET, host, &ip4) == 1) {
+             proto_buf[proto_len++] = 0x01; memcpy(proto_buf + proto_len, &ip4, 4); proto_len += 4;
+        } else if (inet_pton(AF_INET6, host, &ip6) == 1) {
+             proto_buf[proto_len++] = 0x04; memcpy(proto_buf + proto_len, &ip6, 16); proto_len += 16;
+        } else {
+             proto_buf[proto_len++] = 0x03; proto_buf[proto_len++] = (unsigned char)strlen(host);
+             memcpy(proto_buf + proto_len, host, strlen(host)); proto_len += strlen(host);
+        }
+        proto_buf[proto_len++] = (port >> 8) & 0xFF; proto_buf[proto_len++] = port & 0xFF;
+        
         flen = build_ws_frame((char*)proto_buf, proto_len, ws_send_buf);
         tls_write(&tls, ws_send_buf, flen);
 
@@ -244,7 +256,6 @@ DWORD WINAPI client_handler(LPVOID p) {
         unsigned char socks_req[512]; int slen = 0;
         socks_req[slen++] = 0x05; socks_req[slen++] = 0x01; socks_req[slen++] = 0x00; 
         
-        struct in_addr ip4; struct in6_addr ip6;
         if (inet_pton(AF_INET, host, &ip4) == 1) {
             socks_req[slen++] = 0x01; memcpy(socks_req + slen, &ip4, 4); slen += 4;
         } else if (inet_pton(AF_INET6, host, &ip6) == 1) {
@@ -259,8 +270,6 @@ DWORD WINAPI client_handler(LPVOID p) {
         tls_write(&tls, ws_send_buf, flen);
         
         // 4. 读取 Connect 响应 (完整读取)
-        // ws_read_payload_exact 会读取并丢弃整个 WebSocket 帧的 Payload，我们只需要确认它成功读取即可
-        // 响应长度通常是 10 字节以上
         if (ws_read_payload_exact(&tls, resp_buf, 4) == 0) { log_msg("[Err] Socks5 Connect Read Fail"); goto cl_end; }
         if (resp_buf[1] != 0x00) { log_msg("[Err] Socks5 Connect Failed: %02X", resp_buf[1]); goto cl_end; }
     }
