@@ -192,7 +192,6 @@ void SaveEditedNode(HWND hWnd) {
         }
     } else {
         // 如果没有原始类型 (可能是新节点或读取失败)，则尝试推断
-        // 注意：这种推断在 VLESS/VMESS 之间容易混淆，但这是最后的手段
         if (strlen(user) > 20) {
             cJSON_AddStringToObject(newNode, "type", "vmess");
             cJSON_AddStringToObject(newNode, "uuid", user);
@@ -663,13 +662,38 @@ void OpenNodeEditWindow(const wchar_t* tag) {
     if(h) { ShowWindow(h, SW_SHOW); UpdateWindow(h); }
 }
 
+// [修改] 添加复选框控制日志开关
 LRESULT CALLBACK LogWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     static HWND hEdit;
+    static HWND hChk; // [新增]
+
     switch(msg) {
         case WM_CREATE:
-            hEdit = CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_VSCROLL|ES_MULTILINE|ES_READONLY, 0,0,0,0, hWnd, (HMENU)ID_LOGVIEWER_EDIT, NULL, NULL);
-            SendMessage(hEdit, WM_SETFONT, (WPARAM)hLogFont, 0); break;
-        case WM_SIZE: MoveWindow(hEdit, 0, 0, LOWORD(lParam), HIWORD(lParam), TRUE); break;
+            // [新增] 创建“开启日志记录”复选框，位于顶部
+            hChk = CreateWindowW(L"BUTTON", L"开启日志记录 (默认关闭)", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 
+                10, 5, 200, 20, hWnd, (HMENU)ID_LOG_CHK, NULL, NULL);
+            // 设置默认状态
+            SendMessage(hChk, BM_SETCHECK, g_enableLog ? BST_CHECKED : BST_UNCHECKED, 0);
+            SendMessage(hChk, WM_SETFONT, (WPARAM)hAppFont, 0);
+
+            // [修改] 创建编辑框，Y坐标下移 30px，避免遮挡
+            hEdit = CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_VSCROLL|ES_MULTILINE|ES_READONLY, 
+                0, 30, 0, 0, hWnd, (HMENU)ID_LOGVIEWER_EDIT, NULL, NULL);
+            SendMessage(hEdit, WM_SETFONT, (WPARAM)hLogFont, 0); 
+            break;
+
+        case WM_SIZE: 
+            // [修改] 调整编辑框大小，留出顶部 30px
+            MoveWindow(hEdit, 0, 30, LOWORD(lParam), HIWORD(lParam) - 30, TRUE); 
+            break;
+
+        case WM_COMMAND:
+            // [新增] 处理复选框点击事件
+            if (LOWORD(wParam) == ID_LOG_CHK) {
+                g_enableLog = (IsDlgButtonChecked(hWnd, ID_LOG_CHK) == BST_CHECKED);
+            }
+            break;
+
         case WM_LOG_UPDATE: {
             wchar_t* p = (wchar_t*)lParam; int len = GetWindowTextLength(hEdit);
             if (len > 30000) { SendMessage(hEdit, EM_SETSEL, 0, -1); SendMessage(hEdit, WM_CLEAR, 0, 0); }
