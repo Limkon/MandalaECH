@@ -226,7 +226,6 @@ int tls_write(TLSContext *ctx, const char *data, int len) {
         else {
             int err = SSL_get_error(ctx->ssl, ret);
             if (err == SSL_ERROR_WANT_WRITE || err == SSL_ERROR_WANT_READ) { Sleep(1); continue; }
-            // [新增] 错误日志
             log_msg("[Error] SSL_write failed. Error: %d", err);
             return -1; 
         }
@@ -261,7 +260,7 @@ void tls_close(TLSContext *ctx) {
     if (ctx->ssl) { SSL_shutdown(ctx->ssl); SSL_free(ctx->ssl); ctx->ssl = NULL; }
 }
 
-// [修复] 使用 rand() 代替 RAND_bytes，避免环境问题
+// [更新] 使用 rand() 代替 RAND_bytes，避免环境问题
 int build_ws_frame(const char *in, int len, char *out) {
     int idx = 0;
     out[idx++] = (char)0x82; 
@@ -295,15 +294,43 @@ int build_ws_frame(const char *in, int len, char *out) {
     return idx + len;
 }
 
-int check_ws_frame(unsigned char *in, int len, int *head_len, int *payload_len) {
+// [更新] 正确解析 64 位长度 WebSocket 帧
+long long check_ws_frame(unsigned char *in, int len, int *head_len, int *payload_len) {
     if(len < 2) return 0;
-    int hl = 2; int pl = in[1] & 0x7F;
-    if (pl == 126) { if (len < 4) return 0; hl = 4; pl = (in[2] << 8) | in[3]; } 
-    else if (pl == 127) { if (len < 10) return 0; hl = 10; pl = 65536; } // 简化大包检查
-    if (in[1] & 0x80) hl += 4;
-    if (len < hl + pl) return 0;
-    *head_len = hl; *payload_len = pl;
-    return hl + pl; 
+    
+    int hl = 2; 
+    unsigned long long pl = in[1] & 0x7F;
+
+    if (pl == 126) { 
+        if (len < 4) return 0; 
+        hl = 4; 
+        pl = ((unsigned long long)in[2] << 8) | in[3]; 
+    } 
+    else if (pl == 127) { 
+        if (len < 10) return 0; 
+        hl = 10; 
+        // 解析 64 位长度 (Big Endian)
+        pl = 0;
+        for(int i = 0; i < 8; i++) {
+            pl = (pl << 8) | in[2 + i];
+        }
+    }
+    
+    if (in[1] & 0x80) hl += 4; // Mask key present
+
+    // [安全检查] 检查包大小是否超过缓冲区限制 (BUFFER_SIZE from common.h)
+    if (pl > BUFFER_SIZE) {
+        log_msg("[Err] WS Frame too large: %llu (Max: %d). Dropping connection.", pl, BUFFER_SIZE);
+        return -1; 
+    }
+
+    // 检查是否有足够的数据
+    if ((unsigned long long)len < (unsigned long long)hl + pl) return 0;
+    
+    *head_len = hl; 
+    *payload_len = (int)pl; 
+    
+    return (long long)(hl + pl); 
 }
 
 int ws_read_payload_exact(TLSContext *tls, char *out_buf, int expected_len) {
