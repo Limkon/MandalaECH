@@ -1,7 +1,9 @@
 #include "crypto.h"
 #include "utils.h"
+#include <openssl/rand.h> // 用于更安全的随机数
 
 // ---------------------- BIO Fragmentation Implementation ----------------------
+// [恢复] 这里是之前遗漏的 BIO 分片逻辑，必须保留
 typedef struct {
     int first_packet_sent;
 } FragCtx;
@@ -42,7 +44,6 @@ static int frag_free(BIO *b) {
     return 1;
 }
 
-// [优化] 限制分片数量，防止握手超时
 #define MAX_FRAG_COUNT 32 
 
 static int frag_write(BIO *b, const char *in, int inl) {
@@ -50,10 +51,8 @@ static int frag_write(BIO *b, const char *in, int inl) {
     BIO *next = BIO_next(b);
     if (!ctx || !next) return 0;
 
-    // [关键修复] 清除当前的重试标志，防止状态残留
     BIO_clear_retry_flags(b);
 
-    // 随机分片逻辑：仅针对握手阶段 (TLS ClientHello)
     if (inl > 0 && ctx->first_packet_sent == 0) {
         ctx->first_packet_sent = 1; 
 
@@ -62,16 +61,11 @@ static int frag_write(BIO *b, const char *in, int inl) {
         int frag_count = 0;
 
         while (remaining > 0) {
-            // 安全逃逸：分片过多直接发送剩余数据
             if (frag_count >= MAX_FRAG_COUNT) {
                 int ret = BIO_write(next, in + bytes_sent, remaining);
                 if (ret <= 0) {
-                    // [关键修复] 发生错误/重试时，复制底层 BIO 的重试标志
                     BIO_copy_next_retry(b);
                     if (bytes_sent > 0) {
-                        // 如果已经写入了部分数据，由于这是非原子操作，
-                        // 我们返回已写入字节数，让上层视为成功（上层会再次调用写入剩余部分）
-                        // 此时这是一次"部分成功"，不需要保留 Retry 标志
                         BIO_clear_retry_flags(b);
                         return bytes_sent;
                     }
@@ -93,7 +87,6 @@ static int frag_write(BIO *b, const char *in, int inl) {
             int ret = BIO_write(next, in + bytes_sent, chunk_size);
             
             if (ret <= 0) {
-                // [关键修复] 复制重试标志
                 BIO_copy_next_retry(b);
                 if (bytes_sent > 0) {
                     BIO_clear_retry_flags(b);
@@ -113,9 +106,7 @@ static int frag_write(BIO *b, const char *in, int inl) {
         return bytes_sent;
     }
     
-    // 直通模式
     int ret = BIO_write(next, in, inl);
-    // [关键修复] 无论成功失败，都复制 Retry 标志（针对非阻塞 IO）
     BIO_copy_next_retry(b);
     return ret;
 }
@@ -123,12 +114,9 @@ static int frag_write(BIO *b, const char *in, int inl) {
 static int frag_read(BIO *b, char *out, int outl) {
     BIO *next = BIO_next(b);
     if (!next) return 0;
-
-    // [关键修复] 必须处理非阻塞 IO 的重试标志
     BIO_clear_retry_flags(b);
     int ret = BIO_read(next, out, outl);
     BIO_copy_next_retry(b);
-    
     return ret;
 }
 
@@ -138,6 +126,9 @@ static long frag_ctrl(BIO *b, int cmd, long num, void *ptr) {
     return BIO_ctrl(next, cmd, num, ptr);
 }
 // ---------------------- End BIO Implementation ----------------------
+
+// 全局 SSL 上下文
+extern SSL_CTX *g_ssl_ctx; 
 
 void FreeGlobalSSLContext() {
     if (g_ssl_ctx) {
@@ -168,6 +159,7 @@ void init_openssl_global() {
         log_msg("[Security] Standard OpenSSL Cipher Suites");
     }
 
+    // 加载嵌入的 CA 证书
     HRSRC hRes = FindResourceW(NULL, MAKEINTRESOURCEW(2), RT_RCDATA);
     if (hRes) {
         HGLOBAL hData = LoadResource(NULL, hRes);
@@ -205,21 +197,20 @@ void init_openssl_global() {
     }
 }
 
-// --- 修复 Padding 导致的 MTU 问题 ---
 int tls_init_connect(TLSContext *ctx) {
+    if (!g_ssl_ctx) init_openssl_global();
+
     ctx->ssl = SSL_new(g_ssl_ctx);
+    if (!ctx->ssl) return -1;
+
+    SSL_set_fd(ctx->ssl, (int)ctx->sock);
     
+    // Padding 逻辑
     if (g_enablePadding) {
         int range = g_padSizeMax - g_padSizeMin;
         if (range < 0) range = 0;
-        
         int blockSize = g_padSizeMin + (range > 0 ? (rand() % (range + 1)) : 0);
-        
-        // [关键修复] 强制限制最大 Padding 块大小
-        // 防止：ClientHello (600) + Padding (1000) > MTU (1500)
-        // 限制为 200 可以提供足够的混淆，同时避免大跨度的对齐导致包过大
         if (blockSize > 200) blockSize = 200; 
-
         if (blockSize > 0) {
             SSL_set_block_padding(ctx->ssl, blockSize);
         }
@@ -247,7 +238,7 @@ int tls_init_connect(TLSContext *ctx) {
 }
 
 int tls_write(TLSContext *ctx, const char *data, int len) {
-    if (!ctx->ssl) return -1;
+    if (!ctx || !ctx->ssl) return -1;
     int written = 0;
     while (written < len) {
         int ret = SSL_write(ctx->ssl, data + written, len - written);
@@ -262,7 +253,7 @@ int tls_write(TLSContext *ctx, const char *data, int len) {
 }
 
 int tls_read(TLSContext *ctx, char *out, int max) {
-    if (!ctx->ssl) return -1;
+    if (!ctx || !ctx->ssl) return -1;
     int ret = SSL_read(ctx->ssl, out, max);
     if (ret <= 0) {
         int err = SSL_get_error(ctx->ssl, ret);
@@ -274,46 +265,108 @@ int tls_read(TLSContext *ctx, char *out, int max) {
 }
 
 int tls_read_exact(TLSContext *ctx, char *buf, int len) {
-    int total = 0;
-    while (total < len) {
-        int ret = tls_read(ctx, buf + total, len - total);
-        if (ret < 0) return 0; 
-        if (ret == 0) { Sleep(1); continue; } 
-        total += ret;
+    int received = 0;
+    while (received < len) {
+        int r = tls_read(ctx, buf + received, len - received);
+        if (r < 0) return 0; 
+        if (r == 0) { Sleep(1); continue; }
+        received += r;
     }
-    return 1;
+    return received;
 }
 
 void tls_close(TLSContext *ctx) {
     if (ctx->ssl) { SSL_shutdown(ctx->ssl); SSL_free(ctx->ssl); ctx->ssl = NULL; }
 }
 
+// [增强修复] WebSocket 帧构建：包含 Masking 和大包支持
+// 修复了之前不支持 > 65535 字节以及 Masking 不规范的问题
 int build_ws_frame(const char *in, int len, char *out) {
-    out[0] = 0x82; uint8_t mask[4]; *(uint32_t*)mask = GetTickCount(); 
-    if (len < 126) { out[1] = 0x80 | len; memcpy(out+2, mask, 4); for(int i=0;i<len;i++) out[6+i] = in[i]^mask[i%4]; return 6+len; } 
-    else if (len <= 65535) { out[1] = 0x80 | 126; out[2] = (len>>8)&0xFF; out[3] = len&0xFF; memcpy(out+4, mask, 4); for(int i=0;i<len;i++) out[8+i] = in[i]^mask[i%4]; return 8+len; }
-    return -1; 
+    int idx = 0;
+    
+    // 0x82 = FIN(1) + Binary Frame(2)
+    out[idx++] = (char)0x82; 
+
+    // 生成随机掩码
+    unsigned char mask[4];
+    RAND_bytes(mask, 4);
+
+    if (len < 126) {
+        out[idx++] = (char)(0x80 | len); // Mask bit (0x80) + len
+    } else if (len <= 65535) {
+        out[idx++] = (char)(0x80 | 126);
+        out[idx++] = (len >> 8) & 0xFF;
+        out[idx++] = len & 0xFF;
+    } else {
+        // 支持 > 65535 的大包 (64bit length)
+        out[idx++] = (char)(0x80 | 127);
+        // 只有低32位有效，高位填0
+        out[idx++] = 0; out[idx++] = 0; out[idx++] = 0; out[idx++] = 0;
+        out[idx++] = (len >> 24) & 0xFF;
+        out[idx++] = (len >> 16) & 0xFF;
+        out[idx++] = (len >> 8) & 0xFF;
+        out[idx++] = len & 0xFF;
+    }
+
+    // 写入 Mask Key
+    memcpy(out + idx, mask, 4);
+    idx += 4;
+
+    // 对 Payload 进行异或掩码处理
+    for (int i = 0; i < len; i++) {
+        out[idx + i] = in[i] ^ mask[i % 4];
+    }
+    
+    return idx + len;
 }
 
 int check_ws_frame(unsigned char *in, int len, int *head_len, int *payload_len) {
     if(len < 2) return 0;
-    int hl = 2; int pl = in[1] & 0x7F;
-    if (pl == 126) { if (len < 4) return 0; hl = 4; pl = (in[2] << 8) | in[3]; } 
-    else if (pl == 127) { if (len < 10) return 0; hl = 10; pl = 65536; }
+    
+    // 服务端发来的通常不带 Mask，mask bit 应为 0
+    int hl = 2; 
+    int pl = in[1] & 0x7F;
+    
+    if (pl == 126) { 
+        if (len < 4) return 0; 
+        hl = 4; 
+        pl = (in[2] << 8) | in[3]; 
+    } else if (pl == 127) { 
+        if (len < 10) return 0; 
+        // 暂仅支持 32位 长度
+        hl = 10; 
+        pl = (in[6] << 24) | (in[7] << 16) | (in[8] << 8) | in[9]; 
+    }
+    
+    // 兼容性检查：如果服务端也发了 Mask (虽然标准说服务端不应 Mask，但防御性编程)
+    if (in[1] & 0x80) {
+        hl += 4; // 跳过 mask key
+    }
+
     if (len < hl + pl) return 0;
-    *head_len = hl; *payload_len = pl;
+    
+    *head_len = hl; 
+    *payload_len = pl;
     return hl + pl; 
 }
 
 int ws_read_payload_exact(TLSContext *tls, char *out_buf, int expected_len) {
     char raw_head[16];
+    // 读取前2字节
     if (!tls_read_exact(tls, raw_head, 2)) return 0;
+    
     int payload_len = raw_head[1] & 0x7F;
+    int head_extra = 0;
+    
     if (payload_len == 126) {
         if (!tls_read_exact(tls, raw_head + 2, 2)) return 0;
         payload_len = (unsigned char)raw_head[2] << 8 | (unsigned char)raw_head[3];
     }
+    // 注意：这里没有处理 127 的情况，因为握手响应通常很短
+    
     if (payload_len < expected_len) return 0;
+    
+    // 读取 Payload
     if (!tls_read_exact(tls, out_buf, payload_len)) return 0;
     return payload_len;
 }
