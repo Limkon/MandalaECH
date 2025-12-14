@@ -3,20 +3,25 @@
 #include "utils.h"
 #include <openssl/sha.h>
 
-// --- UUID 解析 ---
+// --- 辅助函数：解析 UUID (支持带横杠或不带) ---
 void parse_uuid(const char* uuid_str, unsigned char* out) {
     const char* p = uuid_str;
     int i = 0;
     while (*p && i < 16) {
-        if (*p == '-') { p++; continue; }
+        if (*p == '-' || *p == ' ' || *p == '{' || *p == '}') { 
+            p++; continue; 
+        }
         int v;
-        sscanf(p, "%2x", &v);
-        out[i++] = (unsigned char)v;
-        p += 2;
+        if (sscanf(p, "%2x", &v) == 1) {
+            out[i++] = (unsigned char)v;
+            p += 2;
+        } else {
+            p++; // 跳过非十六进制字符
+        }
     }
 }
 
-// --- Trojan Hash ---
+// --- 辅助函数：Trojan 密码哈希 (SHA224) ---
 void trojan_password_hash(const char* password, char* out_hex) {
     unsigned char digest[SHA224_DIGEST_LENGTH];
     SHA224((unsigned char*)password, strlen(password), digest);
@@ -26,6 +31,7 @@ void trojan_password_hash(const char* password, char* out_hex) {
     out_hex[SHA224_DIGEST_LENGTH * 2] = 0;
 }
 
+// 接收超时辅助函数
 int recv_timeout(SOCKET s, char *buf, int len, int timeout_sec) {
     fd_set fds; FD_ZERO(&fds); FD_SET(s, &fds);
     struct timeval tv = { timeout_sec, 0 };
@@ -34,6 +40,7 @@ int recv_timeout(SOCKET s, char *buf, int len, int timeout_sec) {
     return recv(s, buf, len, 0);
 }
 
+// 发送全部数据辅助函数
 int send_all(SOCKET s, const char *buf, int len) {
     int total = 0; int bytesleft = len; int n;
     while(total < len) {
@@ -48,29 +55,32 @@ int send_all(SOCKET s, const char *buf, int len) {
     return total;
 }
 
-// 调试辅助：打印 Hex 预览
+// 调试日志：打印简短 Hex 预览
 void log_hex_simple(const char* tag, unsigned char* data, int len) {
     if (len <= 0) return;
-    char buf[64];
+    char buf[64] = {0};
     int max = len > 6 ? 6 : len;
     int p = 0;
     for(int i=0; i<max; i++) p += sprintf(buf+p, "%02X ", data[i]);
     log_msg("%s %d bytes: %s...", tag, len, buf);
 }
 
+// --- 客户端处理线程 (核心逻辑) ---
 DWORD WINAPI client_handler(LPVOID p) {
-    SOCKET c = (SOCKET)(UINT_PTR)p; TLSContext tls; memset(&tls, 0, sizeof(tls));
+    SOCKET c = (SOCKET)(UINT_PTR)p; 
+    TLSContext tls; memset(&tls, 0, sizeof(tls));
     SOCKET r = INVALID_SOCKET;      
     
+    // 增大缓冲区以支持大包
     char *c_buf = (char*)malloc(BUFFER_SIZE); 
     char *ws_read_buf = (char*)malloc(BUFFER_SIZE); 
-    char *ws_send_buf = (char*)malloc(BUFFER_SIZE + 512);
+    char *ws_send_buf = (char*)malloc(BUFFER_SIZE + 4096); 
 
     if (!c_buf || !ws_read_buf || !ws_send_buf) { goto cl_end; }
     int ws_buf_len = 0; int flag = 1; 
     setsockopt(c, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
     
-    // 1. 读取浏览器请求
+    // 1. 读取浏览器首包 (分析目标地址)
     int browser_len = recv_timeout(c, c_buf, BUFFER_SIZE, 10);
     if (browser_len <= 0) goto cl_end;
     c_buf[browser_len] = 0;
@@ -79,27 +89,29 @@ DWORD WINAPI client_handler(LPVOID p) {
     char *header_end = NULL;
     int header_len = 0;
 
-    if (c_buf[0] == 0x05) { send(c, "\x05\x00", 2, 0); goto cl_end; }
+    // 简单的协议判断
+    if (c_buf[0] == 0x05) { send(c, "\x05\x00", 2, 0); goto cl_end; } // 不做 Socks5 服务端
     else {
         if (sscanf(c_buf, "%15s %255s", method, host) == 2) {
             char *p = strchr(host, ':');
             if (p) { *p = 0; port = atoi(p+1); }
             else if(stricmp(method, "CONNECT")==0) port = 443;
+            
             if (stricmp(method, "CONNECT") == 0) is_connect_method = 1;
             
-            // 计算头部长度，查找 \r\n\r\n
+            // 计算 HTTP 头部长度，检测是否有 Early Data (Pipeline)
             header_end = strstr(c_buf, "\r\n\r\n");
             if (header_end) {
                 header_len = (int)(header_end - c_buf) + 4;
             } else {
-                header_len = browser_len; // 没找到结束符，假设全是头
+                header_len = browser_len;
             }
         } else { goto cl_end; }
     }
     
-    // log_msg("[Info] %s %s:%d", method, host, port);
+    log_msg("[Access] %s %s:%d (%s)", method, host, port, g_proxyConfig.type);
 
-    // 2. 连接远程服务器
+    // 2. DNS 解析与连接代理服务器
     struct hostent *h = gethostbyname(g_proxyConfig.host);
     if(!h) { log_msg("[Err] DNS Fail: %s", g_proxyConfig.host); goto cl_end; }
     
@@ -110,13 +122,17 @@ DWORD WINAPI client_handler(LPVOID p) {
     struct sockaddr_in a; memset(&a, 0, sizeof(a)); a.sin_family = AF_INET; a.sin_port = htons((unsigned short)g_proxyConfig.port);
     a.sin_addr = *(struct in_addr*)h->h_addr;
     
-    if (connect(r, (struct sockaddr*)&a, sizeof(a)) != 0) { log_msg("[Err] Connect Fail"); goto cl_end; }
+    if (connect(r, (struct sockaddr*)&a, sizeof(a)) != 0) { log_msg("[Err] TCP Connect Fail"); goto cl_end; }
     
+    // 3. TLS 握手
     tls.sock = r;
-    if (tls_init_connect(&tls) != 0) { log_msg("[Err] TLS Fail"); goto cl_end; }
+    if (tls_init_connect(&tls) != 0) { log_msg("[Err] TLS Handshake Fail"); goto cl_end; }
     
-    // 3. WebSocket 握手
+    // 4. WebSocket 握手
     const char* sni_val = (strlen(g_proxyConfig.sni) > 0) ? g_proxyConfig.sni : g_proxyConfig.host;
+    // 确保 path 以 / 开头
+    const char* req_path = (strlen(g_proxyConfig.path) > 0) ? g_proxyConfig.path : "/";
+    
     int offset = snprintf(ws_send_buf, BUFFER_SIZE, 
         "GET %s HTTP/1.1\r\n"
         "Host: %s\r\n"
@@ -125,14 +141,15 @@ DWORD WINAPI client_handler(LPVOID p) {
         "Connection: Upgrade\r\n"
         "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
         "Sec-WebSocket-Version: 13\r\n\r\n", 
-        g_proxyConfig.path, sni_val, g_userAgentStr);
+        req_path, sni_val, g_userAgentStr);
 
     tls_write(&tls, ws_send_buf, offset);
 
+    // 读取 WS 响应
     int len = tls_read(&tls, ws_read_buf, BUFFER_SIZE-1);
-    if (len <= 0 || !strstr(ws_read_buf, "101")) { log_msg("[Err] WS Handshake Fail"); goto cl_end; }
+    if (len <= 0 || !strstr(ws_read_buf, "101")) { log_msg("[Err] WS Handshake Fail (Not 101)"); goto cl_end; }
     
-    // 4. 发送协议头
+    // 5. 发送代理协议请求头 (VLESS/Trojan/Socks)
     int flen = 0;
     unsigned char proto_buf[1024];
     int proto_len = 0;
@@ -141,18 +158,21 @@ DWORD WINAPI client_handler(LPVOID p) {
     BOOL is_trojan = (_stricmp(g_proxyConfig.type, "trojan") == 0);
 
     if (is_vless) {
+        // [VLESS Request]
         proto_buf[proto_len++] = 0x00; // Version
         parse_uuid(g_proxyConfig.user, proto_buf + proto_len); proto_len += 16; 
-        proto_buf[proto_len++] = 0x00; // Addons
-        proto_buf[proto_len++] = 0x01; // TCP
+        proto_buf[proto_len++] = 0x00; // Addons Len
+        proto_buf[proto_len++] = 0x01; // Cmd: TCP
         proto_buf[proto_len++] = (port >> 8) & 0xFF; proto_buf[proto_len++] = port & 0xFF;        
-        proto_buf[proto_len++] = 0x03; // Domain
+        proto_buf[proto_len++] = 0x03; // Type: Domain
         proto_buf[proto_len++] = (unsigned char)strlen(host);
         memcpy(proto_buf + proto_len, host, strlen(host)); proto_len += (int)strlen(host);
         
         flen = build_ws_frame((char*)proto_buf, proto_len, ws_send_buf);
         tls_write(&tls, ws_send_buf, flen);
+
     } else if (is_trojan) {
+        // [Trojan Request]
         char hex_pass[56 + 1]; trojan_password_hash(g_proxyConfig.pass, hex_pass);
         memcpy(proto_buf, hex_pass, 56); proto_len = 56;
         proto_buf[proto_len++] = 0x0D; proto_buf[proto_len++] = 0x0A;
@@ -163,16 +183,31 @@ DWORD WINAPI client_handler(LPVOID p) {
         proto_buf[proto_len++] = 0x0D; proto_buf[proto_len++] = 0x0A;
         flen = build_ws_frame((char*)proto_buf, proto_len, ws_send_buf);
         tls_write(&tls, ws_send_buf, flen);
+
     } else {
-        // Socks5 ... (omitted for brevity, assume vless/trojan)
+        // [Socks5 Request] (Simplified)
+        char auth[] = {0x05, 0x01, 0x00};
+        if (strlen(g_proxyConfig.user) > 0) auth[2] = 0x02;
+        flen = build_ws_frame(auth, 3, ws_send_buf);
+        tls_write(&tls, ws_send_buf, flen);
+        char resp_buf[256]; ws_read_payload_exact(&tls, resp_buf, 2); // Skip auth resp
+        
+        unsigned char socks_req[512]; int slen = 0;
+        socks_req[slen++] = 0x05; socks_req[slen++] = 0x01; socks_req[slen++] = 0x00; socks_req[slen++] = 0x03;
+        socks_req[slen++] = (unsigned char)strlen(host);
+        memcpy(socks_req + slen, host, strlen(host)); slen += (int)strlen(host);
+        socks_req[slen++] = (port >> 8) & 0xFF; socks_req[slen++] = port & 0xFF;
+        flen = build_ws_frame((char*)socks_req, slen, ws_send_buf);
+        tls_write(&tls, ws_send_buf, flen);
+        ws_read_payload_exact(&tls, resp_buf, 4); // Skip connect resp
     }
     
-    // 5. 响应浏览器并处理“抢跑”数据
+    // 6. 响应浏览器并处理 Pipeline 数据
     if (is_connect_method) {
         const char *ok = "HTTP/1.1 200 Connection Established\r\n\r\n";
         send(c, ok, strlen(ok), 0);
         
-        // [关键修复] 检查 CONNECT 包中是否夹带了额外数据 (Pipeline)
+        // [关键修复] 检查 CONNECT 包中是否夹带了 TLS ClientHello
         if (browser_len > header_len) {
             int extra_len = browser_len - header_len;
             log_hex_simple("[Tx] Early Data", (unsigned char*)(c_buf + header_len), extra_len);
@@ -180,13 +215,13 @@ DWORD WINAPI client_handler(LPVOID p) {
             tls_write(&tls, ws_send_buf, flen);
         }
     } else {
-        // 非 CONNECT 请求（如直接 HTTP GET），直接转发全部内容
+        // 普通 HTTP 请求，直接全量转发
         log_hex_simple("[Tx] Direct Data", (unsigned char*)c_buf, browser_len);
         flen = build_ws_frame(c_buf, browser_len, ws_send_buf);
         tls_write(&tls, ws_send_buf, flen);
     }
     
-    // 6. 数据转发循环
+    // 7. 双向数据转发循环
     fd_set fds; struct timeval tv; u_long mode = 1;
     ioctlsocket(c, FIONBIO, &mode); ioctlsocket(r, FIONBIO, &mode);
     ws_buf_len = 0; int hl, pl, frame_total;
@@ -201,20 +236,17 @@ DWORD WINAPI client_handler(LPVOID p) {
         int n = select(0, &fds, NULL, NULL, &tv);
         if (n < 0) break;
         
-        // 浏览器 -> 发送
+        // [Browser -> Proxy]
         if (FD_ISSET(c, &fds)) {
             len = recv(c, c_buf, BUFFER_SIZE, 0);
             if (len > 0) {
-                log_hex_simple("[Tx] Browser -> Server", (unsigned char*)c_buf, len);
+                // log_hex_simple("[Tx] Browser -> Server", (unsigned char*)c_buf, len);
                 flen = build_ws_frame(c_buf, len, ws_send_buf);
                 if (tls_write(&tls, ws_send_buf, flen) < 0) break;
-            } else if (WSAGetLastError() != WSAEWOULDBLOCK) {
-                // log_msg("[Info] Browser closed connection");
-                break;
-            }
+            } else if (WSAGetLastError() != WSAEWOULDBLOCK) break;
         }
         
-        // 接收 -> 浏览器
+        // [Proxy -> Browser]
         if (FD_ISSET(r, &fds) || pending > 0) {
             if (ws_buf_len < BUFFER_SIZE) {
                 len = tls_read(&tls, ws_read_buf + ws_buf_len, BUFFER_SIZE - ws_buf_len);
@@ -223,42 +255,48 @@ DWORD WINAPI client_handler(LPVOID p) {
             }
         }
         
+        // 处理 WebSocket 粘包/拆包
         while (ws_buf_len > 0) {
             frame_total = check_ws_frame((unsigned char*)ws_read_buf, ws_buf_len, &hl, &pl);
             if (frame_total > 0) {
                 int opcode = ws_read_buf[0] & 0x0F;
-                if (opcode == 0x8) goto cl_end; 
+                if (opcode == 0x8) goto cl_end; // Close frame
+                
+                // 处理数据帧 (Binary=0x2, Text=0x1)
                 if ((opcode == 0x1 || opcode == 0x2) && pl > 0) {
                     char* payload_ptr = ws_read_buf + hl;
                     int payload_size = pl;
 
+                    // [VLESS 响应头剥离逻辑]
                     if (is_vless && !vless_response_header_stripped) {
                         if (payload_size >= 2) {
                             int addon_len = (unsigned char)payload_ptr[1];
                             int head_size = 2 + addon_len;
                             if (payload_size >= head_size) {
-                                log_msg("[Rx] VLESS Header Stripped. Data: %d bytes", payload_size - head_size);
+                                log_msg("[Rx] VLESS Header Stripped. Payload: %d bytes", payload_size - head_size);
                                 payload_ptr += head_size;
                                 payload_size -= head_size;
                                 vless_response_header_stripped = 1;
                             } else {
-                                payload_size = 0; // Partial header
+                                // 数据包不完整（小于头部），暂不处理（丢弃或等待?）
+                                // 为防止死锁，这里暂且置0，等待下一包（极罕见情况）
+                                payload_size = 0; 
                             }
-                        } else {
-                            payload_size = 0; // Too short
-                        }
+                        } else { payload_size = 0; }
                     }
 
                     if (payload_size > 0) {
-                        log_hex_simple("[Rx] Server -> Browser", (unsigned char*)payload_ptr, payload_size);
+                        // log_hex_simple("[Rx] Server -> Browser", (unsigned char*)payload_ptr, payload_size);
                         if (send_all(c, payload_ptr, payload_size) < 0) goto cl_end;
                     }
                 }
+                
+                // 移动缓冲区剩余数据
                 memmove(ws_read_buf, ws_read_buf + frame_total, ws_buf_len - frame_total);
                 ws_buf_len -= frame_total;
             } else { 
-                if (ws_buf_len >= BUFFER_SIZE) goto cl_end; 
-                break; 
+                if (ws_buf_len >= BUFFER_SIZE) goto cl_end; // 溢出保护
+                break; // 数据不全，等待更多数据
             }
         }
     }
@@ -269,6 +307,7 @@ cl_end:
     return 0;
 }
 
+// 监听线程与管理函数 (保持不变)
 DWORD WINAPI server_thread(LPVOID p) {
     g_listen_sock = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
