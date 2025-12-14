@@ -48,7 +48,7 @@ int send_all(SOCKET s, const char *buf, int len) {
         if (n == -1) {
             int err = WSAGetLastError();
             if (err == WSAEWOULDBLOCK) { Sleep(1); continue; }
-            log_msg("[Err] send_all fail: %d", err); // [新增] 错误日志
+            log_msg("[Err] send_all fail: %d", err); 
             return -1;
         }
         total += n; bytesleft -= n;
@@ -163,9 +163,30 @@ DWORD WINAPI client_handler(LPVOID p) {
         proto_buf[proto_len++] = 0x00; // Addons Len
         proto_buf[proto_len++] = 0x01; // Cmd: TCP
         proto_buf[proto_len++] = (port >> 8) & 0xFF; proto_buf[proto_len++] = port & 0xFF;        
-        proto_buf[proto_len++] = 0x03; // Type: Domain
-        proto_buf[proto_len++] = (unsigned char)strlen(host);
-        memcpy(proto_buf + proto_len, host, strlen(host)); proto_len += (int)strlen(host);
+        
+        // [智能地址类型判断]
+        struct in_addr ip4;
+        struct in6_addr ip6;
+        
+        if (inet_pton(AF_INET, host, &ip4) == 1) {
+            // IPv4 (Type 1)
+            proto_buf[proto_len++] = 0x01; 
+            memcpy(proto_buf + proto_len, &ip4, 4); 
+            proto_len += 4;
+        } 
+        else if (inet_pton(AF_INET6, host, &ip6) == 1) {
+            // IPv6 (Type 3)
+            proto_buf[proto_len++] = 0x03; 
+            memcpy(proto_buf + proto_len, &ip6, 16); 
+            proto_len += 16;
+        } 
+        else {
+            // Domain (Type 2)
+            proto_buf[proto_len++] = 0x02; 
+            proto_buf[proto_len++] = (unsigned char)strlen(host);
+            memcpy(proto_buf + proto_len, host, strlen(host)); 
+            proto_len += (int)strlen(host);
+        }
         
         flen = build_ws_frame((char*)proto_buf, proto_len, ws_send_buf);
         tls_write(&tls, ws_send_buf, flen);
@@ -175,9 +196,25 @@ DWORD WINAPI client_handler(LPVOID p) {
         char hex_pass[56 + 1]; trojan_password_hash(g_proxyConfig.pass, hex_pass);
         memcpy(proto_buf, hex_pass, 56); proto_len = 56;
         proto_buf[proto_len++] = 0x0D; proto_buf[proto_len++] = 0x0A;
-        proto_buf[proto_len++] = 0x01; proto_buf[proto_len++] = 0x03;
-        proto_buf[proto_len++] = (unsigned char)strlen(host);
-        memcpy(proto_buf + proto_len, host, strlen(host)); proto_len += strlen(host);
+        proto_buf[proto_len++] = 0x01; // TCP
+        
+        // Trojan 的地址类型定义与 VLESS 略有不同：1=IPv4, 3=Domain, 4=IPv6
+        // 这里为了安全起见，我们对 Trojan 也做一个简单的智能判断
+        struct in_addr ip4;
+        struct in6_addr ip6;
+
+        if (inet_pton(AF_INET, host, &ip4) == 1) {
+             proto_buf[proto_len++] = 0x01; // IPv4
+             memcpy(proto_buf + proto_len, &ip4, 4); proto_len += 4;
+        } else if (inet_pton(AF_INET6, host, &ip6) == 1) {
+             proto_buf[proto_len++] = 0x04; // IPv6 (Trojan use 0x04)
+             memcpy(proto_buf + proto_len, &ip6, 16); proto_len += 16;
+        } else {
+             proto_buf[proto_len++] = 0x03; // Domain
+             proto_buf[proto_len++] = (unsigned char)strlen(host);
+             memcpy(proto_buf + proto_len, host, strlen(host)); proto_len += strlen(host);
+        }
+
         proto_buf[proto_len++] = (port >> 8) & 0xFF; proto_buf[proto_len++] = port & 0xFF;
         proto_buf[proto_len++] = 0x0D; proto_buf[proto_len++] = 0x0A;
         flen = build_ws_frame((char*)proto_buf, proto_len, ws_send_buf);
@@ -192,9 +229,24 @@ DWORD WINAPI client_handler(LPVOID p) {
         char resp_buf[256]; ws_read_payload_exact(&tls, resp_buf, 2); 
         
         unsigned char socks_req[512]; int slen = 0;
-        socks_req[slen++] = 0x05; socks_req[slen++] = 0x01; socks_req[slen++] = 0x00; socks_req[slen++] = 0x03;
-        socks_req[slen++] = (unsigned char)strlen(host);
-        memcpy(socks_req + slen, host, strlen(host)); slen += (int)strlen(host);
+        socks_req[slen++] = 0x05; socks_req[slen++] = 0x01; socks_req[slen++] = 0x00; 
+        
+        // Socks5 也支持 IPv4/IPv6/Domain
+        struct in_addr ip4;
+        struct in6_addr ip6;
+        
+        if (inet_pton(AF_INET, host, &ip4) == 1) {
+            socks_req[slen++] = 0x01; // IPv4
+            memcpy(socks_req + slen, &ip4, 4); slen += 4;
+        } else if (inet_pton(AF_INET6, host, &ip6) == 1) {
+            socks_req[slen++] = 0x04; // IPv6
+            memcpy(socks_req + slen, &ip6, 16); slen += 16;
+        } else {
+            socks_req[slen++] = 0x03; // Domain
+            socks_req[slen++] = (unsigned char)strlen(host);
+            memcpy(socks_req + slen, host, strlen(host)); slen += (int)strlen(host);
+        }
+
         socks_req[slen++] = (port >> 8) & 0xFF; socks_req[slen++] = port & 0xFF;
         flen = build_ws_frame((char*)socks_req, slen, ws_send_buf);
         tls_write(&tls, ws_send_buf, flen);
@@ -229,9 +281,6 @@ DWORD WINAPI client_handler(LPVOID p) {
         FD_ZERO(&fds); FD_SET(c, &fds); FD_SET(r, &fds);
         int pending = SSL_pending(tls.ssl);
         tv.tv_sec = 1; tv.tv_usec = 0;
-        
-        // [修复] 只有在 OpenSSL 有缓冲数据时才跳过 select 等待
-        // 如果 ws_buf_len > 0 但不足一帧，我们需要等待网络数据，所以不能设为 0
         if (pending > 0) { tv.tv_sec = 0; tv.tv_usec = 0; }
         
         int n = select(0, &fds, NULL, NULL, &tv);
@@ -241,16 +290,13 @@ DWORD WINAPI client_handler(LPVOID p) {
         if (FD_ISSET(c, &fds)) {
             len = recv(c, c_buf, BUFFER_SIZE, 0);
             if (len > 0) {
-                // [启用调试日志] 查看浏览器发送的数据
-                log_hex_simple("[Tx] Browser -> Server", (unsigned char*)c_buf, len);
-                
+                // log_hex_simple("[Tx] Browser -> Server", (unsigned char*)c_buf, len);
                 flen = build_ws_frame(c_buf, len, ws_send_buf);
                 if (tls_write(&tls, ws_send_buf, flen) < 0) {
                     log_msg("[Err] TLS Write Failed");
                     break;
                 }
             } else if (len == 0) {
-                // log_msg("[Info] Browser closed connection");
                 break;
             } else if (WSAGetLastError() != WSAEWOULDBLOCK) {
                 log_msg("[Err] Recv Error: %d", WSAGetLastError());
@@ -260,7 +306,6 @@ DWORD WINAPI client_handler(LPVOID p) {
         
         // [Proxy -> Browser]
         if (FD_ISSET(r, &fds) || pending > 0) {
-            // 只有当缓冲区未满时才读取
             if (ws_buf_len < BUFFER_SIZE) {
                 len = tls_read(&tls, ws_read_buf + ws_buf_len, BUFFER_SIZE - ws_buf_len);
                 if (len > 0) {
@@ -275,7 +320,7 @@ DWORD WINAPI client_handler(LPVOID p) {
             frame_total = check_ws_frame((unsigned char*)ws_read_buf, ws_buf_len, &hl, &pl);
             
             if (frame_total < 0) {
-                log_msg("[Err] WS Frame check failed (Size mismatch or corrupted)");
+                log_msg("[Err] WS Frame check failed");
                 goto cl_end; 
             }
 
@@ -294,20 +339,17 @@ DWORD WINAPI client_handler(LPVOID p) {
                             int addon_len = (unsigned char)payload_ptr[1];
                             int head_size = 2 + addon_len;
                             if (payload_size >= head_size) {
-                                log_msg("[Rx] VLESS Header Stripped. Payload: %d bytes (Head: %d)", payload_size - head_size, head_size);
+                                log_msg("[Rx] VLESS Header Stripped. Payload: %d bytes", payload_size - head_size);
                                 payload_ptr += head_size;
                                 payload_size -= head_size;
                                 vless_response_header_stripped = 1;
                             } else {
-                                // 极其罕见情况：包太小，可能是分片了
-                                // 这里先丢弃本次处理，等待下一帧（虽然 VLESS 头几乎不会跨帧）
                                 payload_size = 0; 
                             }
                         } else { payload_size = 0; }
                     }
 
                     if (payload_size > 0) {
-                        // log_hex_simple("[Rx] Server -> Browser", (unsigned char*)payload_ptr, payload_size);
                         if (send_all(c, payload_ptr, payload_size) < 0) {
                             log_msg("[Err] Send to Browser failed");
                             goto cl_end;
