@@ -12,6 +12,8 @@ int g_subCount = 0;
 // --- 内部辅助函数声明 ---
 int Internal_BatchAddNodesFromText(const char* text, cJSON* outbounds);
 char* GetUniqueTagName(cJSON* outbounds, const char* type, const char* base_name);
+// [新增] 前向声明，以防头文件未更新
+cJSON* ParseMandala(const char* link);
 
 // --- 辅助：安全获取或创建 JSON 对象 ---
 static cJSON* GetOrCreateObj(cJSON* parent, const char* name) {
@@ -92,7 +94,6 @@ void LoadSettings() {
     if (wcslen(wUABuf) > 5) WideCharToMultiByte(CP_UTF8, 0, wUABuf, -1, g_userAgentStr, sizeof(g_userAgentStr), NULL, NULL);
     else strcpy(g_userAgentStr, UA_TEMPLATES[0]);
 
-    // [新增] 读取上次选择的节点
     GetPrivateProfileStringW(L"Settings", L"LastNode", L"", currentNode, 64, g_iniFilePath);
 
     g_subCount = GetPrivateProfileIntW(L"Subscriptions", L"Count", 0, g_iniFilePath);
@@ -125,7 +126,6 @@ void SaveSettings() {
     wchar_t wUABuf[512] = {0}; MultiByteToWideChar(CP_UTF8, 0, g_userAgentStr, -1, wUABuf, 512);
     WritePrivateProfileStringW(L"Settings", L"UserAgent", wUABuf, g_iniFilePath);
 
-    // [新增] 保存当前选择的节点
     WritePrivateProfileStringW(L"Settings", L"LastNode", currentNode, g_iniFilePath);
 
     WritePrivateProfileStringW(L"Subscriptions", NULL, NULL, g_iniFilePath);
@@ -317,6 +317,7 @@ int Internal_BatchAddNodesFromText(const char* text, cJSON* outbounds) {
             else if (_strnicmp(line, "vless://", 8) == 0) node = ParseVlessOrTrojan(line);
             else if (_strnicmp(line, "trojan://", 9) == 0) node = ParseVlessOrTrojan(line);
             else if (_strnicmp(line, "socks://", 8) == 0) node = ParseSocks(line);
+            else if (_strnicmp(line, "mandala://", 10) == 0) node = ParseMandala(line); // [新增]
             if (node) {
                 cJSON* jsonType = cJSON_GetObjectItem(node, "type");
                 const char* typeStr = (jsonType && jsonType->valuestring) ? jsonType->valuestring : "proxy";
@@ -325,7 +326,7 @@ int Internal_BatchAddNodesFromText(const char* text, cJSON* outbounds) {
                 char* uniqueTag = GetUniqueTagName(outbounds, typeStr, originalTag);
                 if (cJSON_HasObjectItem(node, "tag")) cJSON_ReplaceItemInObject(node, "tag", cJSON_CreateString(uniqueTag));
                 else cJSON_AddStringToObject(node, "tag", uniqueTag);
-                cJSON_AddItemToArray(outbounds, node); count++;
+                cJSON_AddItemToArray(outbounds, newNode); count++;
             }
         }
         line = strtok_s(NULL, "\r\n ,", &context);
@@ -563,4 +564,88 @@ cJSON* ParseVlessOrTrojan(const char* link) {
     }
     if (security) free(security);
     free(uuid); free(host); free(tag); return outbound;
+}
+
+// [新增] Mandala 链接解析函数
+cJSON* ParseMandala(const char* link) {
+    if (strncmp(link, "mandala://", 10) != 0) return NULL;
+    
+    // 格式: mandala://uuid@host:port?params#remark
+    const char* p = link + 10; 
+    const char* at = strchr(p, '@'); 
+    if (!at) return NULL;
+
+    // 1. 提取 UUID (作为密码)
+    int uuidLen = (int)(at - p); 
+    char* uuid = (char*)malloc(uuidLen + 1); 
+    strncpy(uuid, p, uuidLen); 
+    uuid[uuidLen] = 0;
+
+    // 2. 提取 Host 和 Port
+    p = at + 1; 
+    const char* colon = strchr(p, ':'); 
+    const char* qMark = strchr(p, '?'); 
+    const char* hash = strchr(p, '#');
+    
+    const char* portStart = colon ? colon + 1 : NULL; 
+    const char* hostEnd = colon ? colon : (qMark ? qMark : (hash ? hash : p + strlen(p)));
+    
+    int hostLen = (int)(hostEnd - p); 
+    char* host = (char*)malloc(hostLen + 1); 
+    strncpy(host, p, hostLen); 
+    host[hostLen] = 0;
+    
+    int portNum = portStart ? atoi(portStart) : 443;
+
+    // 3. 提取 Tag (备注)
+    char* tag = hash ? (char*)malloc(strlen(hash+1)+1) : strdup("Mandala");
+    if(hash) UrlDecode(tag, hash+1);
+
+    // 4. 构建 JSON
+    cJSON* outbound = cJSON_CreateObject();
+    cJSON_AddStringToObject(outbound, "type", "mandala"); // 类型标记为 mandala
+    cJSON_AddStringToObject(outbound, "tag", tag);
+    cJSON_AddStringToObject(outbound, "server", host); 
+    cJSON_AddNumberToObject(outbound, "server_port", portNum);
+    cJSON_AddStringToObject(outbound, "password", uuid); // Mandala 使用 password 字段存储 ID
+
+    // 5. 解析参数
+    const char* query = qMark ? qMark + 1 : NULL;
+    
+    // 解析 WebSocket
+    char* type = GetQueryParam(query, "type");
+    if (type && strcmp(type, "ws") == 0) {
+        cJSON* t = cJSON_CreateObject(); 
+        cJSON_AddStringToObject(t, "type", "ws");
+        
+        char* path = GetQueryParam(query, "path");
+        if (path) { cJSON_AddStringToObject(t, "path", path); free(path); }
+        
+        char* hHeader = GetQueryParam(query, "host");
+        if (hHeader) {
+            cJSON* headers = cJSON_CreateObject(); 
+            cJSON_AddStringToObject(headers, "Host", hHeader);
+            cJSON_AddItemToObject(t, "headers", headers); 
+            free(hHeader);
+        }
+        cJSON_AddItemToObject(outbound, "transport", t);
+    }
+    if (type) free(type);
+
+    // 解析 TLS
+    char* security = GetQueryParam(query, "security");
+    if (security && strcmp(security, "tls") == 0) {
+        cJSON* tlsObj = cJSON_CreateObject(); 
+        cJSON_AddBoolToObject(tlsObj, "enabled", cJSON_True);
+        
+        char* sni = GetQueryParam(query, "sni");
+        if (sni) { cJSON_AddStringToObject(tlsObj, "server_name", sni); free(sni); }
+        else cJSON_AddStringToObject(tlsObj, "server_name", host);
+        
+        cJSON_AddItemToObject(outbound, "tls", tlsObj);
+    }
+    if (security) free(security);
+
+    free(uuid); free(host); free(tag); 
+    return outbound;
 }
