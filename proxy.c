@@ -111,12 +111,13 @@ DWORD WINAPI client_handler(LPVOID p) {
     int len;
 
     int flen = 0;
-    unsigned char proto_buf[1024];
+    unsigned char proto_buf[2048]; // [修改] 增大缓冲区以适应 Mandala 加密 Payload
     int proto_len = 0;
     
     BOOL is_vless;
     BOOL is_trojan;
     BOOL is_shadowsocks;
+    BOOL is_mandala; // [新增]
     
     struct in_addr ip4; 
     struct in6_addr ip6;
@@ -262,6 +263,7 @@ DWORD WINAPI client_handler(LPVOID p) {
     is_vless = (_stricmp(g_proxyConfig.type, "vless") == 0);
     is_trojan = (_stricmp(g_proxyConfig.type, "trojan") == 0);
     is_shadowsocks = (_stricmp(g_proxyConfig.type, "shadowsocks") == 0);
+    is_mandala = (_stricmp(g_proxyConfig.type, "mandala") == 0); // [新增] 识别 Mandala 类型
 
     if (is_vless) {
         proto_buf[proto_len++] = 0x00; 
@@ -296,6 +298,67 @@ DWORD WINAPI client_handler(LPVOID p) {
         proto_buf[proto_len++] = 0x0D; proto_buf[proto_len++] = 0x0A;
         flen = build_ws_frame((char*)proto_buf, proto_len, ws_send_buf);
         tls_write(&tls, ws_send_buf, flen);
+    } else if (is_mandala) { 
+        // [新增] Mandala 协议握手逻辑
+        // 结构: Salt(4) + XOR( Hash(56) + PadLen(1) + Padding(N) + Cmd(1) + Addr... + CRLF(2) )
+
+        // 1. 生成随机 Salt (4 bytes)
+        unsigned char salt[4];
+        for(int i=0; i<4; i++) salt[i] = rand() % 256;
+
+        // 2. 准备明文 Payload
+        unsigned char plaintext[2048]; // 临时明文缓冲区
+        int p_len = 0;
+
+        // 2.1 哈希 ID (SHA224 Hex String, 56 bytes)
+        // 复用 trojan_password_hash 函数，因为它生成的正是 56字节的 hex string
+        char hex_pass[57]; 
+        trojan_password_hash(g_proxyConfig.pass, hex_pass);
+        memcpy(plaintext + p_len, hex_pass, 56); p_len += 56;
+
+        // 2.2 随机填充
+        int pad_len = rand() % 16; // 0-15字节随机
+        plaintext[p_len++] = (unsigned char)pad_len;
+        for(int i=0; i<pad_len; i++) plaintext[p_len++] = rand() % 256;
+
+        // 2.3 指令 CMD (0x01 Connect)
+        plaintext[p_len++] = 0x01;
+
+        // 2.4 目标地址 (SOCKS5 格式)
+        if (inet_pton(AF_INET, host, &ip4) == 1) { // IPv4
+             plaintext[p_len++] = 0x01; 
+             memcpy(plaintext + p_len, &ip4, 4); p_len += 4;
+        } else if (inet_pton(AF_INET6, host, &ip6) == 1) { // IPv6
+             plaintext[p_len++] = 0x04; 
+             memcpy(plaintext + p_len, &ip6, 16); p_len += 16;
+        } else { // Domain
+             plaintext[p_len++] = 0x03; 
+             plaintext[p_len++] = (unsigned char)strlen(host);
+             memcpy(plaintext + p_len, host, strlen(host)); p_len += strlen(host);
+        }
+
+        // 2.5 端口
+        plaintext[p_len++] = (port >> 8) & 0xFF; 
+        plaintext[p_len++] = port & 0xFF;
+
+        // 2.6 CRLF
+        plaintext[p_len++] = 0x0D; plaintext[p_len++] = 0x0A;
+
+        // 3. 构造最终包 (Salt + XOR Encrypted Payload)
+        // 将 Salt 写入发送缓冲头部
+        memcpy(proto_buf, salt, 4);
+        
+        // 执行 XOR 加密并写入发送缓冲
+        for(int i=0; i<p_len; i++) {
+            proto_buf[4 + i] = plaintext[i] ^ salt[i % 4];
+        }
+        
+        proto_len = 4 + p_len;
+
+        // 4. 封装 WebSocket 帧并发送
+        flen = build_ws_frame((char*)proto_buf, proto_len, ws_send_buf);
+        tls_write(&tls, ws_send_buf, flen);
+
     } else if (is_shadowsocks) {
         if (inet_pton(AF_INET, host, &ip4) == 1) {
              proto_buf[proto_len++] = 0x01; memcpy(proto_buf + proto_len, &ip4, 4); proto_len += 4;
