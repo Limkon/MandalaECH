@@ -326,7 +326,8 @@ int Internal_BatchAddNodesFromText(const char* text, cJSON* outbounds) {
                 char* uniqueTag = GetUniqueTagName(outbounds, typeStr, originalTag);
                 if (cJSON_HasObjectItem(node, "tag")) cJSON_ReplaceItemInObject(node, "tag", cJSON_CreateString(uniqueTag));
                 else cJSON_AddStringToObject(node, "tag", uniqueTag);
-                cJSON_AddItemToArray(outbounds, newNode); count++;
+                // [修复] 修正了变量名错误 newNode -> node
+                cJSON_AddItemToArray(outbounds, node); count++;
             }
         }
         line = strtok_s(NULL, "\r\n ,", &context);
