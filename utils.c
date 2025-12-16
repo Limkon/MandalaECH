@@ -91,7 +91,7 @@ void UrlDecode(char* dst, const char* src) {
     *dst = '\0';
 }
 
-// [修复] 循环版 GetQueryParam，防止递归溢出
+// [修复] 循环版 GetQueryParam，增加对 '#' 的判断
 char* GetQueryParam(const char* query, const char* key) {
     if (!query || !key) return NULL;
     char keyEq[128]; 
@@ -103,8 +103,13 @@ char* GetQueryParam(const char* query, const char* key) {
         // 确保匹配的是完整的 key (前缀是开头或&或?)
         if (p == query || *(p - 1) == '&' || *(p - 1) == '?') {
             const char* start = p + keyEqLen;
-            const char* end = strchr(start, '&');
-            size_t len = end ? (size_t)(end - start) : strlen(start);
+            
+            // [修复关键点] 查找值的结束位置：遇到 '&' 或 '#' 或 '\0' 均视为结束
+            size_t len = 0;
+            while (start[len] && start[len] != '&' && start[len] != '#') {
+                len++;
+            }
+
             if (len == 0) return NULL;
 
             char* value = (char*)malloc(len + 1);
