@@ -2,6 +2,14 @@
 #define CRYPTO_H
 
 #include "common.h"
+#include <openssl/ssl.h>
+#include <openssl/bio.h>
+
+// 定义 TLS 上下文结构体
+typedef struct {
+    SOCKET sock;
+    SSL *ssl;
+} TLSContext;
 
 // --- BIO 分片过滤器 ---
 BIO_METHOD *BIO_f_fragment(void);
