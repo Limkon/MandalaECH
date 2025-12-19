@@ -4,12 +4,13 @@
 #include <winsock2.h>
 #include <windows.h>
 
-// [核心修復] 定義全域緩衝區大小，解決 proxy.c 和 crypto.c 的編譯錯誤
+// [核心修正] 定義全域緩衝區大小，解決多個檔案的編譯錯誤
 #define BUFFER_SIZE 65536
 
-// 定義配置檔案的路徑變量
-extern wchar_t g_iniFilePath[MAX_PATH];
-#define CONFIG_FILE g_iniFilePath
+// [核心修正] 路徑分離：ini 用於設置，json 用於節點
+extern wchar_t g_iniFilePath[MAX_PATH];    // 儲存 set.ini 路徑
+extern wchar_t g_configFilePath[MAX_PATH]; // 儲存 config.json 路徑
+#define CONFIG_FILE g_configFilePath       // 將節點配置指向 JSON 檔案
 
 // 代理配置結構體
 typedef struct {
@@ -29,7 +30,7 @@ typedef struct {
     char ech[2048];      // ECH 配置字串 (Base64)
 } ProxyConfig;
 
-// --- 全域變數聲明 (解決多個檔案的 undeclared 錯誤) ---
+// --- 全域變數聲明 (解決 undeclared 錯誤) ---
 extern ProxyConfig g_proxyConfig;
 extern int g_localPort;
 extern BOOL g_enableLog;
@@ -75,6 +76,7 @@ extern int g_padSizeMin;
 extern int g_padSizeMax;
 extern int g_uaPlatformIndex;
 extern char g_userAgentStr[512];
+extern char g_dohUrl[512]; // [ECH] 全域 DoH 地址
 
 // UI 常量
 #define ID_TRAY_EXIT            1001
@@ -97,8 +99,12 @@ extern char g_userAgentStr[512];
 // 顏色
 #define COLOR_BTNFACE           15
 
-// [修正] 改為 extern 聲明，解決與 globals.c 的重複定義衝突
+// [修正] 改為 extern 聲明，由 globals.c 提供實際定義
 extern const char* UA_TEMPLATES[];
 extern const wchar_t* UA_PLATFORMS[];
+
+// 函數聲明 (解決隱式聲明警告)
+void SetSystemProxy(BOOL enable);
+BOOL IsSystemProxyEnabled();
 
 #endif // COMMON_H
