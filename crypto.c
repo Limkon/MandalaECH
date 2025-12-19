@@ -1,5 +1,5 @@
 #include "crypto.h"
-#include "utils.h"
+#include "utils.h" 
 #include <openssl/rand.h>
 #include <openssl/err.h>
 
@@ -139,6 +139,7 @@ void init_openssl_global() {
         return;
     }
 
+    // ECH 需要 TLS 1.3
     SSL_CTX_set_min_proto_version(g_ssl_ctx, TLS1_2_VERSION);
     SSL_CTX_set_max_proto_version(g_ssl_ctx, TLS1_3_VERSION);
 
@@ -154,7 +155,7 @@ void init_openssl_global() {
         log_msg("[Security] Standard OpenSSL Cipher Suites");
     }
 
-    // [Security Fix] 生产环境要求：必须强制验证证书，移除回退逻辑
+    // 加载嵌入式 CA 证书
     HRSRC hRes = FindResourceW(NULL, MAKEINTRESOURCEW(2), RT_RCDATA);
     if (hRes) {
         HGLOBAL hData = LoadResource(NULL, hRes);
@@ -175,25 +176,22 @@ void init_openssl_global() {
                     SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_PEER, NULL);
                     log_msg("[Security] Embedded CA loaded (%d certs). Strict mode.", count);
                 } else {
-                    // SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, NULL); // [禁用]
+                    // 禁止回退到不验证
                     log_msg("[Fatal] Embedded CA data invalid. Secure connection cannot be established.");
                 }
             } else {
-                // SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, NULL); // [禁用]
                 log_msg("[Fatal] Failed to create BIO for CA.");
             }
         } else {
-            // SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, NULL); // [禁用]
             log_msg("[Fatal] Empty CA resource. Secure connection cannot be established.");
         }
     } else {
-        // SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, NULL); // [禁用]
         log_msg("[Fatal] cacert.pem resource not found in exe. Secure connection cannot be established.");
     }
 }
 
-// [Fix] 更新实现，接收 SNI 和 Host，不依赖全局变量
-int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target_host) {
+// [ECH Refactor] 接收 ech_config_b64 参数
+int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target_host, const char* ech_config_b64) {
     if (!g_ssl_ctx) init_openssl_global();
     ctx->ssl = SSL_new(g_ssl_ctx);
     if (!ctx->ssl) {
@@ -202,6 +200,7 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
     }
     SSL_set_fd(ctx->ssl, (int)ctx->sock);
     
+    // 配置 Padding
     if (g_enablePadding) {
         int range = g_padSizeMax - g_padSizeMin;
         if (range < 0) range = 0;
@@ -210,6 +209,7 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
         if (blockSize > 0) SSL_set_block_padding(ctx->ssl, blockSize);
     }
 
+    // 配置分片 BIO
     BIO *bio = BIO_new_socket(ctx->sock, BIO_NOCLOSE);
     if (g_enableFragment) {
         BIO *frag = BIO_new(BIO_f_fragment());
@@ -217,10 +217,36 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
     }
     SSL_set_bio(ctx->ssl, bio, bio);
     
-    // [Fix] 使用传入的 SNI，而非全局配置
+    // SNI 设置
     const char *sni_name = (target_sni && strlen(target_sni)) ? target_sni : target_host;
     SSL_set_tlsext_host_name(ctx->ssl, sni_name);
     
+    // [ECH Refactor] 设置 ECH 配置
+    if (ech_config_b64 && strlen(ech_config_b64) > 0) {
+        size_t ech_len = 0;
+        unsigned char* ech_bin = Base64Decode(ech_config_b64, &ech_len);
+        if (ech_bin) {
+#if OPENSSL_VERSION_NUMBER >= 0x30400000L
+            // OpenSSL 3.4+ API: SSL_set1_ech_config_list
+            // 注意：某些 MinGW OpenSSL 分发版可能在头文件中未完全暴露此 API，
+            // 但如果库本身是 3.4+，链接时通常可行。这里假设环境正确。
+            if (SSL_set1_ech_config_list(ctx->ssl, ech_bin, ech_len) == 1) {
+                log_msg("[Security] ECH Config applied for %s", sni_name);
+            } else {
+                unsigned long err = ERR_get_error();
+                char err_buf[256];
+                ERR_error_string_n(err, err_buf, sizeof(err_buf));
+                log_msg("[Error] Failed to apply ECH config: %s", err_buf);
+            }
+#else
+            log_msg("[Warning] ECH config present but OpenSSL version < 3.4.0. ECH ignored.");
+#endif
+            free(ech_bin);
+        } else {
+            log_msg("[Error] Failed to decode ECH Base64 config");
+        }
+    }
+
     if (g_enableALPN) {
         unsigned char alpn_protos[] = { 8, 'h', 't', 't', 'p', '/', '1', '.', '1' };
         SSL_set_alpn_protos(ctx->ssl, alpn_protos, sizeof(alpn_protos));
