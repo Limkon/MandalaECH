@@ -139,7 +139,7 @@ void init_openssl_global() {
         return;
     }
 
-    // 设置 TLS 版本
+    // ECH 需要 TLS 1.3
     SSL_CTX_set_min_proto_version(g_ssl_ctx, TLS1_2_VERSION);
     SSL_CTX_set_max_proto_version(g_ssl_ctx, TLS1_3_VERSION);
 
@@ -155,6 +155,7 @@ void init_openssl_global() {
         log_msg("[Security] Standard OpenSSL Cipher Suites");
     }
 
+    // 强制加载嵌入式 CA 证书 (生产级安全要求)
     HRSRC hRes = FindResourceW(NULL, MAKEINTRESOURCEW(2), RT_RCDATA);
     if (hRes) {
         HGLOBAL hData = LoadResource(NULL, hRes);
@@ -188,6 +189,11 @@ void init_openssl_global() {
     }
 }
 
+// [Fix] 定义函数指针类型，用于动态加载 ECH 函数
+typedef int (*PFN_SSL_set1_ech_config_list)(SSL *ssl, const unsigned char *ech_config_list, size_t ech_config_list_len);
+static PFN_SSL_set1_ech_config_list p_SSL_set1_ech_config_list = NULL;
+static int ech_func_loaded = 0;
+
 // [ECH Refactor] 接收 ech_config_b64 参数
 int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target_host, const char* ech_config_b64) {
     if (!g_ssl_ctx) init_openssl_global();
@@ -219,31 +225,42 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
     const char *sni_name = (target_sni && strlen(target_sni)) ? target_sni : target_host;
     SSL_set_tlsext_host_name(ctx->ssl, sni_name);
     
-    // [ECH Refactor] 设置 ECH 配置
+    // [ECH Refactor] 动态加载并设置 ECH
     if (ech_config_b64 && strlen(ech_config_b64) > 0) {
+        // 尝试加载 ECH 函数 (仅第一次)
+        if (!ech_func_loaded) {
+            // 尝试常见 OpenSSL DLL 名称
+            HMODULE hSSL = GetModuleHandleA("libssl-3-x64.dll");
+            if (!hSSL) hSSL = GetModuleHandleA("libssl-3.dll");
+            if (!hSSL) hSSL = GetModuleHandleA("libssl.dll");
+            
+            if (hSSL) {
+                p_SSL_set1_ech_config_list = (PFN_SSL_set1_ech_config_list)GetProcAddress(hSSL, "SSL_set1_ech_config_list");
+                if (p_SSL_set1_ech_config_list) {
+                    log_msg("[Init] ECH function loaded successfully.");
+                } else {
+                    log_msg("[Init] ECH function not found in DLL.");
+                }
+            }
+            ech_func_loaded = 1;
+        }
+
         size_t ech_len = 0;
         unsigned char* ech_bin = Base64Decode(ech_config_b64, &ech_len);
         if (ech_bin) {
-            // 尝试检测是否存在 SSL_set1_ech_config_list 宏或函数
-            // 由于 C 语言在预处理阶段无法检测函数存在性，且 MingGW 环境报错，
-            // 这里我们暂时注释掉直接调用，或者依赖编译器支持。
-            // 鉴于错误日志明确显示 implicit declaration，说明头文件不支持。
-            // 为了编译通过，我们将此功能降级为日志警告。
-            
-            // #if defined(SSL_set1_ech_config_list) // 这种检查通常无效，除非它是宏
-            
-            // 如果您确定环境已修复，取消下面代码块的注释
-            /* if (SSL_set1_ech_config_list(ctx->ssl, ech_bin, ech_len) == 1) {
-                log_msg("[Security] ECH Config applied for %s", sni_name);
+            if (p_SSL_set1_ech_config_list) {
+                if (p_SSL_set1_ech_config_list(ctx->ssl, ech_bin, ech_len) == 1) {
+                    log_msg("[Security] ECH Config applied for %s", sni_name);
+                } else {
+                    // 获取 OpenSSL 错误信息
+                    unsigned long err = ERR_get_error();
+                    char err_buf[256];
+                    ERR_error_string_n(err, err_buf, sizeof(err_buf));
+                    log_msg("[Error] Failed to apply ECH config: %s", err_buf);
+                }
             } else {
-                unsigned long err = ERR_get_error();
-                char err_buf[256];
-                ERR_error_string_n(err, err_buf, sizeof(err_buf));
-                log_msg("[Error] Failed to apply ECH config: %s", err_buf);
+                log_msg("[Warning] ECH config present but OpenSSL DLL does not support it.");
             }
-            */
-            
-            log_msg("[Warning] ECH config ignored: Compilation environment missing ECH support.");
             free(ech_bin);
         } else {
             log_msg("[Error] Failed to decode ECH Base64 config");
