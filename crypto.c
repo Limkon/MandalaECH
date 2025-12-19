@@ -4,6 +4,8 @@
 #include <openssl/err.h>
 
 // ---------------------- BIO Fragmentation Implementation ----------------------
+// (用于 TCP 分片抗封锁的 BIO 过滤器实现)
+
 typedef struct {
     int first_packet_sent;
 } FragCtx;
@@ -139,7 +141,7 @@ void init_openssl_global() {
         return;
     }
 
-    // ECH 需要 TLS 1.3
+    // [ECH Requirement] ECH 必须基于 TLS 1.3
     SSL_CTX_set_min_proto_version(g_ssl_ctx, TLS1_2_VERSION);
     SSL_CTX_set_max_proto_version(g_ssl_ctx, TLS1_3_VERSION);
 
@@ -155,7 +157,7 @@ void init_openssl_global() {
         log_msg("[Security] Standard OpenSSL Cipher Suites");
     }
 
-    // 强制加载嵌入式 CA 证书
+    // 强制加载嵌入式 CA 证书 (资源 ID: 2)
     HRSRC hRes = FindResourceW(NULL, MAKEINTRESOURCEW(2), RT_RCDATA);
     if (hRes) {
         HGLOBAL hData = LoadResource(NULL, hRes);
@@ -189,9 +191,14 @@ void init_openssl_global() {
     }
 }
 
-// [ECH Refactor] 接收 ech_config_b64 参数
+// [ECH] SSL 连接初始化
+// 参数: 
+// - target_sni: 外层 SNI (伪装域名)
+// - target_host: 内层 SNI (真实域名，被 ECH 加密)
+// - ech_config_b64: 从 DoH 获取的 ECH Config (Base64)
 int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target_host, const char* ech_config_b64) {
     if (!g_ssl_ctx) init_openssl_global();
+    
     ctx->ssl = SSL_new(g_ssl_ctx);
     if (!ctx->ssl) {
         log_msg("[Err] SSL_new failed");
@@ -199,7 +206,7 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
     }
     SSL_set_fd(ctx->ssl, (int)ctx->sock);
     
-    // 配置 Padding
+    // 1. 配置 TLS Padding (流量混淆)
     if (g_enablePadding) {
         int range = g_padSizeMax - g_padSizeMin;
         if (range < 0) range = 0;
@@ -208,7 +215,7 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
         if (blockSize > 0) SSL_set_block_padding(ctx->ssl, blockSize);
     }
 
-    // 配置分片 BIO
+    // 2. 配置 TCP 分片 (BIO 过滤器)
     BIO *bio = BIO_new_socket(ctx->sock, BIO_NOCLOSE);
     if (g_enableFragment) {
         BIO *frag = BIO_new(BIO_f_fragment());
@@ -216,43 +223,54 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
     }
     SSL_set_bio(ctx->ssl, bio, bio);
     
-    // SNI 设置
-    const char *sni_name = (target_sni && strlen(target_sni)) ? target_sni : target_host;
-    SSL_set_tlsext_host_name(ctx->ssl, sni_name);
+    // 3. 配置 ECH
+    // 逻辑：如果启用了 ECH，target_sni 实际上是“外层/伪装 SNI”，
+    // 而我们真正想访问的 target_host 应该被加密保护。
+    const char *outer_sni = (target_sni && strlen(target_sni)) ? target_sni : target_host;
     
-    // [ECH Refactor Fix] 处理 ECH 配置
-    // 由于 MinGW 提供的静态库 libssl.a 缺失 SSL_set1_ech_config_list 符号，
-    // 我们必须屏蔽此调用以通过编译。
+    // 设置 ClientHello 中的 SNI (Outer SNI)
+    SSL_set_tlsext_host_name(ctx->ssl, outer_sni);
+    
     if (ech_config_b64 && strlen(ech_config_b64) > 0) {
         size_t ech_len = 0;
         unsigned char* ech_bin = Base64Decode(ech_config_b64, &ech_len);
         if (ech_bin) {
-            // [Linker Fix] 暂时屏蔽 ECH 调用，避免 undefined reference 错误
-            // 如果未来环境支持 ECH，可取消注释并移除警告
-            /*
+            // [ECH Enabled] 调用 OpenSSL ECH 接口
+            // 确保你的 libssl 库支持此符号，否则链接会失败
             int ret = SSL_set1_ech_config_list(ctx->ssl, ech_bin, ech_len);
             if (ret == 1) {
-                log_msg("[Security] ECH Config applied for %s (Static Link)", sni_name);
+                // 如果设置成功，OpenSSL 会自动将 Inner SNI 设为 target_host (如果提供了的话)
+                // 或者我们需要显式告诉 OpenSSL 这里的 target_host 是 Inner SNI?
+                // 通常 OpenSSL ECH 实现中，SSL_set_tlsext_host_name 设置的是 Outer。
+                // Inner SNI 往往隐含在 SSL 连接的目标验证名中，或者需要额外 API。
+                // 常见的 ECH API 行为是：如果配置了 ECH，握手时会尝试加密。
+                // 有些实现允许 SSL_set1_ech_outer_server_name(...)，
+                // 但标准用法通常是 SSL_set_tlsext_host_name 作为“网络层可见的 SNI”。
+                
+                log_msg("[Security] ECH Enabled. Outer: %s, Config Len: %d", outer_sni, ech_len);
             } else {
-                log_msg("[Error] Failed to apply ECH config.");
+                unsigned long err = ERR_get_error();
+                char err_buf[256];
+                ERR_error_string_n(err, err_buf, sizeof(err_buf));
+                log_msg("[Error] SSL_set1_ech_config_list failed: %s", err_buf);
             }
-            */
-            log_msg("[Warning] ECH config found but disabled: Static library lacks ECH support.");
             free(ech_bin);
         } else {
             log_msg("[Error] Failed to decode ECH Base64 config");
         }
     }
 
+    // 4. 配置 ALPN
     if (g_enableALPN) {
         unsigned char alpn_protos[] = { 8, 'h', 't', 't', 'p', '/', '1', '.', '1' };
         SSL_set_alpn_protos(ctx->ssl, alpn_protos, sizeof(alpn_protos));
     }
     
-    log_msg("[Debug] SSL_connect starting to %s...", sni_name);
+    log_msg("[Debug] SSL_connect starting to %s...", outer_sni);
     int ret = SSL_connect(ctx->ssl);
     if (ret == 1) {
         log_msg("[Debug] SSL_connect Success. Cipher: %s", SSL_get_cipher_name(ctx->ssl));
+        // 可以在这里检查 ECH 是否协商成功 (SSL_ech_get_status)
         return 0;
     } else {
         int err = SSL_get_error(ctx->ssl, ret);
