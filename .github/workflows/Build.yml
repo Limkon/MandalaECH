@@ -26,12 +26,11 @@ jobs:
         echo "Applying NUCLEAR FIX: Disabling signature checks..."
         sed -i 's/^SigLevel.*/SigLevel = Never/' /etc/pacman.conf
 
-        echo "Installing build tools (NO Perl here! Use built-in MSYS Perl)"
+        echo "Installing build tools"
         pacman -Sy --noconfirm \
           mingw-w64-x86_64-gcc \
           mingw-w64-x86_64-make
 
-    # [NEW] 获取远程仓库最新的 Commit SHA，用于生成缓存 Key
     - name: Get OpenSSL Head Commit
       id: openssl-head
       shell: bash
@@ -39,7 +38,6 @@ jobs:
         sha=$(git ls-remote https://github.com/defo-project/openssl.git HEAD | awk '{ print $1 }')
         echo "sha=$sha" >> $GITHUB_OUTPUT
 
-    # [NEW] 配置 OpenSSL 缓存
     - name: Cache OpenSSL
       id: cache-openssl
       uses: actions/cache@v4
@@ -48,27 +46,19 @@ jobs:
         key: openssl-ech-${{ runner.os }}-${{ steps.openssl-head.outputs.sha }}
 
     - name: Build OpenSSL with ECH (Static from DEfO)
-      if: steps.cache-openssl.outputs.cache-hit != 'true'  # 仅当缓存未命中时运行
+      if: steps.cache-openssl.outputs.cache-hit != 'true'
       shell: msys2 {0}
       run: |
         echo "Cloning OpenSSL ECH fork (DEfO project)..."
         git clone --depth 1 https://github.com/defo-project/openssl.git openssl-ech
         cd openssl-ech
 
-        echo "Verifying Perl (should be MSYS/Unix-like)..."
-        which perl
-        perl -V
-
         echo "Configuring OpenSSL with ECH support..."
-        # 关键修改：安装到当前工作区的 openssl_dist 目录，方便缓存
-        ./Configure mingw64 no-shared enable-ech --prefix=$(pwd)/../openssl_dist
+        ./Configure mingw64 no-shared enable-ech --prefix=${GITHUB_WORKSPACE}/openssl_dist
 
         echo "Compiling OpenSSL..."
         mingw32-make -j8
-
-        echo "Installing OpenSSL..."
         mingw32-make install_sw
-
         cd ..
         rm -rf openssl-ech
 
@@ -80,9 +70,11 @@ jobs:
     - name: Compile Executable
       shell: msys2 {0}
       run: |
-        # 关键修改：添加 -I 和 -L 指向缓存的 openssl_dist 目录
+        # 修正路徑：包含 I 路徑與同時搜索 lib 和 lib64 目錄
         gcc gui.c config.c proxy.c crypto.c utils.c globals.c cJSON.c resource.res -o Mandala.exe \
-          -Iopenssl_dist/include -Lopenssl_dist/lib \
+          -I${GITHUB_WORKSPACE}/openssl_dist/include \
+          -L${GITHUB_WORKSPACE}/openssl_dist/lib \
+          -L${GITHUB_WORKSPACE}/openssl_dist/lib64 \
           -lssl -lcrypto -lws2_32 -lgdi32 -lcomctl32 -lwininet -lcrypt32 -luser32 \
           -mwindows -municode -finput-charset=UTF-8 \
           -static
