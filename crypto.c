@@ -154,7 +154,7 @@ void init_openssl_global() {
         log_msg("[Security] Standard OpenSSL Cipher Suites");
     }
 
-    // [Security Fix] 生产环境要求：必须强制验证证书
+    // [Security Fix] 生产环境要求：必须强制验证证书，移除回退逻辑
     HRSRC hRes = FindResourceW(NULL, MAKEINTRESOURCEW(2), RT_RCDATA);
     if (hRes) {
         HGLOBAL hData = LoadResource(NULL, hRes);
@@ -175,27 +175,24 @@ void init_openssl_global() {
                     SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_PEER, NULL);
                     log_msg("[Security] Embedded CA loaded (%d certs). Strict mode.", count);
                 } else {
-                    // [Security Refactor] 禁用不安全的回退
-                    // SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, NULL);
+                    // SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, NULL); // [禁用]
                     log_msg("[Fatal] Embedded CA data invalid. Secure connection cannot be established.");
                 }
             } else {
-                // [Security Refactor] 禁用不安全的回退
-                // SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, NULL);
+                // SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, NULL); // [禁用]
                 log_msg("[Fatal] Failed to create BIO for CA.");
             }
         } else {
-            // [Security Refactor] 禁用不安全的回退
-            // SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, NULL);
+            // SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, NULL); // [禁用]
             log_msg("[Fatal] Empty CA resource. Secure connection cannot be established.");
         }
     } else {
-        // [Security Refactor] 禁用不安全的回退
-        // SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, NULL);
+        // SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, NULL); // [禁用]
         log_msg("[Fatal] cacert.pem resource not found in exe. Secure connection cannot be established.");
     }
 }
 
+// [Fix] 更新实现，接收 SNI 和 Host，不依赖全局变量
 int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target_host) {
     if (!g_ssl_ctx) init_openssl_global();
     ctx->ssl = SSL_new(g_ssl_ctx);
@@ -220,7 +217,7 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
     }
     SSL_set_bio(ctx->ssl, bio, bio);
     
-    // [Refactor] 使用传入的配置副本中的 SNI 和 Host
+    // [Fix] 使用传入的 SNI，而非全局配置
     const char *sni_name = (target_sni && strlen(target_sni)) ? target_sni : target_host;
     SSL_set_tlsext_host_name(ctx->ssl, sni_name);
     
@@ -229,7 +226,6 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
         SSL_set_alpn_protos(ctx->ssl, alpn_protos, sizeof(alpn_protos));
     }
     
-    // [Debug] 增加详细的 SSL 连接日志
     log_msg("[Debug] SSL_connect starting to %s...", sni_name);
     int ret = SSL_connect(ctx->ssl);
     if (ret == 1) {
