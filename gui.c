@@ -5,12 +5,10 @@
 #include "crypto.h"
 #include <commctrl.h>
 #include <stdio.h>
+#include <wchar.h> // for swprintf_s
 
 // 链接 comctl32 库以支持高级控件
 #pragma comment(lib, "comctl32.lib")
-
-// [修复] 删除此处的定义，因为已在 globals.c 中定义，在 common.h 中声明
-// WNDPROC g_oldListBoxProc = NULL; 
 
 // 用于追踪窗口句柄，实现单例模式
 static HWND hSettingsWnd = NULL;
@@ -134,6 +132,11 @@ void SaveEditedNode(HWND hWnd) {
     char tag[256], addr[256], user[256], pass[256], host[256], path[256];
     
     int port = GetDlgItemInt(hWnd, ID_EDIT_PORT, NULL, FALSE);
+    if (port <= 0 || port > 65535) {
+        MessageBoxW(hWnd, L"端口必须在 1-65535 之间", L"参数错误", MB_OK | MB_ICONERROR);
+        return;
+    }
+
     GetDlgItemTextW(hWnd, ID_EDIT_TAG, wTag, 256);
     GetDlgItemTextW(hWnd, ID_EDIT_ADDR, wAddr, 256);
     GetDlgItemTextW(hWnd, ID_EDIT_USER, wUser, 256);
@@ -166,7 +169,8 @@ void SaveEditedNode(HWND hWnd) {
                 cJSON* t = cJSON_GetObjectItem(node, "tag");
                 if (t && strcmp(t->valuestring, oldTagUtf8) == 0) {
                     cJSON* type = cJSON_GetObjectItem(node, "type");
-                    if (type && type->valuestring) strncpy(originalType, type->valuestring, 63);
+                    // [Security] 限制复制长度
+                    if (type && type->valuestring) snprintf(originalType, sizeof(originalType), "%s", type->valuestring);
                     break;
                 }
             }
@@ -454,7 +458,9 @@ LRESULT CALLBACK SubWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 char newUrl[512]; GetDlgItemTextA(hWnd, ID_SUB_URL_EDIT, newUrl, 512);
                 TrimString(newUrl);
                 if (strlen(newUrl) < 4) { MessageBoxW(hWnd, L"请输入有效的订阅地址", L"错误", MB_OK); break; }
-                strcpy(g_subs[g_subCount].url, newUrl); g_subs[g_subCount].enabled = TRUE; g_subCount++;
+                // [Safety] 限制复制
+                strncpy(g_subs[g_subCount].url, newUrl, 511); g_subs[g_subCount].url[511] = 0;
+                g_subs[g_subCount].enabled = TRUE; g_subCount++;
                 RefreshSubList(); SetDlgItemTextA(hWnd, ID_SUB_URL_EDIT, "");
             }
             else if (id == ID_SUB_DEL_BTN) {
@@ -481,7 +487,9 @@ LRESULT CALLBACK SubWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             int count = (int)wParam;
             EnableWindow(GetDlgItem(hWnd, ID_SUB_UPD_BTN), TRUE);
             SetWindowTextW(hWnd, L"订阅设置");
-            wchar_t msg[128]; wsprintfW(msg, L"更新完成，共获取 %d 个节点。", count);
+            wchar_t msg[128]; 
+            // [Safety] 替换 wsprintfW
+            swprintf_s(msg, 128, L"更新完成，共获取 %d 个节点。", count);
             MessageBoxW(hWnd, msg, L"结果", MB_OK);
             HWND hMgr = FindWindowW(L"NodeMgr", NULL);
             if (hMgr) SendMessage(hMgr, WM_REFRESH_NODELIST, 0, 0);
@@ -547,7 +555,9 @@ LRESULT CALLBACK NodeMgrWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             else if (LOWORD(wParam) == ID_NODEMGR_DEL) {
                 int selCount = SendMessage(hList, LB_GETSELCOUNT, 0, 0);
                 if (selCount <= 0) { MessageBoxW(hWnd, L"请先选择至少一个节点", L"提示", MB_OK); break; }
-                wchar_t confirmMsg[64]; wsprintfW(confirmMsg, L"确定要删除选中的 %d 个节点吗？", selCount);
+                wchar_t confirmMsg[64]; 
+                // [Safety] 替换 wsprintfW
+                swprintf_s(confirmMsg, 64, L"确定要删除选中的 %d 个节点吗？", selCount);
                 if (MessageBoxW(hWnd, confirmMsg, L"确认删除", MB_YESNO | MB_ICONQUESTION) != IDYES) break;
                 int* selIndices = (int*)malloc(selCount * sizeof(int));
                 if (!selIndices) break;
@@ -662,33 +672,27 @@ void OpenNodeEditWindow(const wchar_t* tag) {
     if(h) { ShowWindow(h, SW_SHOW); UpdateWindow(h); }
 }
 
-// [修改] 添加复选框控制日志开关
 LRESULT CALLBACK LogWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     static HWND hEdit;
-    static HWND hChk; // [新增]
+    static HWND hChk;
 
     switch(msg) {
         case WM_CREATE:
-            // [新增] 创建“开启日志记录”复选框，位于顶部
             hChk = CreateWindowW(L"BUTTON", L"开启日志记录 (默认关闭)", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 
                 10, 5, 200, 20, hWnd, (HMENU)ID_LOG_CHK, NULL, NULL);
-            // 设置默认状态
             SendMessage(hChk, BM_SETCHECK, g_enableLog ? BST_CHECKED : BST_UNCHECKED, 0);
             SendMessage(hChk, WM_SETFONT, (WPARAM)hAppFont, 0);
 
-            // [修改] 创建编辑框，Y坐标下移 30px，避免遮挡
             hEdit = CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_VSCROLL|ES_MULTILINE|ES_READONLY, 
                 0, 30, 0, 0, hWnd, (HMENU)ID_LOGVIEWER_EDIT, NULL, NULL);
             SendMessage(hEdit, WM_SETFONT, (WPARAM)hLogFont, 0); 
             break;
 
         case WM_SIZE: 
-            // [修改] 调整编辑框大小，留出顶部 30px
             MoveWindow(hEdit, 0, 30, LOWORD(lParam), HIWORD(lParam) - 30, TRUE); 
             break;
 
         case WM_COMMAND:
-            // [新增] 处理复选框点击事件
             if (LOWORD(wParam) == ID_LOG_CHK) {
                 g_enableLog = (IsDlgButtonChecked(hWnd, ID_LOG_CHK) == BST_CHECKED);
             }
@@ -760,7 +764,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 ParseTags();
                 HWND hMgr = FindWindowW(L"NodeMgr", L"节点管理 (支持 Ctrl+A 全选/多选)");
                 if (hMgr && IsWindow(hMgr)) SendMessage(hMgr, WM_REFRESH_NODELIST, 0, 0);
-                wchar_t msgBuf[128]; wsprintfW(msgBuf, L"成功导入 %d 个节点！", count);
+                wchar_t msgBuf[128]; 
+                // [Safety] 替换 wsprintfW
+                swprintf_s(msgBuf, 128, L"成功导入 %d 个节点！", count);
                 MessageBoxW(hWnd, msgBuf, L"导入成功", MB_OK|MB_ICONINFORMATION);
                 if (wcslen(currentNode) == 0 && nodeCount > 0) SwitchNode(nodeTags[0]);
             } else MessageBoxW(hWnd, L"剪贴板中未发现支持的链接 (vmess/vless/ss/trojan)", L"导入失败", MB_OK|MB_ICONWARNING);
