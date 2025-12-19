@@ -9,13 +9,14 @@
 #include <openssl/err.h>
 #include "crypto.h" 
 
-// 链接 Winsock 库
 #ifdef _MSC_VER
 #pragma comment(lib, "ws2_32.lib")
 #endif
 
 extern int g_localPort; 
 extern BOOL g_enableLog; 
+
+// --- 日志与错误处理 ---
 
 void log_msg(const char *format, ...) {
     if (!g_enableLog) return;
@@ -28,7 +29,6 @@ void log_msg(const char *format, ...) {
     time_t now; time(&now);
     struct tm t; localtime_s(&t, &now);
     wchar_t wMsg[2048];
-    // [Safety] 格式化日志字符串
     swprintf_s(wMsg, 2048, L"[%02d:%02d:%02d] %S\r\n", t.tm_hour, t.tm_min, t.tm_sec, buffer);
 
     HWND hLogWnd = FindWindowW(L"LogWnd", NULL);
@@ -46,6 +46,8 @@ void log_wsa_error(const char* context) {
     int err = WSAGetLastError();
     log_msg("%s failed with error: %d", context, err);
 }
+
+// --- 文件操作 ---
 
 BOOL ReadFileToBuffer(const wchar_t* filename, char** buffer, long* fileSize) {
     FILE* f = NULL;
@@ -69,6 +71,8 @@ BOOL WriteBufferToFile(const wchar_t* filename, const char* buffer) {
     fclose(f);
     return TRUE;
 }
+
+// --- 字符串处理 ---
 
 void TrimString(char* str) {
     char* p = str;
@@ -107,7 +111,6 @@ char* GetQueryParam(const char* query, const char* key) {
     char keyEq[128]; snprintf(keyEq, 128, "%s=", key);
     const char* p = strstr(query, keyEq);
     if (!p) return NULL;
-    // 确保匹配的是参数名而不是值的一部分
     if (p != query && *(p-1) != '&' && *(p-1) != '?') {
         p = strstr(p+1, keyEq);
         if(!p) return NULL;
@@ -124,11 +127,10 @@ char* GetQueryParam(const char* query, const char* key) {
 }
 
 static const char base64_table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-static const int mod_table[] = {0, 2, 1};
 
 unsigned char* Base64Decode(const char* src, size_t* out_len) {
     size_t len = strlen(src);
-    if (len % 4 != 0) { // 尝试补全 padding
+    if (len % 4 != 0) { 
         int pad = 4 - (len % 4);
         char* padded = (char*)malloc(len + pad + 1);
         strcpy(padded, src);
@@ -172,12 +174,11 @@ char* GetClipboardText() {
     return text;
 }
 
-// 简单的 HTTP GET (仅返回 Body 字符串，不支持二进制)
+// 简单的 HTTP GET (文本版，复用二进制版)
 char* Utils_HttpGet(const char* url) {
     int len = 0;
     char* data = Utils_HttpBytesGet(url, &len);
     if (data) {
-        // 确保是字符串结束
         char* str = (char*)realloc(data, len + 1);
         str[len] = 0;
         return str;
@@ -185,8 +186,24 @@ char* Utils_HttpGet(const char* url) {
     return NULL;
 }
 
-// --- [ECH 相关实现] ---
+// --- ECH 相关功能实现 ---
 
+// 标准 Base64 编码 (用于 ECH 导出)
+void Base64Encode(const unsigned char* src, int len, char* dst) {
+    int i = 0, j = 0;
+    for (; i < len; i += 3) {
+        int val = (src[i] << 16) + (i + 1 < len ? src[i+1] << 8 : 0) + (i + 2 < len ? src[i+2] : 0);
+        dst[j++] = base64_table[(val >> 18) & 0x3F];
+        dst[j++] = base64_table[(val >> 12) & 0x3F];
+        if (i + 1 < len) dst[j++] = base64_table[(val >> 6) & 0x3F];
+        else dst[j++] = '=';
+        if (i + 2 < len) dst[j++] = base64_table[val & 0x3F];
+        else dst[j++] = '=';
+    }
+    dst[j] = 0;
+}
+
+// Base64Url 编码 (用于 DoH 查询参数)
 void Base64UrlEncode(const unsigned char* src, int len, char* dst) {
     const char* tbl = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     int i = 0, j = 0;
@@ -195,7 +212,7 @@ void Base64UrlEncode(const unsigned char* src, int len, char* dst) {
         dst[j++] = tbl[(val >> 18) & 0x3F];
         dst[j++] = tbl[(val >> 12) & 0x3F];
         if (i + 1 < len) dst[j++] = tbl[(val >> 6) & 0x3F];
-        else dst[j++] = '='; // Base64Url 通常不补 padding，但 DNS 查询可能需要
+        else dst[j++] = '='; 
         if (i + 2 < len) dst[j++] = tbl[val & 0x3F];
         else dst[j++] = '=';
     }
@@ -206,13 +223,13 @@ void Base64UrlEncode(const unsigned char* src, int len, char* dst) {
 
 int BuildDNSQueryHTTPS(const char* domain, unsigned char* buf) {
     int pos = 0;
-    // Header (ID=0, Flags=RD)
-    buf[pos++] = 0; buf[pos++] = 0; 
+    // Header
+    buf[pos++] = 0; buf[pos++] = 0; // ID
     buf[pos++] = 0x01; buf[pos++] = 0x00; // RD=1
-    buf[pos++] = 0; buf[pos++] = 1; // QDCOUNT=1
-    buf[pos++] = 0; buf[pos++] = 0; // ANCOUNT=0
-    buf[pos++] = 0; buf[pos++] = 0; // NSCOUNT=0
-    buf[pos++] = 0; buf[pos++] = 0; // ARCOUNT=0
+    buf[pos++] = 0; buf[pos++] = 1; // QDCOUNT
+    buf[pos++] = 0; buf[pos++] = 0; // ANCOUNT
+    buf[pos++] = 0; buf[pos++] = 0; // NSCOUNT
+    buf[pos++] = 0; buf[pos++] = 0; // ARCOUNT
     
     // QNAME
     const char* p = domain;
@@ -230,17 +247,15 @@ int BuildDNSQueryHTTPS(const char* domain, unsigned char* buf) {
         memcpy(buf + pos, p, len);
         pos += len;
     }
-    buf[pos++] = 0; // Root
+    buf[pos++] = 0;
     
-    // QTYPE = 65 (HTTPS)
+    // Type 65 (HTTPS), Class 1 (IN)
     buf[pos++] = 0; buf[pos++] = 65;
-    // QCLASS = 1 (IN)
     buf[pos++] = 0; buf[pos++] = 1;
-    
     return pos;
 }
 
-// 支持二进制返回的 HTTP GET (用于 DoH)
+// 支持二进制返回的 HTTP GET (OpenSSL 实现)
 char* Utils_HttpBytesGet(const char* url, int* out_len) {
     if (!url) return NULL;
     char host[256] = {0}; 
@@ -249,28 +264,21 @@ char* Utils_HttpBytesGet(const char* url, int* out_len) {
     
     const char* p = url;
     if (strncmp(p, "https://", 8) == 0) p += 8;
-    else if (strncmp(p, "http://", 7) == 0) { p += 7; port = 80; } // 暂不支持 HTTP DoH，这里仅做容错
+    else if (strncmp(p, "http://", 7) == 0) { p += 7; port = 80; } 
     
     const char* slash = strchr(p, '/');
     int hostLen = slash ? (int)(slash - p) : (int)strlen(p);
     strncpy(host, p, hostLen);
     if (slash) strcpy(path, slash); else strcpy(path, "/");
     
-    // 解析端口 (host:port)
     char* colon = strchr(host, ':');
-    if (colon) {
-        *colon = 0;
-        port = atoi(colon + 1);
-    }
+    if (colon) { *colon = 0; port = atoi(colon + 1); }
 
-    // 建立 SSL 连接
     SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
     if (!ctx) return NULL;
-    // 忽略证书验证 (简化)
     SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
     
     SSL *ssl = SSL_new(ctx);
-    
     struct hostent *he = gethostbyname(host);
     if (!he) { SSL_free(ssl); SSL_CTX_free(ctx); return NULL; }
     
@@ -293,7 +301,6 @@ char* Utils_HttpBytesGet(const char* url, int* out_len) {
     }
     
     char req[4096];
-    // 这里关键是 Accept 头，告诉服务器我们想要 DNS Message
     snprintf(req, sizeof(req), 
         "GET %s HTTP/1.1\r\n"
         "Host: %s\r\n"
@@ -320,8 +327,6 @@ char* Utils_HttpBytesGet(const char* url, int* out_len) {
         }
     }
     
-    // 解析 HTTP Body (二进制安全)
-    // 查找 \r\n\r\n
     int body_start_idx = -1;
     for(int i=0; i<total-3; i++) {
         if (resp[i]=='\r' && resp[i+1]=='\n' && resp[i+2]=='\r' && resp[i+3]=='\n') {
@@ -357,7 +362,6 @@ char* FetchECHFromDoH(const char* dohUrl, const char* sni) {
     Base64UrlEncode(query, qlen, b64query);
     
     char fullUrl[2048];
-    // cloudflare/ali DoH 支持 ?dns=BASE64
     snprintf(fullUrl, sizeof(fullUrl), "%s?dns=%s", dohUrl, b64query);
     
     int resp_len = 0;
@@ -369,27 +373,19 @@ char* FetchECHFromDoH(const char* dohUrl, const char* sni) {
         return NULL; 
     }
     
-    // 解析 DNS Answer
-    // 简单的 DNS Packet Parser
     int pos = 12; // Header
-    
-    // Skip Question Section
-    // (Assume 1 question, skip QNAME + QTYPE + QCLASS)
     while (pos < resp_len && resp[pos] != 0) pos += resp[pos] + 1; 
-    pos += 5; // Null byte + QTYPE(2) + QCLASS(2)
+    pos += 5; // Null byte + QTYPE + QCLASS
     
     if (pos >= resp_len) { free(resp); return NULL; }
     
-    // Answer Count
     int ancount = (resp[6] << 8) | resp[7];
     
     for (int i=0; i<ancount; i++) {
         if (pos >= resp_len) break;
-        
-        // Name (Label or Pointer)
         if ((resp[pos] & 0xC0) == 0xC0) pos += 2; 
         else while(pos < resp_len && resp[pos]!=0) pos += resp[pos]+1; 
-        if (pos < resp_len && resp[pos] == 0) pos++; // Skip null byte if not pointer
+        if (pos < resp_len && resp[pos] == 0) pos++;
         
         if (pos + 10 > resp_len) break;
         
@@ -399,40 +395,20 @@ char* FetchECHFromDoH(const char* dohUrl, const char* sni) {
         
         if (pos + rdlen > resp_len) break;
         
-        if (type == 65) { // HTTPS Record
+        if (type == 65) { // HTTPS
             unsigned char* rdata = resp + pos;
-            int rpos = 2; // Priority (2 bytes)
-            
-            // Target Name (Variable)
+            int rpos = 2; 
             if (rpos < rdlen && rdata[rpos] == 0) rpos++; 
             else while(rpos < rdlen && rdata[rpos]!=0) rpos += rdata[rpos]+1;
             
-            // Params (Key=2, ValLen=2, Value...)
             while (rpos + 4 <= rdlen) {
                 int key = (rdata[rpos] << 8) | rdata[rpos+1];
                 int vlen = (rdata[rpos+2] << 8) | rdata[rpos+3];
                 rpos += 4;
-                
-                if (key == 5) { // ECH Config (id=5)
-                    // Found ECH! Encode to Base64 and return
-                    // 这里为了兼容性，我们将二进制 ECH Config 转换为 Base64 字符串
-                    // 因为 OpenSSL 的 SSL_set1_ech_config_list 实际上接受二进制
-                    // 但我们的 ProxyConfig 存储的是字符串，所以先转 Base64 存，用时再解
-                    // 或者：直接存 hex string? 
-                    // 鉴于 ech-wk 和 sing-box 配置通常是 Base64，我们这里返回 Base64
-                    
-                    // 注意：这里的 Base64UrlEncode 是 URL 安全的，可能需要标准 Base64
-                    // 简单起见，我们假设后续解码能处理 URL Safe
+                if (key == 5) { // ECH Config
                     int b64len = (vlen * 4 / 3) + 8;
                     char* out = (char*)malloc(b64len);
-                    // 临时造一个标准 Base64 Encode (复用 Base64UrlEncode 并替换 -_)
-                    Base64UrlEncode(rdata + rpos, vlen, out);
-                    // Replace -_ with +/
-                    for(int k=0; out[k]; k++) {
-                        if (out[k] == '-') out[k] = '+';
-                        else if (out[k] == '_') out[k] = '/';
-                    }
-                    
+                    Base64Encode(rdata + rpos, vlen, out); // 使用标准 Base64 编码
                     free(resp);
                     return out;
                 }
@@ -441,7 +417,6 @@ char* FetchECHFromDoH(const char* dohUrl, const char* sni) {
         }
         pos += rdlen;
     }
-    
     free(resp);
     return NULL;
 }
