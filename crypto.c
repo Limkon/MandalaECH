@@ -121,8 +121,8 @@ static long frag_ctrl(BIO *b, int cmd, long num, void *ptr) {
     if (!next) return 0;
     return BIO_ctrl(next, cmd, num, ptr);
 }
-// ---------------------- End BIO Implementation ----------------------
 
+// ---------------------- OpenSSL Global ----------------------
 extern SSL_CTX *g_ssl_ctx; 
 
 void FreeGlobalSSLContext() {
@@ -307,10 +307,11 @@ void tls_close(TLSContext *ctx) {
     if (ctx->ssl) { SSL_shutdown(ctx->ssl); SSL_free(ctx->ssl); ctx->ssl = NULL; }
 }
 
+// ---------------------- WebSocket Implementation ----------------------
+
 int build_ws_frame(const char *in, int len, char *out) {
     int idx = 0;
     out[idx++] = (char)0x82; 
-
     unsigned char mask[4];
     for(int i=0; i<4; i++) mask[i] = (unsigned char)(rand() & 0xFF);
 
@@ -328,23 +329,18 @@ int build_ws_frame(const char *in, int len, char *out) {
         out[idx++] = (len >> 8) & 0xFF;
         out[idx++] = len & 0xFF;
     }
-
     memcpy(out + idx, mask, 4);
     idx += 4;
-
     for (int i = 0; i < len; i++) {
         out[idx + i] = in[i] ^ mask[i % 4];
     }
-    
     return idx + len;
 }
 
 long long check_ws_frame(unsigned char *in, int len, int *head_len, int *payload_len) {
     if(len < 2) return 0;
-    
     int hl = 2; 
     unsigned long long pl = in[1] & 0x7F;
-
     if (pl == 126) { 
         if (len < 4) return 0; 
         hl = 4; 
@@ -354,35 +350,35 @@ long long check_ws_frame(unsigned char *in, int len, int *head_len, int *payload
         if (len < 10) return 0; 
         hl = 10; 
         pl = 0;
-        for(int i = 0; i < 8; i++) {
-            pl = (pl << 8) | in[2 + i];
-        }
+        for(int i = 0; i < 8; i++) { pl = (pl << 8) | in[2 + i]; }
     }
-    
     if (in[1] & 0x80) hl += 4; 
-
     if (pl > BUFFER_SIZE) {
-        log_msg("[Err] WS Frame too large: %llu (Max: %d). Dropping connection.", pl, BUFFER_SIZE);
+        log_msg("[Err] WS Frame too large: %llu.", pl);
         return -1; 
     }
-
     if ((unsigned long long)len < (unsigned long long)hl + pl) return 0;
-    
-    *head_len = hl; 
-    *payload_len = (int)pl; 
-    
+    *head_len = hl; *payload_len = (int)pl; 
     return (long long)(hl + pl); 
 }
 
 int ws_read_payload_exact(TLSContext *tls, char *out_buf, int expected_len) {
-    char raw_head[16];
-    if (!tls_read_exact(tls, raw_head, 2)) return 0;
-    int payload_len = raw_head[1] & 0x7F;
-    if (payload_len == 126) {
-        if (!tls_read_exact(tls, raw_head + 2, 2)) return 0;
-        payload_len = (unsigned char)raw_head[2] << 8 | (unsigned char)raw_head[3];
+    unsigned char raw_head[14];
+    if (!tls_read_exact(tls, (char*)raw_head, 2)) return 0;
+    unsigned long long full_payload_len = raw_head[1] & 0x7F;
+    if (full_payload_len == 126) {
+        if (!tls_read_exact(tls, (char*)raw_head + 2, 2)) return 0;
+        full_payload_len = ((unsigned int)raw_head[2] << 8) | raw_head[3];
+    } else if (full_payload_len == 127) {
+        if (!tls_read_exact(tls, (char*)raw_head + 2, 8)) return 0;
+        full_payload_len = 0;
+        for (int i = 0; i < 8; i++) { full_payload_len = (full_payload_len << 8) | raw_head[2 + i]; }
     }
-    if (payload_len < expected_len) return 0;
-    if (!tls_read_exact(tls, out_buf, payload_len)) return 0;
-    return payload_len;
+    if (full_payload_len > BUFFER_SIZE || full_payload_len < (unsigned long long)expected_len) {
+        log_msg("[Err] WS Payload too large or invalid: %llu", full_payload_len);
+        return 0;
+    }
+    int payload_int = (int)full_payload_len;
+    if (!tls_read_exact(tls, out_buf, payload_int)) return 0;
+    return payload_int;
 }
