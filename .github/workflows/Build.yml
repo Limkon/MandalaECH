@@ -16,6 +16,7 @@ jobs:
       uses: msys2/setup-msys2@v2
       with:
         msystem: MINGW64
+        # 1. 关闭自动更新，防止启动时因签名问题崩溃
         update: false
         cache: false
         install: git
@@ -24,26 +25,30 @@ jobs:
       shell: msys2 {0}
       run: |
         echo "Applying NUCLEAR FIX: Disabling signature checks entirely..."
+        
+        # 2. 暴力修改 pacman 配置，信任所有包
         sed -i 's/^SigLevel.*/SigLevel = Never/' /etc/pacman.conf
+        
+        # 3. 安装编译工具
+        # [注意] 这里不要安装 mingw-w64-x86_64-openssl，我们要自己编译
         echo "Installing build tools..."
-        # 移除了 mingw-w64-x86_64-openssl，改由手动编译
         pacman -Sy --noconfirm mingw-w64-x86_64-gcc mingw-w64-x86_64-make perl
 
     - name: Build OpenSSL with ECH (Static from DEfO)
       shell: msys2 {0}
       run: |
         echo "Cloning OpenSSL ECH fork (DEfO project)..."
-        # [关键修改] 改为克隆 DEfO 项目的 OpenSSL 分支，该分支包含 enable-ech 选项
+        # [关键修复] 改为克隆 DEfO 项目的 OpenSSL 源码，这个版本才支持 enable-ech
         git clone --depth 1 https://github.com/defo-project/openssl.git openssl-ech
         
         cd openssl-ech
         
         echo "Configuring OpenSSL..."
-        # [关键] 
+        # [关键参数] 
         # mingw64: 目标平台
-        # no-shared: 只编译静态库 (.a)
-        # enable-ech: 开启 ECH 支持 (DEfO 分支支持此选项)
-        # --prefix=/mingw64: 安装到系统目录
+        # no-shared: 编译静态库 (.a)，让你的 exe 可以独立运行
+        # enable-ech: 开启 ECH 支持
+        # --prefix=/mingw64: 安装到系统目录，让 gcc 能找到
         ./Configure mingw64 no-shared enable-ech --prefix=/mingw64
         
         echo "Compiling OpenSSL (This may take 10-20 minutes)..."
