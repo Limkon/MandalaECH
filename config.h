@@ -7,7 +7,7 @@
 // 注意：原有的全局变量 (g_localPort, g_proxyConfig 等) 已在 common.h 中声明
 // 我们直接使用它们，不再重复声明
 
-// --- 新增：全局 DoH 设置 ---
+// --- [ECH] 新增：全局 DoH 设置 ---
 extern char g_dohUrl[512];
 
 // --- 新增：订阅管理系统 ---
@@ -37,7 +37,7 @@ cJSON* ParseVmess(const char* link);
 cJSON* ParseShadowsocks(const char* link);
 cJSON* ParseVlessOrTrojan(const char* link);
 cJSON* ParseSocks(const char* link);
-cJSON* ParseMandala(const char* link);
+cJSON* ParseMandala(const char* link); // [新增]
 
 int ImportFromClipboard();
 void ToggleTrayIcon();
