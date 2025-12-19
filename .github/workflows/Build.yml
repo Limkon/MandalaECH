@@ -1,11 +1,10 @@
 name: Windows Manual Build
-# 手动触发
 on:
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: windows-latest  # windows-2025 也行，但 latest 通常更稳定
+    runs-on: windows-latest
     
     steps:
     - name: Checkout code
@@ -15,25 +14,22 @@ jobs:
       uses: msys2/setup-msys2@v2
       with:
         msystem: MINGW64
-        update: false          # 关闭自动更新，避免签名问题
+        update: false
         cache: false
-        install: git           # 只预装 git，其他后面自己装
+        install: git
         path-type: minimal
         release: true
 
     - name: Disable Signature Check and Install Dependencies
       shell: msys2 {0}
       run: |
-        echo "Applying NUCLEAR FIX: Disabling signature checks entirely..."
+        echo "Applying NUCLEAR FIX: Disabling signature checks..."
         sed -i 's/^SigLevel.*/SigLevel = Never/' /etc/pacman.conf
 
-        echo "Installing build tools..."
+        echo "Installing build tools (NO Perl here! Use built-in MSYS Perl)"
         pacman -Sy --noconfirm \
           mingw-w64-x86_64-gcc \
-          mingw-w64-x86_64-make \
-          mingw-w64-x86_64-perl \
-          mingw-w64-x86_64-winpthreads \
-          mingw-w64-x86_64-libwinpthread-git
+          mingw-w64-x86_64-make
 
     - name: Build OpenSSL with ECH (Static from DEfO)
       shell: msys2 {0}
@@ -42,20 +38,22 @@ jobs:
         git clone --depth 1 https://github.com/defo-project/openssl.git openssl-ech
         cd openssl-ech
 
+        echo "Verifying Perl (should be MSYS/Unix-like)..."
+        which perl
+        perl -V
+
         echo "Configuring OpenSSL with ECH support..."
+        # 关键：直接用 mingw64，不要加 --cross-compile-prefix（因为不是交叉编译）
         ./Configure mingw64 no-shared enable-ech --prefix=/mingw64
 
-        echo "Compiling OpenSSL (this may take 10-20 minutes)..."
-        # 关键修复：使用 mingw32-make 而不是 make
-        # 并行编译，使用 runner 的所有核心（windows-latest 有 7 个逻辑核心，-j8 很安全）
+        echo "Compiling OpenSSL..."
         mingw32-make -j8
 
-        echo "Installing OpenSSL (only libraries and headers)..."
+        echo "Installing OpenSSL..."
         mingw32-make install_sw
 
-        # 可选：清理一下，节省空间
         cd ..
-        rm -rf openssl-ech
+        rm -rf openssl-ech  # 清理源码
 
     - name: Compile Resources
       shell: msys2 {0}
@@ -73,5 +71,5 @@ jobs:
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: Mandala-Windows-x64
+        name: Mandala-Windows-x64-ECH
         path: Mandala.exe
