@@ -1,6 +1,7 @@
 #include "proxy.h"
 #include "crypto.h"
 #include "utils.h"
+#include <ws2tcpip.h>
 #include <openssl/sha.h>
 
 // [Concurrency Fix] 客户端线程上下文，保存配置副本
@@ -571,3 +572,4 @@ void StopProxyCore() {
     if (hProxyThread) { WaitForSingleObject(hProxyThread, 2000); CloseHandle(hProxyThread); hProxyThread = NULL; }
     log_msg("Proxy Stopped");
 }
+
