@@ -12,13 +12,13 @@ extern wchar_t g_iniFilePath[MAX_PATH];
 typedef struct {
     char type[32];      // 协议类型: vless, trojan, socks, shadowsocks, mandala, vmess
     char tag[256];      // 备注
-    char host[256];     // 服务器地址 (如果是 ECH，这里是真实目标域名 Inner SNI)
+    char host[256];     // 服务器地址 (真实目标 IP 或域名 / Inner SNI)
     int port;           // 端口
     
     char user[256];     // UUID 或 用户名
     char pass[256];     // 密码
     
-    char sni[256];      // TLS SNI (如果是 ECH，这里通常由 Outer SNI 覆盖，或用于普通 TLS)
+    char sni[256];      // TLS SNI (通常用于普通 TLS，或作为 ECH 的 Outer SNI)
     char path[256];     // WS Path / gRPC ServiceName
     
     // [ECH 新增字段]
