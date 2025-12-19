@@ -8,8 +8,6 @@
 // --- 全局变量声明 ---
 Subscription g_subs[MAX_SUBS];
 int g_subCount = 0;
-// [ECH] 全局 DoH 地址 (默认阿里云)
-char g_dohUrl[512] = "https://dns.alidns.com/dns-query";
 
 // --- 内部辅助函数声明 ---
 int Internal_BatchAddNodesFromText(const char* text, cJSON* outbounds);
@@ -689,3 +687,4 @@ cJSON* ParseMandala(const char* link) {
     free(uuid); free(host); free(tag); 
     return outbound;
 }
+
