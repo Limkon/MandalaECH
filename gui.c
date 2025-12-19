@@ -3,6 +3,7 @@
 #include "proxy.h"
 #include "utils.h"
 #include "crypto.h"
+#include "resource.h"
 #include <commctrl.h>
 #include <stdio.h>
 #include <wchar.h> // for swprintf_s
@@ -863,3 +864,4 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nSho
     
     return 0;
 }
+
