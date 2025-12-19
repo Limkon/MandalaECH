@@ -1,7 +1,16 @@
 #include "crypto.h"
-#include "utils.h" 
+#include "utils.h"
 #include <openssl/rand.h>
 #include <openssl/err.h>
+
+// -------------------------------------------------------------------------
+// [Fix] 手动声明 ECH 函数原型
+// 解决 MinGW OpenSSL 头文件可能缺失此定义导致的 "implicit declaration" 错误。
+// 在静态链接模式下，只要底层的 libssl.a 包含此符号，链接即可成功。
+// -------------------------------------------------------------------------
+#if !defined(SSL_set1_ech_config_list)
+int SSL_set1_ech_config_list(SSL *ssl, const unsigned char *ech_config_list, size_t ech_config_list_len);
+#endif
 
 // ---------------------- BIO Fragmentation Implementation ----------------------
 typedef struct {
@@ -155,7 +164,7 @@ void init_openssl_global() {
         log_msg("[Security] Standard OpenSSL Cipher Suites");
     }
 
-    // 强制加载嵌入式 CA 证书 (生产级安全要求)
+    // 强制加载嵌入式 CA 证书
     HRSRC hRes = FindResourceW(NULL, MAKEINTRESOURCEW(2), RT_RCDATA);
     if (hRes) {
         HGLOBAL hData = LoadResource(NULL, hRes);
@@ -189,12 +198,7 @@ void init_openssl_global() {
     }
 }
 
-// [Fix] 定义函数指针类型，用于动态加载 ECH 函数
-typedef int (*PFN_SSL_set1_ech_config_list)(SSL *ssl, const unsigned char *ech_config_list, size_t ech_config_list_len);
-static PFN_SSL_set1_ech_config_list p_SSL_set1_ech_config_list = NULL;
-static int ech_func_loaded = 0;
-
-// [ECH Refactor] 接收 ech_config_b64 参数
+// [ECH Refactor] 接收 ech_config_b64 参数，直接静态调用
 int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target_host, const char* ech_config_b64) {
     if (!g_ssl_ctx) init_openssl_global();
     ctx->ssl = SSL_new(g_ssl_ctx);
@@ -225,41 +229,22 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
     const char *sni_name = (target_sni && strlen(target_sni)) ? target_sni : target_host;
     SSL_set_tlsext_host_name(ctx->ssl, sni_name);
     
-    // [ECH Refactor] 动态加载并设置 ECH
+    // [ECH Refactor] 静态链接模式下的 ECH 设置
     if (ech_config_b64 && strlen(ech_config_b64) > 0) {
-        // 尝试加载 ECH 函数 (仅第一次)
-        if (!ech_func_loaded) {
-            // 尝试常见 OpenSSL DLL 名称
-            HMODULE hSSL = GetModuleHandleA("libssl-3-x64.dll");
-            if (!hSSL) hSSL = GetModuleHandleA("libssl-3.dll");
-            if (!hSSL) hSSL = GetModuleHandleA("libssl.dll");
-            
-            if (hSSL) {
-                p_SSL_set1_ech_config_list = (PFN_SSL_set1_ech_config_list)GetProcAddress(hSSL, "SSL_set1_ech_config_list");
-                if (p_SSL_set1_ech_config_list) {
-                    log_msg("[Init] ECH function loaded successfully.");
-                } else {
-                    log_msg("[Init] ECH function not found in DLL.");
-                }
-            }
-            ech_func_loaded = 1;
-        }
-
         size_t ech_len = 0;
         unsigned char* ech_bin = Base64Decode(ech_config_b64, &ech_len);
         if (ech_bin) {
-            if (p_SSL_set1_ech_config_list) {
-                if (p_SSL_set1_ech_config_list(ctx->ssl, ech_bin, ech_len) == 1) {
-                    log_msg("[Security] ECH Config applied for %s", sni_name);
-                } else {
-                    // 获取 OpenSSL 错误信息
-                    unsigned long err = ERR_get_error();
-                    char err_buf[256];
-                    ERR_error_string_n(err, err_buf, sizeof(err_buf));
-                    log_msg("[Error] Failed to apply ECH config: %s", err_buf);
-                }
+            // 直接调用函数，依赖链接器在静态库(libssl.a)中找到它
+            // 只要编译环境的 OpenSSL 版本 >= 3.4.0 且支持 ECH，此调用将成功
+            int ret = SSL_set1_ech_config_list(ctx->ssl, ech_bin, ech_len);
+            
+            if (ret == 1) {
+                log_msg("[Security] ECH Config applied for %s (Static Link)", sni_name);
             } else {
-                log_msg("[Warning] ECH config present but OpenSSL DLL does not support it.");
+                unsigned long err = ERR_get_error();
+                char err_buf[256];
+                ERR_error_string_n(err, err_buf, sizeof(err_buf));
+                log_msg("[Error] Failed to apply ECH config: %s", err_buf);
             }
             free(ech_bin);
         } else {
