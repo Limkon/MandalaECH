@@ -9,6 +9,9 @@ typedef struct {
     ProxyConfig config; // 完整的配置副本，避免读取全局变量导致的竞争条件
 } ClientContext;
 
+// [Security Fix] 更新了 tls_init_connect 的声明 (由 crypto.h 提供，无需重复声明)
+// int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target_host, const char* ech_config_b64);
+
 // --- 辅助函数：解析 UUID (支持带横杠或不带) ---
 void parse_uuid(const char* uuid_str, unsigned char* out) {
     const char* p = uuid_str;
@@ -32,7 +35,8 @@ void trojan_password_hash(const char* password, char* out_hex) {
     unsigned char digest[SHA224_DIGEST_LENGTH];
     SHA224((unsigned char*)password, strlen(password), digest);
     for(int i = 0; i < SHA224_DIGEST_LENGTH; i++) {
-        snprintf(out_hex + (i * 2), 3, "%02x", digest[i]); // 使用安全的 snprintf
+        // [Security Fix] 使用 snprintf 防止缓冲区溢出
+        snprintf(out_hex + (i * 2), 3, "%02x", digest[i]);
     }
     out_hex[SHA224_DIGEST_LENGTH * 2] = 0;
 }
@@ -67,6 +71,7 @@ void log_hex_simple(const char* tag, unsigned char* data, int len) {
     char buf[64] = {0};
     int max = len > 6 ? 6 : len;
     int p = 0;
+    // [Security Fix] 使用 snprintf
     for(int i=0; i<max; i++) {
         p += snprintf(buf+p, sizeof(buf)-p, "%02X ", data[i]);
     }
@@ -95,7 +100,7 @@ DWORD WINAPI client_handler(LPVOID p) {
     if (!ctx) return 0;
 
     SOCKET c = ctx->clientSock;
-    ProxyConfig localConfig = ctx->config; // 线程本地副本
+    ProxyConfig localConfig = ctx->config; // 线程本地副本 (包含 ech 字段)
     free(ctx); // 立即释放堆内存
 
     TLSContext tls; 
@@ -214,8 +219,8 @@ DWORD WINAPI client_handler(LPVOID p) {
         
         if (connect(r, (struct sockaddr*)&a, sizeof(a)) == 0) {
             tls.sock = r;
-            // [Security] 传递本地配置的 SNI 和 Host
-            if (tls_init_connect(&tls, localConfig.sni, localConfig.host) == 0) break;
+            // [ECH Refactor] 传递本地配置的 SNI, Host 和 ECH
+            if (tls_init_connect(&tls, localConfig.sni, localConfig.host, localConfig.ech) == 0) break;
             else tls_close(&tls);
         }
         closesocket(r); r = INVALID_SOCKET;
