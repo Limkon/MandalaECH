@@ -3,6 +3,9 @@
 
 #include "common.h"
 
+void SetSystemProxy(BOOL enable);
+BOOL IsSystemProxyEnabled();
+
 // 日志记录函数
 void log_msg(const char *format, ...);
 // 记录 Winsock 错误
@@ -32,3 +35,4 @@ void Base64UrlEncode(const unsigned char* src, int len, char* dst);
 char* FetchECHFromDoH(const char* dohUrl, const char* sni);
 
 #endif
+
