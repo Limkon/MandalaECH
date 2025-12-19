@@ -15,7 +15,7 @@ jobs:
       with:
         msystem: MINGW64
         update: false
-        cache: true # 啟用 MSYS2 系統包緩存
+        cache: true # 啟用 MSYS2 系統包快取
         install: git
         path-type: minimal
         release: true
@@ -31,21 +31,13 @@ jobs:
           mingw-w64-x86_64-gcc \
           mingw-w64-x86_64-make
 
-    # [優化] 獲取 OpenSSL 最新 Commit SHA 作為緩存 Key 的一部分
-    - name: Get OpenSSL Head Commit
-      id: openssl-head
-      shell: bash
-      run: |
-        sha=$(git ls-remote https://github.com/defo-project/openssl.git HEAD | awk '{ print $1 }')
-        echo "sha=$sha" >> $GITHUB_OUTPUT
-
-    # [優化] 配置 OpenSSL 靜態庫緩存
+    # [優化] 使用穩定版本快取。一旦成功生成的 openssl_dist 被儲存，下次將直接調用。
     - name: Cache OpenSSL
       id: cache-openssl
       uses: actions/cache@v4
       with:
         path: openssl_dist
-        key: openssl-ech-${{ runner.os }}-${{ steps.openssl-head.outputs.sha }}
+        key: openssl-ech-${{ runner.os }}-v1 
 
     - name: Build OpenSSL with ECH (Static from DEfO)
       if: steps.cache-openssl.outputs.cache-hit != 'true'
@@ -56,7 +48,7 @@ jobs:
         cd openssl-ech
 
         echo "Configuring OpenSSL with ECH support..."
-        # 使用工作目錄絕對路徑作為安裝前綴，確保緩存與鏈接路徑一致
+        # 使用絕對路徑作為前綴，確保編譯產物位置固定
         ./Configure mingw64 no-shared enable-ech --prefix=${GITHUB_WORKSPACE}/openssl_dist
 
         echo "Compiling OpenSSL..."
@@ -68,16 +60,16 @@ jobs:
     - name: Compile Resources
       shell: msys2 {0}
       run: |
-        # 預先編譯資源文件，確保圖標與版本資訊嵌入
+        # 編譯資源文件，包含圖標與清單
         windres -i resource.rc -o resource.res --target=pe-x86-64 -O coff
 
     - name: Compile Executable
       shell: msys2 {0}
       run: |
-        # 優化點：
-        # 1. 使用 -I 準確指向緩存的標頭路徑
-        # 2. 同時添加 lib 和 lib64 路徑以兼容 OpenSSL 的安裝佈局
-        # 3. 靜態鏈接所有依賴庫，確保發布後無 DLL 缺失問題
+        # [核心修正] 
+        # 1. -I 指定 OpenSSL 標頭檔路徑
+        # 2. -L 同時指定 lib 和 lib64 路徑以應對 64 位元構建佈局
+        # 3. 靜態鏈接所有依賴庫，解決運行時 DLL 缺失
         gcc gui.c config.c proxy.c crypto.c utils.c globals.c cJSON.c resource.res -o Mandala.exe \
           -I${GITHUB_WORKSPACE}/openssl_dist/include \
           -L${GITHUB_WORKSPACE}/openssl_dist/lib \
