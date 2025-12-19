@@ -4,7 +4,7 @@
 #include <openssl/err.h>
 
 // ---------------------- BIO Fragmentation Implementation ----------------------
-// (用于 TCP 分片抗封锁的 BIO 过滤器实现)
+// (用於 TCP 分片抗封鎖的 BIO 過濾器實現)
 
 typedef struct {
     int first_packet_sent;
@@ -141,7 +141,7 @@ void init_openssl_global() {
         return;
     }
 
-    // [ECH Requirement] ECH 必须基于 TLS 1.3
+    // [ECH Requirement] ECH 必須基於 TLS 1.3
     SSL_CTX_set_min_proto_version(g_ssl_ctx, TLS1_2_VERSION);
     SSL_CTX_set_max_proto_version(g_ssl_ctx, TLS1_3_VERSION);
 
@@ -157,7 +157,7 @@ void init_openssl_global() {
         log_msg("[Security] Standard OpenSSL Cipher Suites");
     }
 
-    // 强制加载嵌入式 CA 证书 (资源 ID: 2)
+    // 強制加載嵌入式 CA 證書 (資源 ID: 2)
     HRSRC hRes = FindResourceW(NULL, MAKEINTRESOURCEW(2), RT_RCDATA);
     if (hRes) {
         HGLOBAL hData = LoadResource(NULL, hRes);
@@ -191,11 +191,7 @@ void init_openssl_global() {
     }
 }
 
-// [ECH] SSL 连接初始化
-// 参数: 
-// - target_sni: 外层 SNI (伪装域名)
-// - target_host: 内层 SNI (真实域名，被 ECH 加密)
-// - ech_config_b64: 从 DoH 获取的 ECH Config (Base64)
+// [ECH] SSL 連接初始化
 int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target_host, const char* ech_config_b64) {
     if (!g_ssl_ctx) init_openssl_global();
     
@@ -215,7 +211,7 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
         if (blockSize > 0) SSL_set_block_padding(ctx->ssl, blockSize);
     }
 
-    // 2. 配置 TCP 分片 (BIO 过滤器)
+    // 2. 配置 TCP 分片 (BIO 過濾器)
     BIO *bio = BIO_new_socket(ctx->sock, BIO_NOCLOSE);
     if (g_enableFragment) {
         BIO *frag = BIO_new(BIO_f_fragment());
@@ -224,30 +220,16 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
     SSL_set_bio(ctx->ssl, bio, bio);
     
     // 3. 配置 ECH
-    // 逻辑：如果启用了 ECH，target_sni 实际上是“外层/伪装 SNI”，
-    // 而我们真正想访问的 target_host 应该被加密保护。
     const char *outer_sni = (target_sni && strlen(target_sni)) ? target_sni : target_host;
-    
-    // 设置 ClientHello 中的 SNI (Outer SNI)
     SSL_set_tlsext_host_name(ctx->ssl, outer_sni);
     
     if (ech_config_b64 && strlen(ech_config_b64) > 0) {
         size_t ech_len = 0;
         unsigned char* ech_bin = Base64Decode(ech_config_b64, &ech_len);
         if (ech_bin) {
-            // [ECH Enabled] 调用 OpenSSL ECH 接口
-            // 确保你的 libssl 库支持此符号，否则链接会失败
             int ret = SSL_set1_ech_config_list(ctx->ssl, ech_bin, ech_len);
             if (ret == 1) {
-                // 如果设置成功，OpenSSL 会自动将 Inner SNI 设为 target_host (如果提供了的话)
-                // 或者我们需要显式告诉 OpenSSL 这里的 target_host 是 Inner SNI?
-                // 通常 OpenSSL ECH 实现中，SSL_set_tlsext_host_name 设置的是 Outer。
-                // Inner SNI 往往隐含在 SSL 连接的目标验证名中，或者需要额外 API。
-                // 常见的 ECH API 行为是：如果配置了 ECH，握手时会尝试加密。
-                // 有些实现允许 SSL_set1_ech_outer_server_name(...)，
-                // 但标准用法通常是 SSL_set_tlsext_host_name 作为“网络层可见的 SNI”。
-                
-                log_msg("[Security] ECH Enabled. Outer: %s, Config Len: %d", outer_sni, ech_len);
+                log_msg("[Security] ECH Enabled. Outer: %s, Config Len: %d", outer_sni, (int)ech_len);
             } else {
                 unsigned long err = ERR_get_error();
                 char err_buf[256];
@@ -270,7 +252,6 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
     int ret = SSL_connect(ctx->ssl);
     if (ret == 1) {
         log_msg("[Debug] SSL_connect Success. Cipher: %s", SSL_get_cipher_name(ctx->ssl));
-        // 可以在这里检查 ECH 是否协商成功 (SSL_ech_get_status)
         return 0;
     } else {
         int err = SSL_get_error(ctx->ssl, ret);
@@ -305,7 +286,7 @@ int tls_read(TLSContext *ctx, char *out, int max) {
     if (ret <= 0) {
         int err = SSL_get_error(ctx->ssl, ret);
         if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) return 0;
-        if (err == SSL_ERROR_ZERO_RETURN) return -1; // Connection closed
+        if (err == SSL_ERROR_ZERO_RETURN) return -1; 
         return -1;
     }
     return ret;
