@@ -3,83 +3,94 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
+  # --- 任務 1：專門負責編譯 OpenSSL ---
+  build-openssl:
     runs-on: windows-latest
-    
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    - name: Setup MSYS2
-      uses: msys2/setup-msys2@v2
-      with:
-        msystem: MINGW64
-        update: false
-        cache: true # 啟用 MSYS2 系統包快取
-        install: git
-        path-type: minimal
-        release: true
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          cache: true
+          install: git
+          path-type: minimal
 
-    - name: Disable Signature Check and Install Dependencies
-      shell: msys2 {0}
-      run: |
-        echo "Applying NUCLEAR FIX: Disabling signature checks..."
-        sed -i 's/^SigLevel.*/SigLevel = Never/' /etc/pacman.conf
+      - name: Install Dependencies
+        shell: msys2 {0}
+        run: |
+          sed -i 's/^SigLevel.*/SigLevel = Never/' /etc/pacman.conf
+          pacman -Sy --noconfirm mingw-w64-x86_64-gcc mingw-w64-x86_64-make
 
-        echo "Installing build tools"
-        pacman -Sy --noconfirm \
-          mingw-w64-x86_64-gcc \
-          mingw-w64-x86_64-make
+      - name: Cache OpenSSL
+        id: cache-openssl
+        uses: actions/cache@v4
+        with:
+          path: openssl_dist
+          key: openssl-ech-${{ runner.os }}-v1 # 固定版本 Key
 
-    # [優化] 使用穩定版本快取。一旦成功生成的 openssl_dist 被儲存，下次將直接調用。
-    - name: Cache OpenSSL
-      id: cache-openssl
-      uses: actions/cache@v4
-      with:
-        path: openssl_dist
-        key: openssl-ech-${{ runner.os }}-v1 
+      - name: Build OpenSSL with ECH
+        if: steps.cache-openssl.outputs.cache-hit != 'true'
+        shell: msys2 {0}
+        run: |
+          echo "Building OpenSSL (This will only run once)..."
+          git clone --depth 1 https://github.com/defo-project/openssl.git openssl-ech
+          cd openssl-ech
+          ./Configure mingw64 no-shared enable-ech --prefix=${GITHUB_WORKSPACE}/openssl_dist
+          mingw32-make -j8
+          mingw32-make install_sw
 
-    - name: Build OpenSSL with ECH (Static from DEfO)
-      if: steps.cache-openssl.outputs.cache-hit != 'true'
-      shell: msys2 {0}
-      run: |
-        echo "Cloning OpenSSL ECH fork (DEfO project)..."
-        git clone --depth 1 https://github.com/defo-project/openssl.git openssl-ech
-        cd openssl-ech
+  # --- 任務 2：編譯 Mandala 主程序 ---
+  build-app:
+    needs: build-openssl # 確保 OpenSSL 任務先完成
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-        echo "Configuring OpenSSL with ECH support..."
-        # 使用絕對路徑作為前綴，確保編譯產物位置固定
-        ./Configure mingw64 no-shared enable-ech --prefix=${GITHUB_WORKSPACE}/openssl_dist
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          cache: true
+          install: git
+          path-type: minimal
 
-        echo "Compiling OpenSSL..."
-        mingw32-make -j8
-        mingw32-make install_sw
-        cd ..
-        rm -rf openssl-ech
+      - name: Install Build Tools
+        shell: msys2 {0}
+        run: |
+          sed -i 's/^SigLevel.*/SigLevel = Never/' /etc/pacman.conf
+          pacman -Sy --noconfirm mingw-w64-x86_64-gcc mingw-w64-x86_64-make
 
-    - name: Compile Resources
-      shell: msys2 {0}
-      run: |
-        # 編譯資源文件，包含圖標與清單
-        windres -i resource.rc -o resource.res --target=pe-x86-64 -O coff
+      - name: Restore OpenSSL Cache
+        id: cache-openssl
+        uses: actions/cache@v4
+        with:
+          path: openssl_dist
+          key: openssl-ech-${{ runner.os }}-v1 # 必須與任務 1 的 Key 完全一致
 
-    - name: Compile Executable
-      shell: msys2 {0}
-      run: |
-        # [核心修正] 
-        # 1. -I 指定 OpenSSL 標頭檔路徑
-        # 2. -L 同時指定 lib 和 lib64 路徑以應對 64 位元構建佈局
-        # 3. 靜態鏈接所有依賴庫，解決運行時 DLL 缺失
-        gcc gui.c config.c proxy.c crypto.c utils.c globals.c cJSON.c resource.res -o Mandala.exe \
-          -I${GITHUB_WORKSPACE}/openssl_dist/include \
-          -L${GITHUB_WORKSPACE}/openssl_dist/lib \
-          -L${GITHUB_WORKSPACE}/openssl_dist/lib64 \
-          -lssl -lcrypto -lws2_32 -lgdi32 -lcomctl32 -lwininet -lcrypt32 -luser32 \
-          -mwindows -municode -finput-charset=UTF-8 \
-          -static
+      - name: Compile Resources
+        shell: msys2 {0}
+        run: windres -i resource.rc -o resource.res --target=pe-x86-64 -O coff
 
-    - name: Upload Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: Mandala-Windows-x64-ECH
-        path: Mandala.exe
+      - name: Compile Executable
+        shell: msys2 {0}
+        run: |
+          # 這裡現在會直接使用任務 1 緩存好的 openssl_dist
+          gcc gui.c config.c proxy.c crypto.c utils.c globals.c cJSON.c resource.res -o Mandala.exe \
+            -I${GITHUB_WORKSPACE}/openssl_dist/include \
+            -L${GITHUB_WORKSPACE}/openssl_dist/lib \
+            -L${GITHUB_WORKSPACE}/openssl_dist/lib64 \
+            -lssl -lcrypto -lws2_32 -lgdi32 -lcomctl32 -lwininet -lcrypt32 -luser32 \
+            -mwindows -municode -finput-charset=UTF-8 \
+            -static
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mandala-Windows-x64-ECH
+          path: Mandala.exe
