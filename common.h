@@ -104,7 +104,8 @@ typedef struct {
     char sni[256]; 
     char user[128]; 
     char pass[128];
-    char type[32]; 
+    char type[32];
+    char ech[2048]; // [ECH Refactor] 增加 ECH 配置存储字段
 } ProxyConfig;
 
 // --- 全局变量声明 (extern) ---
