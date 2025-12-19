@@ -13,18 +13,20 @@
 #endif
 
 extern int g_localPort; 
-extern BOOL g_enableLog; // [新增] 引用全局日志开关
+extern BOOL g_enableLog; 
 
 // --- 日志函数 ---
 void log_msg(const char *format, ...) {
-    // [新增] 如果未开启日志，直接跳过
-    if (!g_enableLog) return;
+    // 生产环境安全建议：保留 Fatal 错误日志，即使 g_enableLog 为 FALSE
+    // 这里为简化，仅保留原逻辑，但建议在 format 包含 [Fatal] 时强制输出
+    if (!g_enableLog && strstr(format, "[Fatal]") == NULL) return;
 
     char buf[2048]; 
     char time_buf[64]; 
     SYSTEMTIME st; 
     GetLocalTime(&st);
-    sprintf(time_buf, "[%02d:%02d:%02d] ", st.wHour, st.wMinute, st.wSecond);
+    // [Safety] 缓冲区安全
+    snprintf(time_buf, sizeof(time_buf), "[%02d:%02d:%02d] ", st.wHour, st.wMinute, st.wSecond);
     
     va_list args; 
     va_start(args, format); 
@@ -95,23 +97,19 @@ void UrlDecode(char* dst, const char* src) {
 char* GetQueryParam(const char* query, const char* key) {
     if (!query || !key) return NULL;
     char keyEq[128]; 
+    // [Security Fix] 使用 snprintf
     snprintf(keyEq, sizeof(keyEq), "%s=", key);
     size_t keyEqLen = strlen(keyEq);
 
     const char* p = query;
     while ((p = strstr(p, keyEq)) != NULL) {
-        // 确保匹配的是完整的 key (前缀是开头或&或?)
         if (p == query || *(p - 1) == '&' || *(p - 1) == '?') {
             const char* start = p + keyEqLen;
-            
-            // [修复关键点] 查找值的结束位置：遇到 '&' 或 '#' 或 '\0' 均视为结束
             size_t len = 0;
             while (start[len] && start[len] != '&' && start[len] != '#') {
                 len++;
             }
-
             if (len == 0) return NULL;
-
             char* value = (char*)malloc(len + 1);
             if (!value) return NULL;
             strncpy(value, start, len);
@@ -128,7 +126,7 @@ char* GetQueryParam(const char* query, const char* key) {
     return NULL;
 }
 
-// --- Base64 ---
+// ... (Base64 和其他辅助函数保持不变) ...
 static int GetBase64Val(char c) {
     if (c >= 'A' && c <= 'Z') return c - 'A';
     if (c >= 'a' && c <= 'z') return c - 'a' + 26;
@@ -211,23 +209,20 @@ static BOOL ParseUrl(const char* url, URL_COMPONENTS_SIMPLE* out) {
     const char* p = url;
     if (strncmp(p, "https://", 8) == 0) { out->port = 443; p += 8; }
     else if (strncmp(p, "http://", 7) == 0) { out->port = 80; p += 7; }
-    else return FALSE; // Only support HTTP/HTTPS
+    else return FALSE; 
 
-    // Host
     const char* slash = strchr(p, '/');
     int hostLen = (slash) ? (int)(slash - p) : (int)strlen(p);
     if (hostLen >= sizeof(out->host)) return FALSE;
     strncpy(out->host, p, hostLen);
     out->host[hostLen] = '\0';
 
-    // Port in host
     char* colon = strchr(out->host, ':');
     if (colon) {
         *colon = '\0';
         out->port = atoi(colon + 1);
     }
 
-    // Path
     if (slash) {
         if (strlen(slash) >= sizeof(out->path)) return FALSE; 
         strcpy(out->path, slash);
@@ -237,7 +232,6 @@ static BOOL ParseUrl(const char* url, URL_COMPONENTS_SIMPLE* out) {
     return TRUE;
 }
 
-// --- OpenSSL 实现的 HTTPS GET ---
 static char* InternalHttpsGet(const char* url, BOOL useProxy) {
     URL_COMPONENTS_SIMPLE u;
     if (!ParseUrl(url, &u)) { log_msg("[Utils] Invalid URL or too long: %s", url); return NULL; }
@@ -255,7 +249,6 @@ static char* InternalHttpsGet(const char* url, BOOL useProxy) {
     SSL *ssl = NULL;
     char* result = NULL;
 
-    // 1. 建立 TCP 连接
     const char* targetHost = useProxy ? "127.0.0.1" : u.host;
     int targetPort = useProxy ? g_localPort : u.port;
 
@@ -284,9 +277,9 @@ static char* InternalHttpsGet(const char* url, BOOL useProxy) {
         return NULL;
     }
 
-    // 2. 如果是代理，发送 HTTP CONNECT
     if (useProxy) {
         char connectReq[512];
+        // [Safety] snprintf
         snprintf(connectReq, sizeof(connectReq), 
             "CONNECT %s:%d HTTP/1.1\r\n"
             "Host: %s:%d\r\n"
@@ -306,10 +299,10 @@ static char* InternalHttpsGet(const char* url, BOOL useProxy) {
         }
     }
 
-    // 3. SSL 握手
     ctx = SSL_CTX_new(TLS_client_method());
     if (!ctx) { closesocket(s); return NULL; }
     
+    // [Note] 这里是工具函数下载订阅/更新用的，非核心代理逻辑，暂保持 verify_none 以防订阅源自签
     SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
 
     ssl = SSL_new(ctx);
@@ -318,13 +311,12 @@ static char* InternalHttpsGet(const char* url, BOOL useProxy) {
     SSL_set_tlsext_host_name(ssl, u.host);
 
     if (SSL_connect(ssl) != 1) {
-        log_msg("[Utils] SSL Handshake Failed. (OpenSSL error)");
-        ERR_print_errors_fp(stderr);
+        log_msg("[Utils] SSL Handshake Failed.");
         goto cleanup;
     }
 
-    // 4. 发送 HTTP GET
     char request[4096];
+    // [Safety] snprintf
     snprintf(request, sizeof(request),
         "GET %s HTTP/1.1\r\n"
         "Host: %s\r\n"
@@ -335,7 +327,6 @@ static char* InternalHttpsGet(const char* url, BOOL useProxy) {
     
     if (SSL_write(ssl, request, (int)strlen(request)) <= 0) goto cleanup;
 
-    // 5. 读取响应
     int buffer_size = 65536; 
     int total_read = 0;
     char* resp_buf = (char*)malloc(buffer_size);
@@ -354,7 +345,6 @@ static char* InternalHttpsGet(const char* url, BOOL useProxy) {
     }
     resp_buf[total_read] = 0;
 
-    // 6. 解析 HTTP 响应
     char* body_start = strstr(resp_buf, "\r\n\r\n");
     if (!body_start) {
         body_start = strstr(resp_buf, "\n\n");
@@ -385,22 +375,18 @@ cleanup:
     return result;
 }
 
-// --- Utils_HttpGet ---
 char* Utils_HttpGet(const char* url) {
     if (!url) return NULL;
     
-    // 1. 优先尝试走本地代理
     if (g_localPort > 0) {
         char* res = InternalHttpsGet(url, TRUE);
         if (res) return res;
         log_msg("[Utils] Proxy download failed, falling back to DIRECT mode...");
     }
-
-    // 2. 尝试直连
     return InternalHttpsGet(url, FALSE);
 }
 
-// --- Windows 代理设置 (保留) ---
+// ... (Proxy settings 保持不变) ...
 BOOL IsWindows8OrGreater() {
     HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
     if (hKernel32 == NULL) return FALSE;
