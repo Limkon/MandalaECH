@@ -139,7 +139,7 @@ void init_openssl_global() {
         return;
     }
 
-    // ECH 需要 TLS 1.3
+    // 设置 TLS 版本
     SSL_CTX_set_min_proto_version(g_ssl_ctx, TLS1_2_VERSION);
     SSL_CTX_set_max_proto_version(g_ssl_ctx, TLS1_3_VERSION);
 
@@ -155,7 +155,6 @@ void init_openssl_global() {
         log_msg("[Security] Standard OpenSSL Cipher Suites");
     }
 
-    // 加载嵌入式 CA 证书
     HRSRC hRes = FindResourceW(NULL, MAKEINTRESOURCEW(2), RT_RCDATA);
     if (hRes) {
         HGLOBAL hData = LoadResource(NULL, hRes);
@@ -176,7 +175,6 @@ void init_openssl_global() {
                     SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_PEER, NULL);
                     log_msg("[Security] Embedded CA loaded (%d certs). Strict mode.", count);
                 } else {
-                    // 禁止回退到不验证
                     log_msg("[Fatal] Embedded CA data invalid. Secure connection cannot be established.");
                 }
             } else {
@@ -226,11 +224,16 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
         size_t ech_len = 0;
         unsigned char* ech_bin = Base64Decode(ech_config_b64, &ech_len);
         if (ech_bin) {
-#if OPENSSL_VERSION_NUMBER >= 0x30400000L
-            // OpenSSL 3.4+ API: SSL_set1_ech_config_list
-            // 注意：某些 MinGW OpenSSL 分发版可能在头文件中未完全暴露此 API，
-            // 但如果库本身是 3.4+，链接时通常可行。这里假设环境正确。
-            if (SSL_set1_ech_config_list(ctx->ssl, ech_bin, ech_len) == 1) {
+            // 尝试检测是否存在 SSL_set1_ech_config_list 宏或函数
+            // 由于 C 语言在预处理阶段无法检测函数存在性，且 MingGW 环境报错，
+            // 这里我们暂时注释掉直接调用，或者依赖编译器支持。
+            // 鉴于错误日志明确显示 implicit declaration，说明头文件不支持。
+            // 为了编译通过，我们将此功能降级为日志警告。
+            
+            // #if defined(SSL_set1_ech_config_list) // 这种检查通常无效，除非它是宏
+            
+            // 如果您确定环境已修复，取消下面代码块的注释
+            /* if (SSL_set1_ech_config_list(ctx->ssl, ech_bin, ech_len) == 1) {
                 log_msg("[Security] ECH Config applied for %s", sni_name);
             } else {
                 unsigned long err = ERR_get_error();
@@ -238,9 +241,9 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
                 ERR_error_string_n(err, err_buf, sizeof(err_buf));
                 log_msg("[Error] Failed to apply ECH config: %s", err_buf);
             }
-#else
-            log_msg("[Warning] ECH config present but OpenSSL version < 3.4.0. ECH ignored.");
-#endif
+            */
+            
+            log_msg("[Warning] ECH config ignored: Compilation environment missing ECH support.");
             free(ech_bin);
         } else {
             log_msg("[Error] Failed to decode ECH Base64 config");
