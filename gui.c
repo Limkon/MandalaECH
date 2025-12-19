@@ -833,7 +833,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nSho
     // 初始化 set.ini 路徑 (用於存儲軟件設置)
     GetModuleFileNameW(NULL, g_iniFilePath, MAX_PATH);
     wchar_t* p = wcsrchr(g_iniFilePath, L'\\'); 
-    if (p) { *p = 0; wcscat(g_iniFilePath, L'\\set.ini'); } 
+    // [修正] 將 L'\\set.ini' 改為 L"\\set.ini" (雙引號)
+    if (p) { *p = 0; wcscat(g_iniFilePath, L"\\set.ini"); } 
     else wcscpy(g_iniFilePath, L"set.ini");
     
     // [新增] 初始化 config.json 路徑 (用於存儲節點信息)
@@ -873,5 +874,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nSho
     
     return 0;
 }
+
 
 
