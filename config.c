@@ -12,8 +12,17 @@ int g_subCount = 0;
 // --- 内部辅助函数声明 ---
 int Internal_BatchAddNodesFromText(const char* text, cJSON* outbounds);
 char* GetUniqueTagName(cJSON* outbounds, const char* type, const char* base_name);
-// [新增] 前向声明，以防头文件未更新
 cJSON* ParseMandala(const char* link);
+
+// [Security Fix] 安全字符串复制辅助函数
+// 确保目标缓冲区一定以 \0 结尾，且不会溢出
+static void SafeStrCpy(char* dest, size_t destSize, const char* src) {
+    if (!dest || destSize == 0) return;
+    if (!src) { dest[0] = '\0'; return; }
+    
+    // 使用 snprintf 自动处理截断和 null 结尾
+    snprintf(dest, destSize, "%s", src);
+}
 
 // --- 辅助：安全获取或创建 JSON 对象 ---
 static cJSON* GetOrCreateObj(cJSON* parent, const char* name) {
@@ -34,15 +43,16 @@ static void ParseSSPlugin(cJSON* outbound, const char* pluginParam) {
     char host[256] = {0}; char path[256] = {0}; char sni[256] = {0}; char mode[64] = {0};
     BOOL isTls = FALSE;
     BOOL isV2ray = (strstr(pluginCopy, "v2ray-plugin") != NULL);
-    BOOL isObfs = (strstr(pluginCopy, "obfs-local") != NULL || strstr(pluginCopy, "simple-obfs") != NULL);
+    // BOOL isObfs = (strstr(pluginCopy, "obfs-local") != NULL || strstr(pluginCopy, "simple-obfs") != NULL); // 未使用变量
     
     char* ctx = NULL; char* token = strtok_s(pluginCopy, ";", &ctx);
     while (token) {
-        if (strncmp(token, "host=", 5) == 0) strncpy(host, token+5, 255);
-        else if (strncmp(token, "obfs-host=", 10) == 0) strncpy(host, token+10, 255);
-        else if (strncmp(token, "path=", 5) == 0) strncpy(path, token+5, 255);
-        else if (strncmp(token, "sni=", 4) == 0) strncpy(sni, token+4, 255);
-        else if (strncmp(token, "mode=", 5) == 0) strncpy(mode, token+5, 63);
+        // [Security Fix] 使用 SafeStrCpy 替代 strncpy，防止未截断风险
+        if (strncmp(token, "host=", 5) == 0) SafeStrCpy(host, sizeof(host), token+5);
+        else if (strncmp(token, "obfs-host=", 10) == 0) SafeStrCpy(host, sizeof(host), token+10);
+        else if (strncmp(token, "path=", 5) == 0) SafeStrCpy(path, sizeof(path), token+5);
+        else if (strncmp(token, "sni=", 4) == 0) SafeStrCpy(sni, sizeof(sni), token+4);
+        else if (strncmp(token, "mode=", 5) == 0) SafeStrCpy(mode, sizeof(mode), token+5);
         else if (strcmp(token, "tls") == 0) isTls = TRUE;
         else if (strncmp(token, "obfs=", 5) == 0) { if (strcmp(token+5, "tls") == 0) isTls = TRUE; }
         token = strtok_s(NULL, ";", &ctx);
@@ -57,7 +67,6 @@ static void ParseSSPlugin(cJSON* outbound, const char* pluginParam) {
 
     if (isV2ray && strcmp(mode, "quic") != 0) {
         cJSON* trans = GetOrCreateObj(outbound, "transport");
-        // 只有当没有设置 type 时才设置，避免覆盖
         if (!cJSON_HasObjectItem(trans, "type")) cJSON_AddStringToObject(trans, "type", "ws");
         if (strlen(path) > 0) cJSON_AddStringToObject(trans, "path", path);
         if (strlen(host) > 0) {
@@ -92,7 +101,7 @@ void LoadSettings() {
     g_uaPlatformIndex = GetPrivateProfileIntW(L"Settings", L"UAPlatform", 0, g_iniFilePath);
     wchar_t wUABuf[512] = {0}; GetPrivateProfileStringW(L"Settings", L"UserAgent", L"", wUABuf, 512, g_iniFilePath);
     if (wcslen(wUABuf) > 5) WideCharToMultiByte(CP_UTF8, 0, wUABuf, -1, g_userAgentStr, sizeof(g_userAgentStr), NULL, NULL);
-    else strcpy(g_userAgentStr, UA_TEMPLATES[0]);
+    else SafeStrCpy(g_userAgentStr, sizeof(g_userAgentStr), UA_TEMPLATES[0]);
 
     GetPrivateProfileStringW(L"Settings", L"LastNode", L"", currentNode, 64, g_iniFilePath);
 
@@ -100,7 +109,9 @@ void LoadSettings() {
     if (g_subCount > MAX_SUBS) g_subCount = MAX_SUBS;
     for (int i = 0; i < g_subCount; i++) {
         wchar_t wKeyEn[32], wKeyUrl[32], wUrl[512];
-        wsprintfW(wKeyEn, L"Sub%d_Enabled", i); wsprintfW(wKeyUrl, L"Sub%d_Url", i);
+        // [Security Fix] 使用 swprintf_s 替代 wsprintfW
+        swprintf_s(wKeyEn, 32, L"Sub%d_Enabled", i); 
+        swprintf_s(wKeyUrl, 32, L"Sub%d_Url", i);
         g_subs[i].enabled = GetPrivateProfileIntW(L"Subscriptions", wKeyEn, 1, g_iniFilePath);
         GetPrivateProfileStringW(L"Subscriptions", wKeyUrl, L"", wUrl, 512, g_iniFilePath);
         WideCharToMultiByte(CP_UTF8, 0, wUrl, -1, g_subs[i].url, 512, NULL, NULL);
@@ -109,32 +120,36 @@ void LoadSettings() {
 
 void SaveSettings() {
     wchar_t buffer[16];
-    wsprintfW(buffer, L"%u", g_hotkeyModifiers); WritePrivateProfileStringW(L"Settings", L"Modifiers", buffer, g_iniFilePath);
-    wsprintfW(buffer, L"%u", g_hotkeyVk); WritePrivateProfileStringW(L"Settings", L"VK", buffer, g_iniFilePath);
-    wsprintfW(buffer, L"%d", g_localPort); WritePrivateProfileStringW(L"Settings", L"LocalPort", buffer, g_iniFilePath);
-    wsprintfW(buffer, L"%d", g_hideTrayStart); WritePrivateProfileStringW(L"Settings", L"HideTray", buffer, g_iniFilePath);
-    wsprintfW(buffer, L"%d", g_enableChromeCiphers); WritePrivateProfileStringW(L"Settings", L"ChromeCiphers", buffer, g_iniFilePath);
-    wsprintfW(buffer, L"%d", g_enableALPN); WritePrivateProfileStringW(L"Settings", L"EnableALPN", buffer, g_iniFilePath);
-    wsprintfW(buffer, L"%d", g_enableFragment); WritePrivateProfileStringW(L"Settings", L"EnableFragment", buffer, g_iniFilePath);
-    wsprintfW(buffer, L"%d", g_fragSizeMin); WritePrivateProfileStringW(L"Settings", L"FragMin", buffer, g_iniFilePath);
-    wsprintfW(buffer, L"%d", g_fragSizeMax); WritePrivateProfileStringW(L"Settings", L"FragMax", buffer, g_iniFilePath);
-    wsprintfW(buffer, L"%d", g_fragDelayMs); WritePrivateProfileStringW(L"Settings", L"FragDelay", buffer, g_iniFilePath);
-    wsprintfW(buffer, L"%d", g_enablePadding); WritePrivateProfileStringW(L"Settings", L"EnablePadding", buffer, g_iniFilePath);
-    wsprintfW(buffer, L"%d", g_padSizeMin); WritePrivateProfileStringW(L"Settings", L"PadMin", buffer, g_iniFilePath);
-    wsprintfW(buffer, L"%d", g_padSizeMax); WritePrivateProfileStringW(L"Settings", L"PadMax", buffer, g_iniFilePath);
-    wsprintfW(buffer, L"%d", g_uaPlatformIndex); WritePrivateProfileStringW(L"Settings", L"UAPlatform", buffer, g_iniFilePath);
+    // [Security Fix] 全面替换为 swprintf_s
+    swprintf_s(buffer, 16, L"%u", g_hotkeyModifiers); WritePrivateProfileStringW(L"Settings", L"Modifiers", buffer, g_iniFilePath);
+    swprintf_s(buffer, 16, L"%u", g_hotkeyVk); WritePrivateProfileStringW(L"Settings", L"VK", buffer, g_iniFilePath);
+    swprintf_s(buffer, 16, L"%d", g_localPort); WritePrivateProfileStringW(L"Settings", L"LocalPort", buffer, g_iniFilePath);
+    swprintf_s(buffer, 16, L"%d", g_hideTrayStart); WritePrivateProfileStringW(L"Settings", L"HideTray", buffer, g_iniFilePath);
+    swprintf_s(buffer, 16, L"%d", g_enableChromeCiphers); WritePrivateProfileStringW(L"Settings", L"ChromeCiphers", buffer, g_iniFilePath);
+    swprintf_s(buffer, 16, L"%d", g_enableALPN); WritePrivateProfileStringW(L"Settings", L"EnableALPN", buffer, g_iniFilePath);
+    swprintf_s(buffer, 16, L"%d", g_enableFragment); WritePrivateProfileStringW(L"Settings", L"EnableFragment", buffer, g_iniFilePath);
+    swprintf_s(buffer, 16, L"%d", g_fragSizeMin); WritePrivateProfileStringW(L"Settings", L"FragMin", buffer, g_iniFilePath);
+    swprintf_s(buffer, 16, L"%d", g_fragSizeMax); WritePrivateProfileStringW(L"Settings", L"FragMax", buffer, g_iniFilePath);
+    swprintf_s(buffer, 16, L"%d", g_fragDelayMs); WritePrivateProfileStringW(L"Settings", L"FragDelay", buffer, g_iniFilePath);
+    swprintf_s(buffer, 16, L"%d", g_enablePadding); WritePrivateProfileStringW(L"Settings", L"EnablePadding", buffer, g_iniFilePath);
+    swprintf_s(buffer, 16, L"%d", g_padSizeMin); WritePrivateProfileStringW(L"Settings", L"PadMin", buffer, g_iniFilePath);
+    swprintf_s(buffer, 16, L"%d", g_padSizeMax); WritePrivateProfileStringW(L"Settings", L"PadMax", buffer, g_iniFilePath);
+    swprintf_s(buffer, 16, L"%d", g_uaPlatformIndex); WritePrivateProfileStringW(L"Settings", L"UAPlatform", buffer, g_iniFilePath);
     wchar_t wUABuf[512] = {0}; MultiByteToWideChar(CP_UTF8, 0, g_userAgentStr, -1, wUABuf, 512);
     WritePrivateProfileStringW(L"Settings", L"UserAgent", wUABuf, g_iniFilePath);
 
     WritePrivateProfileStringW(L"Settings", L"LastNode", currentNode, g_iniFilePath);
 
     WritePrivateProfileStringW(L"Subscriptions", NULL, NULL, g_iniFilePath);
-    wsprintfW(buffer, L"%d", g_subCount); WritePrivateProfileStringW(L"Subscriptions", L"Count", buffer, g_iniFilePath);
+    swprintf_s(buffer, 16, L"%d", g_subCount); WritePrivateProfileStringW(L"Subscriptions", L"Count", buffer, g_iniFilePath);
     for (int i = 0; i < g_subCount; i++) {
         wchar_t wKeyEn[32], wKeyUrl[32], wUrl[512], wVal[2];
-        wsprintfW(wKeyEn, L"Sub%d_Enabled", i); wsprintfW(wKeyUrl, L"Sub%d_Url", i);
-        wsprintfW(wVal, L"%d", g_subs[i].enabled); WritePrivateProfileStringW(L"Subscriptions", wKeyEn, wVal, g_iniFilePath);
-        MultiByteToWideChar(CP_UTF8, 0, g_subs[i].url, -1, wUrl, 512); WritePrivateProfileStringW(L"Subscriptions", wKeyUrl, wUrl, g_iniFilePath);
+        swprintf_s(wKeyEn, 32, L"Sub%d_Enabled", i); 
+        swprintf_s(wKeyUrl, 32, L"Sub%d_Url", i);
+        swprintf_s(wVal, 2, L"%d", g_subs[i].enabled); 
+        WritePrivateProfileStringW(L"Subscriptions", wKeyEn, wVal, g_iniFilePath);
+        MultiByteToWideChar(CP_UTF8, 0, g_subs[i].url, -1, wUrl, 512); 
+        WritePrivateProfileStringW(L"Subscriptions", wKeyUrl, wUrl, g_iniFilePath);
     }
 }
 
@@ -204,35 +219,47 @@ char* GetUniqueTagName(cJSON* outbounds, const char* type, const char* base_name
 void ParseNodeConfigToGlobal(cJSON *node) {
     if (!node) return;
     memset(&g_proxyConfig, 0, sizeof(ProxyConfig));
-    strcpy(g_proxyConfig.path, "/"); 
+    // [Security Fix] 使用 SafeStrCpy 防止配置溢出
+    SafeStrCpy(g_proxyConfig.path, sizeof(g_proxyConfig.path), "/"); 
+
     cJSON *server = cJSON_GetObjectItem(node, "server");
     cJSON *port = cJSON_GetObjectItem(node, "server_port");
     cJSON *uuid = cJSON_GetObjectItem(node, "uuid");
     if (!uuid) uuid = cJSON_GetObjectItem(node, "password"); 
-    if (server && server->valuestring) strcpy(g_proxyConfig.host, server->valuestring);
+    
+    if (server && server->valuestring) SafeStrCpy(g_proxyConfig.host, sizeof(g_proxyConfig.host), server->valuestring);
     if (port) g_proxyConfig.port = port->valueint;
-    if (uuid && uuid->valuestring) { strcpy(g_proxyConfig.user, uuid->valuestring); strcpy(g_proxyConfig.pass, uuid->valuestring); }
-    cJSON *user = cJSON_GetObjectItem(node, "username"); cJSON *pass = cJSON_GetObjectItem(node, "password");
-    if(user && user->valuestring) strcpy(g_proxyConfig.user, user->valuestring);
-    if(pass && pass->valuestring) strcpy(g_proxyConfig.pass, pass->valuestring);
+    
+    if (uuid && uuid->valuestring) { 
+        SafeStrCpy(g_proxyConfig.user, sizeof(g_proxyConfig.user), uuid->valuestring); 
+        SafeStrCpy(g_proxyConfig.pass, sizeof(g_proxyConfig.pass), uuid->valuestring); 
+    }
+    
+    cJSON *user = cJSON_GetObjectItem(node, "username"); 
+    cJSON *pass = cJSON_GetObjectItem(node, "password");
+    if(user && user->valuestring) SafeStrCpy(g_proxyConfig.user, sizeof(g_proxyConfig.user), user->valuestring);
+    if(pass && pass->valuestring) SafeStrCpy(g_proxyConfig.pass, sizeof(g_proxyConfig.pass), pass->valuestring);
+    
     cJSON *tls = cJSON_GetObjectItem(node, "tls");
     if (tls) {
         cJSON *sni = cJSON_GetObjectItem(tls, "server_name");
-        if (sni && sni->valuestring) strcpy(g_proxyConfig.sni, sni->valuestring);
+        if (sni && sni->valuestring) SafeStrCpy(g_proxyConfig.sni, sizeof(g_proxyConfig.sni), sni->valuestring);
     }
+    
     cJSON *trans = cJSON_GetObjectItem(node, "transport");
     if(trans) {
         cJSON *path = cJSON_GetObjectItem(trans, "path");
-        if(path && path->valuestring) strcpy(g_proxyConfig.path, path->valuestring);
+        if(path && path->valuestring) SafeStrCpy(g_proxyConfig.path, sizeof(g_proxyConfig.path), path->valuestring);
     }
-    if (strlen(g_proxyConfig.sni) == 0) strcpy(g_proxyConfig.sni, g_proxyConfig.host);
+    
+    if (strlen(g_proxyConfig.sni) == 0) SafeStrCpy(g_proxyConfig.sni, sizeof(g_proxyConfig.sni), g_proxyConfig.host);
 
     // 解析并保存协议类型
     cJSON *type = cJSON_GetObjectItem(node, "type");
     if (type && type->valuestring) {
-        strncpy(g_proxyConfig.type, type->valuestring, 31);
+        SafeStrCpy(g_proxyConfig.type, sizeof(g_proxyConfig.type), type->valuestring);
     } else {
-        strcpy(g_proxyConfig.type, "socks");
+        SafeStrCpy(g_proxyConfig.type, sizeof(g_proxyConfig.type), "socks");
     }
 
     log_msg("Node Config Loaded: %s:%d (Type: %s, SNI: %s)", 
@@ -254,11 +281,13 @@ void SwitchNode(const wchar_t* tag) {
         if (t && strcmp(t->valuestring, tagUtf8) == 0) { targetNode = node; break; }
     }
     if (targetNode) {
-        StopProxyCore(); ParseNodeConfigToGlobal(targetNode); StartProxyCore();
-        // 保存设置
+        StopProxyCore(); 
+        ParseNodeConfigToGlobal(targetNode); 
+        StartProxyCore();
         SaveSettings(); 
         
-        wchar_t tip[128]; wsprintfW(tip, L"已切换: %s", tag);
+        wchar_t tip[128]; 
+        swprintf_s(tip, 128, L"已切换: %s", tag);
         wcsncpy(nid.szInfo, tip, 127); wcsncpy(nid.szInfoTitle, L"Mandala Client", 63); nid.uFlags |= NIF_INFO;
         Shell_NotifyIconW(NIM_MODIFY, &nid);
     }
@@ -326,7 +355,6 @@ int Internal_BatchAddNodesFromText(const char* text, cJSON* outbounds) {
                 char* uniqueTag = GetUniqueTagName(outbounds, typeStr, originalTag);
                 if (cJSON_HasObjectItem(node, "tag")) cJSON_ReplaceItemInObject(node, "tag", cJSON_CreateString(uniqueTag));
                 else cJSON_AddStringToObject(node, "tag", uniqueTag);
-                // [修复] 修正了变量名错误 newNode -> node
                 cJSON_AddItemToArray(outbounds, node); count++;
             }
         }
@@ -433,12 +461,24 @@ cJSON* ParseShadowsocks(const char* link) {
         size_t decLen; unsigned char* decoded = Base64Decode(mainPart, &decLen);
         if(!decoded) { free(mainPart); free(tag); return NULL; }
         char* dStr = (char*)decoded; at = strchr(dStr, '@');
-        if (at) { strncpy(serverPort, at+1, 255); strncpy(methodPass, dStr, at-dStr); methodPass[at-dStr]=0; }
+        if (at) { 
+            // [Security] 限制复制长度
+            SafeStrCpy(serverPort, sizeof(serverPort), at+1); 
+            size_t mpLen = at - dStr;
+            if (mpLen >= sizeof(methodPass)) mpLen = sizeof(methodPass) - 1;
+            strncpy(methodPass, dStr, mpLen); methodPass[mpLen]=0; 
+        }
         free(decoded);
     } else {
-        strncpy(serverPort, at+1, 255); char b64User[256]; strncpy(b64User, mainPart, at-mainPart); b64User[at-mainPart] = 0;
+        SafeStrCpy(serverPort, sizeof(serverPort), at+1); 
+        char b64User[256]; 
+        size_t uLen = at - mainPart;
+        if (uLen >= sizeof(b64User)) uLen = sizeof(b64User) - 1;
+        strncpy(b64User, mainPart, uLen); b64User[uLen] = 0;
+        
         size_t decLen; unsigned char* decoded = Base64Decode(b64User, &decLen);
-        if(decoded) { strncpy(methodPass, (char*)decoded, 255); free(decoded); } else strncpy(methodPass, b64User, 255);
+        if(decoded) { SafeStrCpy(methodPass, sizeof(methodPass), (char*)decoded); free(decoded); } 
+        else SafeStrCpy(methodPass, sizeof(methodPass), b64User);
     }
     free(mainPart);
     char* colon = strrchr(serverPort, ':'); if (!colon) { free(tag); return NULL; }
