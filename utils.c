@@ -18,14 +18,14 @@ extern BOOL g_enableLog;
 // --- 日志函数 ---
 void log_msg(const char *format, ...) {
     // 生产环境安全建议：保留 Fatal 错误日志，即使 g_enableLog 为 FALSE
-    // 这里为简化，仅保留原逻辑，但建议在 format 包含 [Fatal] 时强制输出
     if (!g_enableLog && strstr(format, "[Fatal]") == NULL) return;
 
     char buf[2048]; 
     char time_buf[64]; 
     SYSTEMTIME st; 
     GetLocalTime(&st);
-    // [Safety] 缓冲区安全
+    
+    // [Safety] 使用 snprintf 防止溢出
     snprintf(time_buf, sizeof(time_buf), "[%02d:%02d:%02d] ", st.wHour, st.wMinute, st.wSecond);
     
     va_list args; 
@@ -55,22 +55,31 @@ void log_wsa_error(const char* context) {
 
 // --- 文件操作 ---
 BOOL ReadFileToBuffer(const wchar_t* filename, char** buffer, long* fileSize) {
-    FILE* f = NULL;
-    if (_wfopen_s(&f, filename, L"rb") != 0 || !f) { *fileSize=0; return FALSE; }
-    fseek(f, 0, SEEK_END); *fileSize = ftell(f); fseek(f, 0, SEEK_SET);
+    // [Fix] 使用 _wfopen 替代 _wfopen_s 以兼容 MinGW
+    FILE* f = _wfopen(filename, L"rb");
+    if (!f) { *fileSize=0; return FALSE; }
+    
+    fseek(f, 0, SEEK_END); 
+    *fileSize = ftell(f); 
+    fseek(f, 0, SEEK_SET);
+    
     *buffer = (char*)malloc(*fileSize + 1);
     if (*buffer) {
         fread(*buffer, 1, *fileSize, f); 
         (*buffer)[*fileSize] = 0;
     }
-    fclose(f); return (*buffer != NULL);
+    fclose(f); 
+    return (*buffer != NULL);
 }
 
 BOOL WriteBufferToFile(const wchar_t* filename, const char* buffer) {
-    FILE* f = NULL;
-    if (_wfopen_s(&f, filename, L"wb") != 0 || !f) return FALSE;
+    // [Fix] 使用 _wfopen 替代 _wfopen_s 以兼容 MinGW
+    FILE* f = _wfopen(filename, L"wb");
+    if (!f) return FALSE;
+    
     fwrite(buffer, 1, strlen(buffer), f);
-    fclose(f); return TRUE;
+    fclose(f); 
+    return TRUE;
 }
 
 // --- 字符串处理 ---
@@ -103,13 +112,16 @@ char* GetQueryParam(const char* query, const char* key) {
 
     const char* p = query;
     while ((p = strstr(p, keyEq)) != NULL) {
+        // 确保匹配的是参数名，而不是值的后缀 (例如 key=...&real_key=...)
         if (p == query || *(p - 1) == '&' || *(p - 1) == '?') {
             const char* start = p + keyEqLen;
             size_t len = 0;
+            // 读取直到遇到 '&' 或 '#' 或 字符串结束
             while (start[len] && start[len] != '&' && start[len] != '#') {
                 len++;
             }
             if (len == 0) return NULL;
+            
             char* value = (char*)malloc(len + 1);
             if (!value) return NULL;
             strncpy(value, start, len);
@@ -126,7 +138,7 @@ char* GetQueryParam(const char* query, const char* key) {
     return NULL;
 }
 
-// ... (Base64 和其他辅助函数保持不变) ...
+// --- Base64 和其他辅助函数 ---
 static int GetBase64Val(char c) {
     if (c >= 'A' && c <= 'Z') return c - 'A';
     if (c >= 'a' && c <= 'z') return c - 'a' + 26;
@@ -139,31 +151,48 @@ static int GetBase64Val(char c) {
 unsigned char* Base64Decode(const char* src, size_t* out_len) {
     if (!src) return NULL;
     size_t len = strlen(src);
+    // 移除末尾的填充和空白
     while (len > 0 && (src[len-1] == '\n' || src[len-1] == '\r' || src[len-1] == ' ' || src[len-1] == '=')) len--;
     if (len == 0) { *out_len = 0; return NULL; }
+    
     *out_len = (len * 3) / 4;
     unsigned char* out = (unsigned char*)malloc(*out_len + 4); 
     if (!out) return NULL;
+    
     size_t i = 0, j = 0;
     while (i < len) {
+        // 跳过非 Base64 字符 (换行符等)
         if (src[i] == '\r' || src[i] == '\n' || src[i] == ' ') { i++; continue; }
-        int vals[4]; int val_cnt = 0;
+        
+        int vals[4]; 
+        int val_cnt = 0;
         while (i < len && val_cnt < 4) {
             char c = src[i];
             if (c == '\r' || c == '\n' || c == ' ') { i++; continue; }
-            if (c == '=') { i++; break; }
+            if (c == '=') { i++; break; } // 遇到填充符提前结束
             int v = GetBase64Val(c);
-            if (v == -1) { free(out); return NULL; }
-            vals[val_cnt++] = v; i++;
+            if (v == -1) { 
+                // 遇到非法字符，视为解码失败
+                free(out); return NULL; 
+            }
+            vals[val_cnt++] = v; 
+            i++;
         }
+        
         if (val_cnt > 0) {
-            uint32_t triple = (vals[0] << 18) | ((val_cnt>1?vals[1]:0) << 12) | ((val_cnt>2?vals[2]:0) << 6) | ((val_cnt>3?vals[3]:0));
+            uint32_t triple = (vals[0] << 18) | 
+                              ((val_cnt > 1 ? vals[1] : 0) << 12) | 
+                              ((val_cnt > 2 ? vals[2] : 0) << 6) | 
+                              ((val_cnt > 3 ? vals[3] : 0));
+            
             if (j < *out_len) out[j++] = (triple >> 16) & 0xFF;
             if (val_cnt > 2 && j < *out_len) out[j++] = (triple >> 8) & 0xFF;
             if (val_cnt > 3 && j < *out_len) out[j++] = triple & 0xFF;
         }
     }
-    out[j] = '\0'; *out_len = j; return out;
+    out[j] = '\0'; 
+    *out_len = j; 
+    return out;
 }
 
 char* GetClipboardText() {
@@ -302,7 +331,7 @@ static char* InternalHttpsGet(const char* url, BOOL useProxy) {
     ctx = SSL_CTX_new(TLS_client_method());
     if (!ctx) { closesocket(s); return NULL; }
     
-    // [Note] 这里是工具函数下载订阅/更新用的，非核心代理逻辑，暂保持 verify_none 以防订阅源自签
+    // [Note] 下载订阅时暂不验证证书，防止自签证书订阅失败
     SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
 
     ssl = SSL_new(ctx);
@@ -386,7 +415,7 @@ char* Utils_HttpGet(const char* url) {
     return InternalHttpsGet(url, FALSE);
 }
 
-// ... (Proxy settings 保持不变) ...
+// ... (Proxy settings) ...
 BOOL IsWindows8OrGreater() {
     HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
     if (hKernel32 == NULL) return FALSE;
@@ -399,7 +428,8 @@ void SetSystemProxy(BOOL enable) {
     wchar_t proxyServerString[256] = {0};
     wchar_t proxyBypassString[64] = {0};
     if (enable) {
-        wsprintfW(proxyServerString, L"127.0.0.1:%d", g_localPort);
+        // [Fix] 使用 _snwprintf 替代 wsprintfW
+        _snwprintf(proxyServerString, 256, L"127.0.0.1:%d", g_localPort);
         wcsncpy(proxyBypassString, L"<local>", 63);
     }
     if (IsWindows8OrGreater()) {
@@ -458,7 +488,7 @@ BOOL IsSystemProxyEnabled() {
             if (dwEnable == 1) {
                 if (RegQueryValueExW(hKey, L"ProxyServer", NULL, NULL, (LPBYTE)proxyServer, &dwProxySize) == ERROR_SUCCESS) {
                     wchar_t expectedPart[64];
-                    wsprintfW(expectedPart, L"127.0.0.1:%d", g_localPort);
+                    _snwprintf(expectedPart, 64, L"127.0.0.1:%d", g_localPort);
                     if (wcsstr(proxyServer, expectedPart) != NULL) return TRUE;
                 }
             }
