@@ -3,6 +3,15 @@
 #include "utils.h"
 #include <openssl/sha.h>
 
+// [Concurrency Fix] 客户端线程上下文，保存配置副本
+typedef struct {
+    SOCKET clientSock;
+    ProxyConfig config; // 完整的配置副本，避免读取全局变量导致的竞争条件
+} ClientContext;
+
+// [Security Fix] 更新了 tls_init_connect 的声明
+int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target_host);
+
 // --- 辅助函数：解析 UUID (支持带横杠或不带) ---
 void parse_uuid(const char* uuid_str, unsigned char* out) {
     const char* p = uuid_str;
@@ -26,7 +35,8 @@ void trojan_password_hash(const char* password, char* out_hex) {
     unsigned char digest[SHA224_DIGEST_LENGTH];
     SHA224((unsigned char*)password, strlen(password), digest);
     for(int i = 0; i < SHA224_DIGEST_LENGTH; i++) {
-        sprintf(out_hex + (i * 2), "%02x", digest[i]);
+        // [Security Fix] 使用 snprintf 防止缓冲区溢出
+        snprintf(out_hex + (i * 2), 3, "%02x", digest[i]);
     }
     out_hex[SHA224_DIGEST_LENGTH * 2] = 0;
 }
@@ -48,9 +58,6 @@ int send_all(SOCKET s, const char *buf, int len) {
         if (n == -1) {
             int err = WSAGetLastError();
             if (err == WSAEWOULDBLOCK) { Sleep(1); continue; }
-            if (err != WSAECONNRESET && err != WSAECONNABORTED) {
-                // log_msg("[Err] send_all fail: %d", err); 
-            }
             return -1;
         }
         total += n; bytesleft -= n;
@@ -64,7 +71,10 @@ void log_hex_simple(const char* tag, unsigned char* data, int len) {
     char buf[64] = {0};
     int max = len > 6 ? 6 : len;
     int p = 0;
-    for(int i=0; i<max; i++) p += sprintf(buf+p, "%02X ", data[i]);
+    // [Security Fix] 使用 snprintf
+    for(int i=0; i<max; i++) {
+        p += snprintf(buf+p, sizeof(buf)-p, "%02X ", data[i]);
+    }
     log_msg("%s %d bytes: %s...", tag, len, buf);
 }
 
@@ -85,7 +95,14 @@ void base64_encode_key(const unsigned char* src, char* dst) {
 
 // --- 客户端处理线程 (核心逻辑) ---
 DWORD WINAPI client_handler(LPVOID p) {
-    SOCKET c = (SOCKET)(UINT_PTR)p; 
+    // [Concurrency Fix] 接收上下文并复制配置到本地，随即释放上下文
+    ClientContext* ctx = (ClientContext*)p;
+    if (!ctx) return 0;
+
+    SOCKET c = ctx->clientSock;
+    ProxyConfig localConfig = ctx->config; // 线程本地副本
+    free(ctx); // 立即释放堆内存
+
     TLSContext tls; 
     SOCKET r = INVALID_SOCKET;      
     
@@ -111,13 +128,13 @@ DWORD WINAPI client_handler(LPVOID p) {
     int len;
 
     int flen = 0;
-    unsigned char proto_buf[2048]; // [修改] 增大缓冲区以适应 Mandala 加密 Payload
+    unsigned char proto_buf[2048]; 
     int proto_len = 0;
     
     BOOL is_vless;
     BOOL is_trojan;
     BOOL is_shadowsocks;
-    BOOL is_mandala; // [新增]
+    BOOL is_mandala; 
     
     struct in_addr ip4; 
     struct in6_addr ip6;
@@ -128,7 +145,6 @@ DWORD WINAPI client_handler(LPVOID p) {
     int hl, pl;
     long long frame_total;
     int vless_response_header_stripped = 0;
-    int err_code = 0;
     int retry_count = 0;
     
     // 初始化
@@ -185,11 +201,9 @@ DWORD WINAPI client_handler(LPVOID p) {
         } else { goto cl_end; }
     }
     
-    // log_msg("[Access] %s %s:%d", method, host, port);
-
-    // 2. 连接代理服务器
-    h = gethostbyname(g_proxyConfig.host);
-    if(!h) { log_msg("[Err] DNS Fail: %s", g_proxyConfig.host); goto cl_end; }
+    // [Refactor] 使用 localConfig 代替 g_proxyConfig
+    h = gethostbyname(localConfig.host);
+    if(!h) { log_msg("[Err] DNS Fail: %s", localConfig.host); goto cl_end; }
 
     for (retry_count = 0; retry_count < 3; retry_count++) {
         r = socket(AF_INET, SOCK_STREAM, 0);
@@ -200,12 +214,13 @@ DWORD WINAPI client_handler(LPVOID p) {
         setsockopt(r, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout_ms, sizeof(int));
         setsockopt(r, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout_ms, sizeof(int));
 
-        memset(&a, 0, sizeof(a)); a.sin_family = AF_INET; a.sin_port = htons((unsigned short)g_proxyConfig.port);
+        memset(&a, 0, sizeof(a)); a.sin_family = AF_INET; a.sin_port = htons((unsigned short)localConfig.port);
         a.sin_addr = *(struct in_addr*)h->h_addr;
         
         if (connect(r, (struct sockaddr*)&a, sizeof(a)) == 0) {
             tls.sock = r;
-            if (tls_init_connect(&tls) == 0) break;
+            // [Security] 传递本地配置的 SNI 和 Host
+            if (tls_init_connect(&tls, localConfig.sni, localConfig.host) == 0) break;
             else tls_close(&tls);
         }
         closesocket(r); r = INVALID_SOCKET;
@@ -214,15 +229,16 @@ DWORD WINAPI client_handler(LPVOID p) {
 
     if (r == INVALID_SOCKET || tls.ssl == NULL) goto cl_end;
     
-    // 3. WebSocket 握手 (随机 Key)
-    sni_val = (strlen(g_proxyConfig.sni) > 0) ? g_proxyConfig.sni : g_proxyConfig.host;
-    req_path = (strlen(g_proxyConfig.path) > 0) ? g_proxyConfig.path : "/";
+    // 3. WebSocket 握手
+    sni_val = (strlen(localConfig.sni) > 0) ? localConfig.sni : localConfig.host;
+    req_path = (strlen(localConfig.path) > 0) ? localConfig.path : "/";
     
     unsigned char rnd_key[16];
     char ws_key_str[32];
     for(int i=0; i<16; i++) rnd_key[i] = rand() % 256;
     base64_encode_key(rnd_key, ws_key_str);
 
+    // [Security Fix] 使用 snprintf
     offset = snprintf(ws_send_buf, BUFFER_SIZE, 
         "GET %s HTTP/1.1\r\n"
         "Host: %s\r\n"
@@ -259,15 +275,15 @@ DWORD WINAPI client_handler(LPVOID p) {
         }
     }
     
-    // 4. 发送代理协议头
-    is_vless = (_stricmp(g_proxyConfig.type, "vless") == 0);
-    is_trojan = (_stricmp(g_proxyConfig.type, "trojan") == 0);
-    is_shadowsocks = (_stricmp(g_proxyConfig.type, "shadowsocks") == 0);
-    is_mandala = (_stricmp(g_proxyConfig.type, "mandala") == 0); // [新增] 识别 Mandala 类型
+    // 4. 发送代理协议头 (使用 localConfig)
+    is_vless = (_stricmp(localConfig.type, "vless") == 0);
+    is_trojan = (_stricmp(localConfig.type, "trojan") == 0);
+    is_shadowsocks = (_stricmp(localConfig.type, "shadowsocks") == 0);
+    is_mandala = (_stricmp(localConfig.type, "mandala") == 0);
 
     if (is_vless) {
         proto_buf[proto_len++] = 0x00; 
-        parse_uuid(g_proxyConfig.user, proto_buf + proto_len); proto_len += 16; 
+        parse_uuid(localConfig.user, proto_buf + proto_len); proto_len += 16; 
         proto_buf[proto_len++] = 0x00; 
         proto_buf[proto_len++] = 0x01; 
         proto_buf[proto_len++] = (port >> 8) & 0xFF; proto_buf[proto_len++] = port & 0xFF;        
@@ -282,7 +298,7 @@ DWORD WINAPI client_handler(LPVOID p) {
         flen = build_ws_frame((char*)proto_buf, proto_len, ws_send_buf);
         tls_write(&tls, ws_send_buf, flen);
     } else if (is_trojan) {
-        char hex_pass[56 + 1]; trojan_password_hash(g_proxyConfig.pass, hex_pass);
+        char hex_pass[56 + 1]; trojan_password_hash(localConfig.pass, hex_pass);
         memcpy(proto_buf, hex_pass, 56); proto_len = 56;
         proto_buf[proto_len++] = 0x0D; proto_buf[proto_len++] = 0x0A;
         proto_buf[proto_len++] = 0x01; 
@@ -299,63 +315,44 @@ DWORD WINAPI client_handler(LPVOID p) {
         flen = build_ws_frame((char*)proto_buf, proto_len, ws_send_buf);
         tls_write(&tls, ws_send_buf, flen);
     } else if (is_mandala) { 
-        // [新增] Mandala 协议握手逻辑
-        // 结构: Salt(4) + XOR( Hash(56) + PadLen(1) + Padding(N) + Cmd(1) + Addr... + CRLF(2) )
-
-        // 1. 生成随机 Salt (4 bytes)
         unsigned char salt[4];
         for(int i=0; i<4; i++) salt[i] = rand() % 256;
 
-        // 2. 准备明文 Payload
-        unsigned char plaintext[2048]; // 临时明文缓冲区
+        unsigned char plaintext[2048]; 
         int p_len = 0;
 
-        // 2.1 哈希 ID (SHA224 Hex String, 56 bytes)
-        // 复用 trojan_password_hash 函数，因为它生成的正是 56字节的 hex string
         char hex_pass[57]; 
-        trojan_password_hash(g_proxyConfig.pass, hex_pass);
+        trojan_password_hash(localConfig.pass, hex_pass);
         memcpy(plaintext + p_len, hex_pass, 56); p_len += 56;
 
-        // 2.2 随机填充
-        int pad_len = rand() % 16; // 0-15字节随机
+        int pad_len = rand() % 16; 
         plaintext[p_len++] = (unsigned char)pad_len;
         for(int i=0; i<pad_len; i++) plaintext[p_len++] = rand() % 256;
 
-        // 2.3 指令 CMD (0x01 Connect)
         plaintext[p_len++] = 0x01;
 
-        // 2.4 目标地址 (SOCKS5 格式)
-        if (inet_pton(AF_INET, host, &ip4) == 1) { // IPv4
+        if (inet_pton(AF_INET, host, &ip4) == 1) {
              plaintext[p_len++] = 0x01; 
              memcpy(plaintext + p_len, &ip4, 4); p_len += 4;
-        } else if (inet_pton(AF_INET6, host, &ip6) == 1) { // IPv6
+        } else if (inet_pton(AF_INET6, host, &ip6) == 1) {
              plaintext[p_len++] = 0x04; 
              memcpy(plaintext + p_len, &ip6, 16); p_len += 16;
-        } else { // Domain
+        } else {
              plaintext[p_len++] = 0x03; 
              plaintext[p_len++] = (unsigned char)strlen(host);
              memcpy(plaintext + p_len, host, strlen(host)); p_len += strlen(host);
         }
 
-        // 2.5 端口
         plaintext[p_len++] = (port >> 8) & 0xFF; 
         plaintext[p_len++] = port & 0xFF;
 
-        // 2.6 CRLF
         plaintext[p_len++] = 0x0D; plaintext[p_len++] = 0x0A;
 
-        // 3. 构造最终包 (Salt + XOR Encrypted Payload)
-        // 将 Salt 写入发送缓冲头部
         memcpy(proto_buf, salt, 4);
-        
-        // 执行 XOR 加密并写入发送缓冲
         for(int i=0; i<p_len; i++) {
             proto_buf[4 + i] = plaintext[i] ^ salt[i % 4];
         }
-        
         proto_len = 4 + p_len;
-
-        // 4. 封装 WebSocket 帧并发送
         flen = build_ws_frame((char*)proto_buf, proto_len, ws_send_buf);
         tls_write(&tls, ws_send_buf, flen);
 
@@ -372,20 +369,21 @@ DWORD WINAPI client_handler(LPVOID p) {
         flen = build_ws_frame((char*)proto_buf, proto_len, ws_send_buf);
         tls_write(&tls, ws_send_buf, flen);
     } else {
+        // SOCKS5 (outbound)
         char auth[] = {0x05, 0x01, 0x00}; 
-        if (strlen(g_proxyConfig.user) > 0) auth[2] = 0x02; 
+        if (strlen(localConfig.user) > 0) auth[2] = 0x02; 
         flen = build_ws_frame(auth, 3, ws_send_buf);
         tls_write(&tls, ws_send_buf, flen);
         char resp_buf[512]; 
         if (ws_read_payload_exact(&tls, resp_buf, 2) < 2) goto cl_end;
         if (resp_buf[1] == 0x02) {
-            int ulen = strlen(g_proxyConfig.user);
-            int plen = strlen(g_proxyConfig.pass);
+            int ulen = strlen(localConfig.user);
+            int plen = strlen(localConfig.pass);
             unsigned char auth_pkg[512];
             int ap_len = 0;
             auth_pkg[ap_len++] = 0x01; 
-            auth_pkg[ap_len++] = ulen; memcpy(auth_pkg+ap_len, g_proxyConfig.user, ulen); ap_len += ulen;
-            auth_pkg[ap_len++] = plen; memcpy(auth_pkg+ap_len, g_proxyConfig.pass, plen); ap_len += plen;
+            auth_pkg[ap_len++] = ulen; memcpy(auth_pkg+ap_len, localConfig.user, ulen); ap_len += ulen;
+            auth_pkg[ap_len++] = plen; memcpy(auth_pkg+ap_len, localConfig.pass, plen); ap_len += plen;
             flen = build_ws_frame((char*)auth_pkg, ap_len, ws_send_buf);
             tls_write(&tls, ws_send_buf, flen);
             if (ws_read_payload_exact(&tls, resp_buf, 2) < 2) goto cl_end;
@@ -431,7 +429,6 @@ DWORD WINAPI client_handler(LPVOID p) {
         FD_ZERO(&fds); FD_SET(c, &fds); FD_SET(r, &fds);
         int pending = SSL_pending(tls.ssl);
         tv.tv_sec = 1; tv.tv_usec = 0;
-        // [关键修复] 如果缓冲区里有之前粘包的数据，立即处理，不要等 select 超时
         if (pending > 0 || ws_buf_len > 0) { tv.tv_sec = 0; tv.tv_usec = 0; }
         
         int n = select(0, &fds, NULL, NULL, &tv);
@@ -442,11 +439,9 @@ DWORD WINAPI client_handler(LPVOID p) {
             if (len > 0) {
                 flen = build_ws_frame(c_buf, len, ws_send_buf);
                 if (tls_write(&tls, ws_send_buf, flen) < 0) {
-                    // log_msg("[Debug] TLS write fail (Server Closed)");
                     break;
                 }
             } else if (len == 0) {
-                // log_msg("[Debug] Browser Closed Connection");
                 break;
             } else if (WSAGetLastError() != WSAEWOULDBLOCK) {
                 break;
@@ -458,7 +453,6 @@ DWORD WINAPI client_handler(LPVOID p) {
                 len = tls_read(&tls, ws_read_buf + ws_buf_len, BUFFER_SIZE - ws_buf_len);
                 if (len > 0) ws_buf_len += len;
                 else if (len == -1) {
-                    // log_msg("[Debug] Server Closed Connection");
                     break; 
                 }
             }
@@ -482,7 +476,6 @@ DWORD WINAPI client_handler(LPVOID p) {
                                 payload_size -= head_size;
                                 vless_response_header_stripped = 1;
                             } else { 
-                                // [修复] 数据包太小无法剥离头时，暂时当作空处理(丢弃)，而不是崩溃
                                 payload_size = 0; 
                             }
                         } else { payload_size = 0; }
@@ -527,8 +520,17 @@ DWORD WINAPI server_thread(LPVOID p) {
     while(g_proxyRunning) {
         SOCKET c = accept(g_listen_sock, NULL, NULL);
         if (c != INVALID_SOCKET) {
-            HANDLE hClient = CreateThread(NULL, 0, client_handler, (LPVOID)(UINT_PTR)c, 0, NULL);
-            if (hClient) CloseHandle(hClient); else closesocket(c);
+            // [Concurrency Fix] 分配上下文并复制配置
+            ClientContext* ctx = (ClientContext*)malloc(sizeof(ClientContext));
+            if (ctx) {
+                ctx->clientSock = c;
+                ctx->config = g_proxyConfig; // 线程安全的配置快照
+                HANDLE hClient = CreateThread(NULL, 0, client_handler, (LPVOID)ctx, 0, NULL);
+                if (hClient) CloseHandle(hClient); 
+                else { free(ctx); closesocket(c); }
+            } else {
+                closesocket(c);
+            }
         } else break;
     }
     return 0;
