@@ -830,8 +830,17 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nSho
     hLogFont = CreateFontW(14,0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,0,0,0,0,L"Consolas");
     
     OpenLogViewer(FALSE); 
+    // 初始化 set.ini 路徑 (用於存儲軟件設置)
     GetModuleFileNameW(NULL, g_iniFilePath, MAX_PATH);
-    wchar_t* p = wcsrchr(g_iniFilePath, L'\\'); if (p) { *p = 0; wcscat(g_iniFilePath, L"\\set.ini"); } else wcscpy(g_iniFilePath, L"set.ini");
+    wchar_t* p = wcsrchr(g_iniFilePath, L'\\'); 
+    if (p) { *p = 0; wcscat(g_iniFilePath, L'\\set.ini'); } 
+    else wcscpy(g_iniFilePath, L"set.ini");
+    
+    // [新增] 初始化 config.json 路徑 (用於存儲節點信息)
+    GetModuleFileNameW(NULL, g_configFilePath, MAX_PATH);
+    p = wcsrchr(g_configFilePath, L'\\');
+    if (p) { *p = 0; wcscat(g_configFilePath, L"\\config.json"); }
+    else wcscpy(g_configFilePath, L"config.json");
     
     LoadSettings();
     CreateThread(NULL, 0, AutoUpdateThread, NULL, 0, NULL);
@@ -864,4 +873,5 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nSho
     
     return 0;
 }
+
 
