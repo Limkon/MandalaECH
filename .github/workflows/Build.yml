@@ -15,7 +15,7 @@ jobs:
       with:
         msystem: MINGW64
         update: false
-        cache: false
+        cache: true
         install: git
         path-type: minimal
         release: true
@@ -31,7 +31,24 @@ jobs:
           mingw-w64-x86_64-gcc \
           mingw-w64-x86_64-make
 
+    # [NEW] 获取远程仓库最新的 Commit SHA，用于生成缓存 Key
+    - name: Get OpenSSL Head Commit
+      id: openssl-head
+      shell: bash
+      run: |
+        sha=$(git ls-remote https://github.com/defo-project/openssl.git HEAD | awk '{ print $1 }')
+        echo "sha=$sha" >> $GITHUB_OUTPUT
+
+    # [NEW] 配置 OpenSSL 缓存
+    - name: Cache OpenSSL
+      id: cache-openssl
+      uses: actions/cache@v4
+      with:
+        path: openssl_dist
+        key: openssl-ech-${{ runner.os }}-${{ steps.openssl-head.outputs.sha }}
+
     - name: Build OpenSSL with ECH (Static from DEfO)
+      if: steps.cache-openssl.outputs.cache-hit != 'true'  # 仅当缓存未命中时运行
       shell: msys2 {0}
       run: |
         echo "Cloning OpenSSL ECH fork (DEfO project)..."
@@ -43,8 +60,8 @@ jobs:
         perl -V
 
         echo "Configuring OpenSSL with ECH support..."
-        # 关键：直接用 mingw64，不要加 --cross-compile-prefix（因为不是交叉编译）
-        ./Configure mingw64 no-shared enable-ech --prefix=/mingw64
+        # 关键修改：安装到当前工作区的 openssl_dist 目录，方便缓存
+        ./Configure mingw64 no-shared enable-ech --prefix=$(pwd)/../openssl_dist
 
         echo "Compiling OpenSSL..."
         mingw32-make -j8
@@ -53,7 +70,7 @@ jobs:
         mingw32-make install_sw
 
         cd ..
-        rm -rf openssl-ech  # 清理源码
+        rm -rf openssl-ech
 
     - name: Compile Resources
       shell: msys2 {0}
@@ -63,7 +80,9 @@ jobs:
     - name: Compile Executable
       shell: msys2 {0}
       run: |
+        # 关键修改：添加 -I 和 -L 指向缓存的 openssl_dist 目录
         gcc gui.c config.c proxy.c crypto.c utils.c globals.c cJSON.c resource.res -o Mandala.exe \
+          -Iopenssl_dist/include -Lopenssl_dist/lib \
           -lssl -lcrypto -lws2_32 -lgdi32 -lcomctl32 -lwininet -lcrypt32 -luser32 \
           -mwindows -municode -finput-charset=UTF-8 \
           -static
