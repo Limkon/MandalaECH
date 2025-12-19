@@ -9,8 +9,10 @@ typedef struct {
     ProxyConfig config; // 完整的配置副本，避免读取全局变量导致的竞争条件
 } ClientContext;
 
-// [Security Fix] 更新了 tls_init_connect 的声明 (由 crypto.h 提供，无需重复声明)
-// int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target_host, const char* ech_config_b64);
+// 声明外部 ECH 获取函数 (utils.c)
+extern char* FetchECHFromDoH(const char* dohUrl, const char* sni);
+// 声明外部 DoH 地址 (config.c)
+extern char g_dohUrl[512];
 
 // --- 辅助函数：解析 UUID (支持带横杠或不带) ---
 void parse_uuid(const char* uuid_str, unsigned char* out) {
@@ -35,7 +37,6 @@ void trojan_password_hash(const char* password, char* out_hex) {
     unsigned char digest[SHA224_DIGEST_LENGTH];
     SHA224((unsigned char*)password, strlen(password), digest);
     for(int i = 0; i < SHA224_DIGEST_LENGTH; i++) {
-        // [Security Fix] 使用 snprintf 防止缓冲区溢出
         snprintf(out_hex + (i * 2), 3, "%02x", digest[i]);
     }
     out_hex[SHA224_DIGEST_LENGTH * 2] = 0;
@@ -65,19 +66,6 @@ int send_all(SOCKET s, const char *buf, int len) {
     return total;
 }
 
-// 调试日志
-void log_hex_simple(const char* tag, unsigned char* data, int len) {
-    if (len <= 0) return;
-    char buf[64] = {0};
-    int max = len > 6 ? 6 : len;
-    int p = 0;
-    // [Security Fix] 使用 snprintf
-    for(int i=0; i<max; i++) {
-        p += snprintf(buf+p, sizeof(buf)-p, "%02X ", data[i]);
-    }
-    log_msg("%s %d bytes: %s...", tag, len, buf);
-}
-
 // --- Base64 编码 (用于生成随机 WS Key) ---
 void base64_encode_key(const unsigned char* src, char* dst) {
     const char* table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -100,8 +88,31 @@ DWORD WINAPI client_handler(LPVOID p) {
     if (!ctx) return 0;
 
     SOCKET c = ctx->clientSock;
-    ProxyConfig localConfig = ctx->config; // 线程本地副本 (包含 ech 字段)
-    free(ctx); // 立即释放堆内存
+    ProxyConfig localConfig = ctx->config; // 线程本地副本
+    free(ctx); 
+
+    // [ECH Logic] 自动获取 ECH
+    // 如果配置了伪装域名 (Outer SNI)，则启用 ECH 流程
+    if (strlen(localConfig.outer_sni) > 0) {
+        log_msg("[ECH] Processing Outer SNI: %s", localConfig.outer_sni);
+        
+        // 1. 如果没有配置静态 ECH，尝试从 DoH 获取
+        if (strlen(localConfig.ech) == 0) {
+            char* dynEch = FetchECHFromDoH(g_dohUrl, localConfig.outer_sni);
+            if (dynEch) {
+                log_msg("[ECH] Auto-fetched ECH config from DoH");
+                // 更新本地副本的 ECH
+                snprintf(localConfig.ech, sizeof(localConfig.ech), "%s", dynEch);
+                free(dynEch);
+            } else {
+                log_msg("[ECH] Warning: Failed to fetch ECH from DoH, connection may fail.");
+            }
+        }
+        
+        // 2. 将 Outer SNI 设为本次 TLS 连接的握手 SNI (明文部分)
+        // 真实的 SNI (host) 将被封装在 ECH 内部
+        snprintf(localConfig.sni, sizeof(localConfig.sni), "%s", localConfig.outer_sni);
+    }
 
     TLSContext tls; 
     SOCKET r = INVALID_SOCKET;      
@@ -201,9 +212,22 @@ DWORD WINAPI client_handler(LPVOID p) {
         } else { goto cl_end; }
     }
     
-    // [Refactor] 使用 localConfig 代替 g_proxyConfig
-    h = gethostbyname(localConfig.host);
-    if(!h) { log_msg("[Err] DNS Fail: %s", localConfig.host); goto cl_end; }
+    // 连接到代理服务器
+    // 注意：如果使用了 ECH，host 字段可能是真实目标域名，DNS 解析应该解析它
+    // 或者，为了防止 DNS 泄漏，应该解析 Outer SNI 对应的 IP
+    // 这里简单起见，我们解析配置文件中的 host (真实目标)
+    // 更好的做法：如果 ECH 开启，解析 Outer SNI (config.sni) 的 IP
+    const char* connect_host = localConfig.host;
+    if (strlen(localConfig.outer_sni) > 0) {
+        connect_host = localConfig.outer_sni;
+    }
+    
+    h = gethostbyname(connect_host);
+    if(!h) { 
+        // Fallback: try original host if outer sni failed
+        h = gethostbyname(localConfig.host);
+        if (!h) { log_msg("[Err] DNS Fail: %s", connect_host); goto cl_end; }
+    }
 
     for (retry_count = 0; retry_count < 3; retry_count++) {
         r = socket(AF_INET, SOCK_STREAM, 0);
@@ -219,7 +243,7 @@ DWORD WINAPI client_handler(LPVOID p) {
         
         if (connect(r, (struct sockaddr*)&a, sizeof(a)) == 0) {
             tls.sock = r;
-            // [ECH Refactor] 传递本地配置的 SNI, Host 和 ECH
+            // [ECH Refactor] 传递本地配置的 SNI (可能是 Outer SNI), Host (Inner SNI) 和 ECH 配置
             if (tls_init_connect(&tls, localConfig.sni, localConfig.host, localConfig.ech) == 0) break;
             else tls_close(&tls);
         }
@@ -238,7 +262,6 @@ DWORD WINAPI client_handler(LPVOID p) {
     for(int i=0; i<16; i++) rnd_key[i] = rand() % 256;
     base64_encode_key(rnd_key, ws_key_str);
 
-    // [Security Fix] 使用 snprintf
     offset = snprintf(ws_send_buf, BUFFER_SIZE, 
         "GET %s HTTP/1.1\r\n"
         "Host: %s\r\n"
@@ -520,7 +543,6 @@ DWORD WINAPI server_thread(LPVOID p) {
     while(g_proxyRunning) {
         SOCKET c = accept(g_listen_sock, NULL, NULL);
         if (c != INVALID_SOCKET) {
-            // [Concurrency Fix] 分配上下文并复制配置
             ClientContext* ctx = (ClientContext*)malloc(sizeof(ClientContext));
             if (ctx) {
                 ctx->clientSock = c;
