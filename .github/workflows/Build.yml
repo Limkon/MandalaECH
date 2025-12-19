@@ -30,8 +30,36 @@ jobs:
         sed -i 's/^SigLevel.*/SigLevel = Never/' /etc/pacman.conf
         
         # 3. 同步数据库并安装工具链
+        # [注意] 移除了 mingw-w64-x86_64-openssl，因为我们要自己编译支持 ECH 的版本
         echo "Installing build tools..."
-        pacman -Sy --noconfirm mingw-w64-x86_64-gcc mingw-w64-x86_64-openssl mingw-w64-x86_64-make
+        pacman -Sy --noconfirm mingw-w64-x86_64-gcc mingw-w64-x86_64-make perl
+
+    - name: Build OpenSSL with ECH (Static)
+      shell: msys2 {0}
+      run: |
+        echo "Downloading OpenSSL with ECH support..."
+        # 下载你指定的 OpenSSL 版本
+        curl -L -o openssl.tar.gz https://github.com/openssl/openssl/releases/download/openssl-3.6.0/openssl-3.6.0.tar.gz
+        
+        echo "Extracting..."
+        tar -xzf openssl.tar.gz
+        
+        # 进入解压后的目录 (假设解压后目录名为 openssl-3.6.0，如果不是请根据实际情况修改)
+        cd openssl-3.6.0
+        
+        echo "Configuring OpenSSL..."
+        # [关键] 
+        # mingw64: 目标平台
+        # no-shared: 只编译静态库 (.a)，这是生成单文件 exe 的关键
+        # enable-ech: 显式开启 ECH 支持 (如果该版本默认没开)
+        # --prefix=/mingw64: 安装到系统目录，让 gcc 能直接找到
+        ./Configure mingw64 no-shared enable-ech --prefix=/mingw64
+        
+        echo "Compiling OpenSSL (This may take a while)..."
+        make -j$(nproc)
+        
+        echo "Installing OpenSSL..."
+        make install_sw
 
     - name: Compile Resources
       shell: msys2 {0}
@@ -41,7 +69,8 @@ jobs:
     - name: Compile Executable
       shell: msys2 {0}
       run: |
-        # 编译指令更新：加入 globals.c
+        # 编译指令 (保持不变，因为 OpenSSL 已安装到标准路径)
+        # 静态链接参数 -static 会自动链接刚才编译的 libssl.a 和 libcrypto.a
         gcc gui.c config.c proxy.c crypto.c utils.c globals.c cJSON.c resource.res -o Mandala.exe \
           -lssl -lcrypto -lws2_32 -lgdi32 -lcomctl32 -lwininet -lcrypt32 -luser32 \
           -mwindows -municode -finput-charset=UTF-8 -static
