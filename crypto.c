@@ -3,15 +3,6 @@
 #include <openssl/rand.h>
 #include <openssl/err.h>
 
-// -------------------------------------------------------------------------
-// [Fix] 手动声明 ECH 函数原型
-// 解决 MinGW OpenSSL 头文件可能缺失此定义导致的 "implicit declaration" 错误。
-// 在静态链接模式下，只要底层的 libssl.a 包含此符号，链接即可成功。
-// -------------------------------------------------------------------------
-#if !defined(SSL_set1_ech_config_list)
-int SSL_set1_ech_config_list(SSL *ssl, const unsigned char *ech_config_list, size_t ech_config_list_len);
-#endif
-
 // ---------------------- BIO Fragmentation Implementation ----------------------
 typedef struct {
     int first_packet_sent;
@@ -198,7 +189,7 @@ void init_openssl_global() {
     }
 }
 
-// [ECH Refactor] 接收 ech_config_b64 参数，直接静态调用
+// [ECH Refactor] 接收 ech_config_b64 参数
 int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target_host, const char* ech_config_b64) {
     if (!g_ssl_ctx) init_openssl_global();
     ctx->ssl = SSL_new(g_ssl_ctx);
@@ -229,23 +220,24 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
     const char *sni_name = (target_sni && strlen(target_sni)) ? target_sni : target_host;
     SSL_set_tlsext_host_name(ctx->ssl, sni_name);
     
-    // [ECH Refactor] 静态链接模式下的 ECH 设置
+    // [ECH Refactor Fix] 处理 ECH 配置
+    // 由于 MinGW 提供的静态库 libssl.a 缺失 SSL_set1_ech_config_list 符号，
+    // 我们必须屏蔽此调用以通过编译。
     if (ech_config_b64 && strlen(ech_config_b64) > 0) {
         size_t ech_len = 0;
         unsigned char* ech_bin = Base64Decode(ech_config_b64, &ech_len);
         if (ech_bin) {
-            // 直接调用函数，依赖链接器在静态库(libssl.a)中找到它
-            // 只要编译环境的 OpenSSL 版本 >= 3.4.0 且支持 ECH，此调用将成功
+            // [Linker Fix] 暂时屏蔽 ECH 调用，避免 undefined reference 错误
+            // 如果未来环境支持 ECH，可取消注释并移除警告
+            /*
             int ret = SSL_set1_ech_config_list(ctx->ssl, ech_bin, ech_len);
-            
             if (ret == 1) {
                 log_msg("[Security] ECH Config applied for %s (Static Link)", sni_name);
             } else {
-                unsigned long err = ERR_get_error();
-                char err_buf[256];
-                ERR_error_string_n(err, err_buf, sizeof(err_buf));
-                log_msg("[Error] Failed to apply ECH config: %s", err_buf);
+                log_msg("[Error] Failed to apply ECH config.");
             }
+            */
+            log_msg("[Warning] ECH config found but disabled: Static library lacks ECH support.");
             free(ech_bin);
         } else {
             log_msg("[Error] Failed to decode ECH Base64 config");
