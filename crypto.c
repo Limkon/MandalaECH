@@ -1,7 +1,7 @@
 #include "crypto.h"
 #include "utils.h"
 #include <openssl/rand.h>
-#include <openssl/err.h> // 引入 ERR 头文件
+#include <openssl/err.h>
 
 // ---------------------- BIO Fragmentation Implementation ----------------------
 typedef struct {
@@ -154,6 +154,7 @@ void init_openssl_global() {
         log_msg("[Security] Standard OpenSSL Cipher Suites");
     }
 
+    // [Security Fix] 生产环境要求：必须强制验证证书
     HRSRC hRes = FindResourceW(NULL, MAKEINTRESOURCEW(2), RT_RCDATA);
     if (hRes) {
         HGLOBAL hData = LoadResource(NULL, hRes);
@@ -174,24 +175,28 @@ void init_openssl_global() {
                     SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_PEER, NULL);
                     log_msg("[Security] Embedded CA loaded (%d certs). Strict mode.", count);
                 } else {
-                    SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, NULL);
-                    log_msg("[Warning] Embedded CA data invalid. Insecure mode.");
+                    // [Security Refactor] 禁用不安全的回退
+                    // SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, NULL);
+                    log_msg("[Fatal] Embedded CA data invalid. Secure connection cannot be established.");
                 }
             } else {
-                SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, NULL);
-                log_msg("[Warning] Failed to create BIO for CA. Insecure mode.");
+                // [Security Refactor] 禁用不安全的回退
+                // SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, NULL);
+                log_msg("[Fatal] Failed to create BIO for CA.");
             }
         } else {
-            SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, NULL);
-            log_msg("[Warning] Empty CA resource. Insecure mode.");
+            // [Security Refactor] 禁用不安全的回退
+            // SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, NULL);
+            log_msg("[Fatal] Empty CA resource. Secure connection cannot be established.");
         }
     } else {
-        SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, NULL);
-        log_msg("[Warning] cacert.pem resource not found in exe. Insecure mode.");
+        // [Security Refactor] 禁用不安全的回退
+        // SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, NULL);
+        log_msg("[Fatal] cacert.pem resource not found in exe. Secure connection cannot be established.");
     }
 }
 
-int tls_init_connect(TLSContext *ctx) {
+int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target_host) {
     if (!g_ssl_ctx) init_openssl_global();
     ctx->ssl = SSL_new(g_ssl_ctx);
     if (!ctx->ssl) {
@@ -215,7 +220,8 @@ int tls_init_connect(TLSContext *ctx) {
     }
     SSL_set_bio(ctx->ssl, bio, bio);
     
-    const char *sni_name = (strlen(g_proxyConfig.sni) ? g_proxyConfig.sni : g_proxyConfig.host);
+    // [Refactor] 使用传入的配置副本中的 SNI 和 Host
+    const char *sni_name = (target_sni && strlen(target_sni)) ? target_sni : target_host;
     SSL_set_tlsext_host_name(ctx->ssl, sni_name);
     
     if (g_enableALPN) {
