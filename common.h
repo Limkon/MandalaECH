@@ -33,14 +33,11 @@
 #include <openssl/x509.h>
 #include <openssl/pem.h>
 
-// cJSON Header
 #include "cJSON.h"
 
 // --- 宏定义 ---
 #define REG_PATH_PROXY L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings"
 #define CONFIG_FILE L"config.json"
-
-// [关键修改] 增大缓冲区到 8MB，解决 YouTube 视频播放中断问题
 #define BUFFER_SIZE 8388608 
 
 // Windows Messages
@@ -152,7 +149,6 @@ extern char g_userAgentStr[512];
 extern const wchar_t* UA_PLATFORMS[];
 extern const char* UA_TEMPLATES[];
 
-// 日志开关
 extern BOOL g_enableLog;
 
 #endif // COMMON_H
