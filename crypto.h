@@ -10,8 +10,8 @@ BIO_METHOD *BIO_f_fragment(void);
 void init_openssl_global();
 void FreeGlobalSSLContext();
 
-// --- TLS 连接函数 ---
-// [ECH Refactor] target_sni, target_host, ech_config_b64
+// --- TLS 连接函数 (增加 ECH 参数) ---
+// target_sni, target_host, ech_config_b64
 int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target_host, const char* ech_config_b64);
 
 // --- TLS 读写函数 ---
