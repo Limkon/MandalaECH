@@ -3,8 +3,7 @@
 #include <openssl/rand.h>
 #include <openssl/err.h>
 
-// 全局 SSL 上下文 (模具)
-SSL_CTX *g_ssl_ctx = NULL;
+// [Fix] g_ssl_ctx 已移动到 globals.c 定义，此处移除定义，仅保留使用
 // 全局 BIO 方法 (用于分片)
 static BIO_METHOD *method_frag = NULL;
 // 仅初始化一次的标志
