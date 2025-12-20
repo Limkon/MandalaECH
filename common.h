@@ -11,6 +11,7 @@
 #define _WIN32_IE 0x0601
 #define _WIN32_WINNT 0x0601
 #define WIN32_LEAN_AND_MEAN
+#define MAX_CONNECTIONS 512
 
 #include <windows.h>
 #include <shellapi.h>
@@ -157,3 +158,4 @@ extern const char* UA_TEMPLATES[];
 extern BOOL g_enableLog;
 
 #endif // COMMON_H
+
