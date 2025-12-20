@@ -22,7 +22,7 @@ extern BOOL g_enableLog;
 // 日志函数
 // --------------------------------------------------------------------------
 void log_msg(const char *format, ...) {
-    if (!g_enableLog && strstr(format, "[Fatal]") == NULL) return;
+    if (!g_enableLog && strstr(format, "[Fatal]") == NULL && strstr(format, "[Error]") == NULL && strstr(format, "[Debug]") == NULL) return;
     char buf[2048]; char time_buf[64]; SYSTEMTIME st; GetLocalTime(&st);
     snprintf(time_buf, sizeof(time_buf), "[%02d:%02d:%02d] ", st.wHour, st.wMinute, st.wSecond);
     va_list args; va_start(args, format); vsnprintf(buf, sizeof(buf)-64, format, args); va_end(args);
@@ -180,13 +180,12 @@ static char* DechunkBody(const char* raw_body, int raw_len, int* out_len) {
         memcpy(new_buf + write_pos, p, chunk_size); write_pos += chunk_size; p += chunk_size + 2; 
     }
     new_buf[write_pos] = 0; *out_len = write_pos; 
-    log_msg("[Utils] De-chunked data: %d -> %d bytes", raw_len, write_pos);
+    log_msg("[Debug] De-chunked data: %d -> %d bytes", raw_len, write_pos);
     return new_buf;
 }
 
-// [Fix] 核心网络请求函数 (增强兼容性与日志)
 static char* InternalHttpsGet(const char* url, BOOL useProxy, int* out_len) {
-    URL_COMP u; if (!ParseUrl(url, &u)) { log_msg("[Utils] Invalid URL: %s", url); return NULL; }
+    URL_COMP u; if (!ParseUrl(url, &u)) { log_msg("[Error] Invalid URL: %s", url); return NULL; }
     if (out_len) *out_len = 0;
     
     BOOL isDoH = (out_len != NULL); 
@@ -194,19 +193,16 @@ static char* InternalHttpsGet(const char* url, BOOL useProxy, int* out_len) {
     static int ini = 0; if (!ini) { SSL_library_init(); OpenSSL_add_all_algorithms(); SSL_load_error_strings(); ini = 1; }
 
     const char* tHost = useProxy ? "127.0.0.1" : u.host; int tPort = useProxy ? g_localPort : u.port;
-    log_msg("[Utils] Resolving: %s", tHost);
+    log_msg("[Debug] Resolving host: %s", tHost);
     
     struct hostent *he = gethostbyname(tHost); 
-    if (!he || !he->h_addr_list[0]) { log_msg("[Utils] DNS resolution failed for %s", tHost); return NULL; }
+    if (!he || !he->h_addr_list[0]) { log_msg("[Error] DNS resolution failed for %s", tHost); return NULL; }
 
     SOCKET s = INVALID_SOCKET;
     // 轮询 IP 地址
     for (int i = 0; he->h_addr_list[i] != NULL; i++) {
         s = socket(AF_INET, SOCK_STREAM, 0);
-        if (s == INVALID_SOCKET) {
-            log_msg("[Utils] socket() failed. Err: %d", WSAGetLastError());
-            continue;
-        }
+        if (s == INVALID_SOCKET) continue;
 
         struct sockaddr_in a; memset(&a,0,sizeof(a)); 
         a.sin_family = AF_INET; a.sin_port = htons(tPort); 
@@ -217,17 +213,17 @@ static char* InternalHttpsGet(const char* url, BOOL useProxy, int* out_len) {
         setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (char*)&tv, 4);
 
         if (connect(s, (struct sockaddr*)&a, sizeof(a)) == 0) {
-            log_msg("[Utils] Connected to %s", inet_ntoa(a.sin_addr));
-            break; // 成功连接
+            log_msg("[Debug] Connected to %s", inet_ntoa(a.sin_addr));
+            break; 
         } else {
-            log_msg("[Utils] Connect failed to %s. Err: %d", inet_ntoa(a.sin_addr), WSAGetLastError());
+            log_msg("[Debug] Connect failed to %s. Err: %d", inet_ntoa(a.sin_addr), WSAGetLastError());
             closesocket(s);
             s = INVALID_SOCKET;
         }
     }
 
     if (s == INVALID_SOCKET) {
-        log_msg("[Utils] All connection attempts failed for URL: %s", url);
+        log_msg("[Error] All connection attempts failed for URL: %s", url);
         return NULL; 
     }
 
@@ -240,27 +236,26 @@ static char* InternalHttpsGet(const char* url, BOOL useProxy, int* out_len) {
     SSL *ssl = SSL_new(ctx); SSL_set_fd(ssl, (int)s); SSL_set_tlsext_host_name(ssl, u.host);
     
     if (SSL_connect(ssl) != 1) { 
-        log_msg("[Utils] SSL Handshake Failed for %s", u.host); 
+        log_msg("[Error] SSL Handshake Failed for %s", u.host); 
         SSL_free(ssl); SSL_CTX_free(ctx); closesocket(s); return NULL; 
     }
 
     char req[4096];
     const char* ua = isDoH ? "Go-http-client/1.1" : "Mandala/1.0";
     const char* acc = isDoH ? "application/dns-message" : "*/*";
+    const char* ctype = isDoH ? "Content-Type: application/dns-message\r\n" : "";
     
-    // [Fix] Host 头不带端口号，且直接发送 Content-Type
-    // 模仿 ech-wk: 即使是 GET 请求也带 Content-Type，确保兼容性
     snprintf(req, 4096, 
         "GET %s HTTP/1.1\r\n"
         "Host: %s\r\n"
         "User-Agent: %s\r\n"
         "Accept: %s\r\n"
-        "Content-Type: application/dns-message\r\n"
+        "%s"
         "Connection: close\r\n\r\n", 
-        u.path, u.host, ua, acc);
+        u.path, u.host, ua, acc, ctype);
     
     if (SSL_write(ssl, req, strlen(req)) <= 0) {
-        log_msg("[Utils] SSL_write failed");
+        log_msg("[Error] SSL_write failed");
         SSL_free(ssl); SSL_CTX_free(ctx); closesocket(s); return NULL; 
     }
 
@@ -271,11 +266,13 @@ static char* InternalHttpsGet(const char* url, BOOL useProxy, int* out_len) {
     }
     resp[tRead] = 0;
 
+    // 调试日志：打印前100个字符的响应头
+    char debugHead[101];
+    strncpy(debugHead, resp, 100); debugHead[100] = 0;
+    log_msg("[Debug] Received Response Head: %s", debugHead);
+
     if (!strstr(resp, " 200 OK")) { 
-        // 打印具体错误原因
-        char* headEnd = strstr(resp, "\r\n\r\n");
-        if (headEnd) *headEnd = 0;
-        log_msg("[Utils] HTTP Failed. Header:\n%s", resp);
+        log_msg("[Error] HTTP Status Error. Full Header:\n%s", resp);
         free(resp); SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); closesocket(s);
         return NULL; 
     }
@@ -287,6 +284,12 @@ static char* InternalHttpsGet(const char* url, BOOL useProxy, int* out_len) {
     if (body) {
         body += (body[0] == '\r' ? 4 : 2); int raw_len = tRead - (int)(body - resp);
         if (raw_len > 0) {
+            // [Debug] Hex Dump first 16 bytes of body
+            log_msg("[Debug] Body Len: %d. First 8 bytes: %02X %02X %02X %02X %02X %02X %02X %02X", 
+                raw_len, 
+                (unsigned char)body[0], (unsigned char)body[1], (unsigned char)body[2], (unsigned char)body[3],
+                (unsigned char)body[4], (unsigned char)body[5], (unsigned char)body[6], (unsigned char)body[7]);
+
             if (isChunked) {
                 int dechunked_len = 0;
                 final_res = DechunkBody(body, raw_len, &dechunked_len);
@@ -295,7 +298,11 @@ static char* InternalHttpsGet(const char* url, BOOL useProxy, int* out_len) {
                 final_res = (char*)malloc(raw_len + 1); memcpy(final_res, body, raw_len); final_res[raw_len] = 0; 
                 if (out_len) *out_len = raw_len;
             }
+        } else {
+            log_msg("[Error] Empty Body received.");
         }
+    } else {
+        log_msg("[Error] No Body Separator found.");
     }
     free(resp); SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); closesocket(s);
     return final_res; 
@@ -322,15 +329,24 @@ char* FetchECHFromDoH(const char* dohUrl, const char* sni) {
     char url[2048]; snprintf(url, 2048, "%s?dns=%s", dohUrl, b64);
 
     int rLen = 0; unsigned char* resp = (unsigned char*)Utils_HttpBytesGet(url, &rLen);
-    if (!resp || rLen < 12) { if (resp) free(resp); return NULL; }
+    if (!resp || rLen < 12) { log_msg("[Error] DoH response too short or empty (len=%d)", rLen); if (resp) free(resp); return NULL; }
 
-    int p = 12; while (p < rLen && resp[p] != 0) p += resp[p] + 1; p += 5; if (p >= rLen) { free(resp); return NULL; }
+    int p = 12; 
+    // Skip Question
+    while (p < rLen && resp[p] != 0) p += resp[p] + 1; p += 5; 
+    if (p >= rLen) { log_msg("[Error] DNS Parse: Header/Question overflow"); free(resp); return NULL; }
+
     int anC = (resp[6] << 8) | resp[7];
+    log_msg("[Debug] Answer Count: %d", anC);
+    
     for (int i = 0; i < anC; i++) {
         if (p >= rLen) break;
         if ((resp[p] & 0xC0) == 0xC0) p += 2; else { while (p < rLen && resp[p] != 0) p += resp[p] + 1; p++; }
         if (p + 10 > rLen) break;
         int type = (resp[p] << 8) | resp[p+1]; int rdLen = (resp[p+8] << 8) | resp[p+9]; p += 10;
+        
+        log_msg("[Debug] RR Type: %d, Len: %d", type, rdLen);
+
         if (p + rdLen > rLen) break;
         if (type == 65) {
             unsigned char* rdata = resp + p; int rp = 2; 
@@ -344,7 +360,9 @@ char* FetchECHFromDoH(const char* dohUrl, const char* sni) {
                 } rp += vl;
             }
         } p += rdLen;
-    } free(resp); return NULL;
+    } 
+    log_msg("[Error] No ECH Config (Type 65 Key 5) found in answers.");
+    free(resp); return NULL;
 }
 
 // --- System Proxy ---
