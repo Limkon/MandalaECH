@@ -104,7 +104,11 @@ DWORD WINAPI client_handler(LPVOID p) {
     char *c_buf = NULL; 
     char *ws_read_buf = NULL; 
     char *ws_send_buf = NULL; 
+    
+    // [Refactor] 动态缓冲区状态变量
+    int ws_read_buf_cap = IO_BUFFER_SIZE; // 初始容量
     int ws_buf_len = 0; 
+
     int flag = 1; 
 
     int browser_len;
@@ -144,15 +148,17 @@ DWORD WINAPI client_handler(LPVOID p) {
     
     // 初始化
     memset(&tls, 0, sizeof(tls));
-    c_buf = (char*)malloc(BUFFER_SIZE); 
-    ws_read_buf = (char*)malloc(BUFFER_SIZE); 
-    ws_send_buf = (char*)malloc(BUFFER_SIZE + 4096); 
+    
+    // [Refactor] 使用小缓冲区初始化，避免内存爆炸
+    c_buf = (char*)malloc(IO_BUFFER_SIZE); 
+    ws_read_buf = (char*)malloc(ws_read_buf_cap); 
+    ws_send_buf = (char*)malloc(IO_BUFFER_SIZE + 4096); 
 
     if (!c_buf || !ws_read_buf || !ws_send_buf) goto cl_end; 
     setsockopt(c, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
     
-    // 1. 读取浏览器首包
-    browser_len = recv_timeout(c, c_buf, BUFFER_SIZE, 10);
+    // 1. 读取浏览器首包 (使用 IO_BUFFER_SIZE)
+    browser_len = recv_timeout(c, c_buf, IO_BUFFER_SIZE, 10);
     if (browser_len <= 0) goto cl_end; 
     c_buf[browser_len] = 0;
     
@@ -160,7 +166,7 @@ DWORD WINAPI client_handler(LPVOID p) {
     if (c_buf[0] == 0x05) { 
         send(c, "\x05\x00", 2, 0); 
         is_socks5 = 1;
-        int n = recv_timeout(c, c_buf, BUFFER_SIZE, 10);
+        int n = recv_timeout(c, c_buf, IO_BUFFER_SIZE, 10);
         if (n <= 0) goto cl_end;
         browser_len = n;
         if (c_buf[1] == 0x01) { // CONNECT
@@ -233,8 +239,8 @@ DWORD WINAPI client_handler(LPVOID p) {
     for(int i=0; i<16; i++) rnd_key[i] = rand() % 256;
     base64_encode_key(rnd_key, ws_key_str);
 
-    // [Security Fix] 使用 snprintf
-    offset = snprintf(ws_send_buf, BUFFER_SIZE, 
+    // [Refactor] 使用 IO_BUFFER_SIZE
+    offset = snprintf(ws_send_buf, IO_BUFFER_SIZE, 
         "GET %s HTTP/1.1\r\n"
         "Host: %s\r\n"
         "User-Agent: %s\r\n"
@@ -247,7 +253,7 @@ DWORD WINAPI client_handler(LPVOID p) {
     tls_write(&tls, ws_send_buf, offset);
 
     // 读取 WS 响应
-    len = tls_read(&tls, ws_read_buf, BUFFER_SIZE-1);
+    len = tls_read(&tls, ws_read_buf, ws_read_buf_cap - 1);
     if (len <= 0) goto cl_end;
     ws_read_buf[len] = 0;
     
@@ -430,7 +436,8 @@ DWORD WINAPI client_handler(LPVOID p) {
         if (n < 0) break;
         
         if (FD_ISSET(c, &fds)) {
-            len = recv(c, c_buf, BUFFER_SIZE, 0);
+            // [Refactor] Recv 使用 IO_BUFFER_SIZE
+            len = recv(c, c_buf, IO_BUFFER_SIZE, 0);
             if (len > 0) {
                 flen = build_ws_frame(c_buf, len, ws_send_buf);
                 if (tls_write(&tls, ws_send_buf, flen) < 0) {
@@ -444,8 +451,30 @@ DWORD WINAPI client_handler(LPVOID p) {
         }
         
         if (FD_ISSET(r, &fds) || pending > 0) {
-            if (ws_buf_len < BUFFER_SIZE) {
-                len = tls_read(&tls, ws_read_buf + ws_buf_len, BUFFER_SIZE - ws_buf_len);
+            // [Refactor] 动态扩容逻辑
+            // 检查剩余空间是否足够，如果空间快满了，则扩容
+            if (ws_buf_len >= ws_read_buf_cap - 1024) { // 预留一点空间以防万一
+                if (ws_read_buf_cap < MAX_WS_FRAME_SIZE) {
+                    int new_cap = ws_read_buf_cap * 2;
+                    if (new_cap > MAX_WS_FRAME_SIZE) new_cap = MAX_WS_FRAME_SIZE;
+                    
+                    if (new_cap > ws_read_buf_cap) {
+                        char* new_buf = (char*)realloc(ws_read_buf, new_cap);
+                        if (!new_buf) {
+                            log_msg("[Err] OOM expanding read buffer");
+                            goto cl_end;
+                        }
+                        ws_read_buf = new_buf;
+                        ws_read_buf_cap = new_cap;
+                    }
+                } else {
+                    // 如果已经达到最大限制且缓冲区满了，说明帧太大或者处理不及时
+                    if (ws_buf_len >= MAX_WS_FRAME_SIZE) goto cl_end;
+                }
+            }
+
+            if (ws_buf_len < ws_read_buf_cap) {
+                len = tls_read(&tls, ws_read_buf + ws_buf_len, ws_read_buf_cap - ws_buf_len);
                 if (len > 0) ws_buf_len += len;
                 else if (len == -1) {
                     break; 
@@ -484,7 +513,11 @@ DWORD WINAPI client_handler(LPVOID p) {
                 }
                 ws_buf_len -= (int)frame_total;
             } else { 
-                if (ws_buf_len >= BUFFER_SIZE) goto cl_end; 
+                // [Refactor] 如果缓冲区已满但仍未解析出完整帧（说明帧大小 > 当前容量）
+                if (ws_buf_len >= ws_read_buf_cap) {
+                     // 此时会触发外层的扩容逻辑；但如果已经达到 MAX_WS_FRAME_SIZE，则会在下一次循环或扩容检查中失败
+                     if (ws_read_buf_cap >= MAX_WS_FRAME_SIZE) goto cl_end;
+                }
                 break; 
             }
         }
