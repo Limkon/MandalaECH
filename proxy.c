@@ -67,13 +67,14 @@ DWORD WINAPI client_handler(LPVOID p) {
     ProxyConfig localConfig = ctx->config; 
     free(ctx); 
 
-    // [ECH 核心逻辑]
-    // 1. 如果配置了 Outer SNI (如 cloudflare-ech.com)，先尝试获取它的密钥
+    // [ECH 准备阶段]
+    // 检查是否需要动态获取 ECH 密钥
     if (strlen(localConfig.outer_sni) > 0) {
+        // 如果没有配置静态 ECH 字符串，尝试从 DoH 获取
         if (strlen(localConfig.ech) == 0) {
-            // 动态从 DoH 获取密钥
             char* dynEch = FetchECHFromDoH(g_dohUrl, localConfig.outer_sni);
             if (dynEch) {
+                // 成功获取，更新当前线程的配置副本
                 snprintf(localConfig.ech, sizeof(localConfig.ech), "%s", dynEch);
                 free(dynEch);
             }
@@ -95,7 +96,7 @@ DWORD WINAPI client_handler(LPVOID p) {
     if (browser_len <= 0) goto cl_end; 
     c_buf[browser_len] = 0;
     
-    // 简单的协议判断 (SOCKS5 / HTTP)
+    // 简单的协议判断
     char method[16], host[256]; int port = 80; 
     int is_socks5 = 0; int is_connect_method = 0;
     int header_len = 0;
@@ -125,7 +126,8 @@ DWORD WINAPI client_handler(LPVOID p) {
         } else { goto cl_end; }
     }
     
-    // [Connection Strategy] 优先解析 Outer SNI 的 IP
+    // [Connection Logic]
+    // 1. 物理连接目标：优先连接 Outer SNI 的 IP (Cloudflare)，否则连接 Host IP
     const char* connect_host = (strlen(localConfig.outer_sni) > 0) ? localConfig.outer_sni : localConfig.host;
     struct hostent *h = gethostbyname(connect_host);
     if(!h) { h = gethostbyname(localConfig.host); if (!h) goto cl_end; }
@@ -147,13 +149,11 @@ DWORD WINAPI client_handler(LPVOID p) {
         if (connect(r, (struct sockaddr*)&a, sizeof(a)) == 0) {
             tls.sock = r;
             
-            // [CRITICAL FIX] 握手时的 SNI 选择
-            // 如果启用了 ECH (有 keys)，必须使用 Outer SNI (cloudflare-ech.com) 进行 TLS 握手。
-            // 真实的域名 (zoo.cbu.net) 依然作为 HTTP Host 头发送，或由 ECH 封装。
+            // [CRITICAL FIX] 
+            // 握手 SNI (Inner SNI) 必须是真实的 Worker 域名 (localConfig.sni)
+            // OpenSSL 会根据 ECH Config 自动填充 Outer SNI (cloudflare-ech.com)
             const char* handshake_sni = localConfig.sni;
-            if (strlen(localConfig.ech) > 0 && strlen(localConfig.outer_sni) > 0) {
-                handshake_sni = localConfig.outer_sni;
-            }
+            if (strlen(handshake_sni) == 0) handshake_sni = localConfig.host; // fallback
 
             if (tls_init_connect(&tls, handshake_sni, localConfig.host, localConfig.ech) == 0) break;
             else tls_close(&tls);
@@ -164,7 +164,7 @@ DWORD WINAPI client_handler(LPVOID p) {
 
     if (r == INVALID_SOCKET || tls.ssl == NULL) goto cl_end;
     
-    // WebSocket 握手 (Host 头必须是真实的 worker 域名)
+    // WebSocket 握手
     const char* req_host = (strlen(localConfig.sni) > 0) ? localConfig.sni : localConfig.host;
     const char* req_path = (strlen(localConfig.path) > 0) ? localConfig.path : "/";
     
