@@ -14,28 +14,17 @@ extern char g_dohUrl[512];
 
 // --- 辅助函数 ---
 void parse_uuid(const char* uuid_str, unsigned char* out) {
-    const char* p = uuid_str;
-    int i = 0;
+    const char* p = uuid_str; int i = 0;
     while (*p && i < 16) {
-        if (*p == '-' || *p == ' ' || *p == '{' || *p == '}') { 
-            p++; continue; 
-        }
-        int v;
-        if (sscanf(p, "%2x", &v) == 1) {
-            out[i++] = (unsigned char)v;
-            p += 2;
-        } else {
-            p++; 
-        }
+        if (*p == '-' || *p == ' ' || *p == '{' || *p == '}') { p++; continue; }
+        int v; if (sscanf(p, "%2x", &v) == 1) { out[i++] = (unsigned char)v; p += 2; } else { p++; }
     }
 }
 
 void trojan_password_hash(const char* password, char* out_hex) {
     unsigned char digest[SHA224_DIGEST_LENGTH];
     SHA224((unsigned char*)password, strlen(password), digest);
-    for(int i = 0; i < SHA224_DIGEST_LENGTH; i++) {
-        snprintf(out_hex + (i * 2), 3, "%02x", digest[i]);
-    }
+    for(int i = 0; i < SHA224_DIGEST_LENGTH; i++) snprintf(out_hex + (i * 2), 3, "%02x", digest[i]);
     out_hex[SHA224_DIGEST_LENGTH * 2] = 0;
 }
 
@@ -55,24 +44,18 @@ int send_all(SOCKET s, const char *buf, int len) {
             int err = WSAGetLastError();
             if (err == WSAEWOULDBLOCK) { Sleep(1); continue; }
             return -1;
-        }
-        total += n; bytesleft -= n;
-    }
-    return total;
+        } total += n; bytesleft -= n;
+    } return total;
 }
 
 void base64_encode_key(const unsigned char* src, char* dst) {
     const char* table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     for(int i=0; i<16; i+=3) {
         int n = (src[i] << 16) + (src[i+1] << 8) + src[i+2];
-        dst[0] = table[(n >> 18) & 0x3F];
-        dst[1] = table[(n >> 12) & 0x3F];
-        dst[2] = table[(n >> 6) & 0x3F];
-        dst[3] = table[n & 0x3F];
+        dst[0] = table[(n >> 18) & 0x3F]; dst[1] = table[(n >> 12) & 0x3F];
+        dst[2] = table[(n >> 6) & 0x3F]; dst[3] = table[n & 0x3F];
         dst += 4;
-    }
-    *(dst-1) = '='; 
-    *dst = 0;
+    } *(dst-1) = '='; *dst = 0;
 }
 
 // --- 客户端处理线程 ---
@@ -84,156 +67,95 @@ DWORD WINAPI client_handler(LPVOID p) {
     ProxyConfig localConfig = ctx->config; 
     free(ctx); 
 
-    // [ECH Logic Update]
+    // [ECH 核心逻辑]
+    // 1. 如果配置了 Outer SNI (如 cloudflare-ech.com)，先尝试获取它的密钥
     if (strlen(localConfig.outer_sni) > 0) {
-        // 如果没有配置静态 ECH，尝试从 DoH 获取
         if (strlen(localConfig.ech) == 0) {
-            // 查询 Outer SNI (Provider) 的密钥
-            const char* ech_provider = localConfig.outer_sni;
-            
-            log_msg("[ECH] Fetching keys for provider: %s", ech_provider);
-            char* dynEch = FetchECHFromDoH(g_dohUrl, ech_provider);
-            
+            // 动态从 DoH 获取密钥
+            char* dynEch = FetchECHFromDoH(g_dohUrl, localConfig.outer_sni);
             if (dynEch) {
-                log_msg("[ECH] Success. Got ECH config for %s", ech_provider);
                 snprintf(localConfig.ech, sizeof(localConfig.ech), "%s", dynEch);
                 free(dynEch);
-            } else {
-                log_msg("[ECH] Failed to fetch ECH for %s. Connection may fail.", ech_provider);
             }
         }
-        // [IMPORTANT] 我们删除了覆盖 localConfig.sni 的代码。
-        // OpenSSL 会自动使用 ECH 配置中的 Public Name (Outer SNI)。
-        // 保持 localConfig.sni 为真实的 Worker 域名 (Inner SNI) 是正确的做法。
     }
 
     TLSContext tls; 
     SOCKET r = INVALID_SOCKET;      
-    
-    char *c_buf = NULL; 
-    char *ws_read_buf = NULL; 
-    char *ws_send_buf = NULL; 
-    int ws_buf_len = 0; 
-    int flag = 1; 
-
-    int browser_len;
-    char method[16], host[256]; 
-    int port = 80; 
-    int is_connect_method = 0;
-    int is_socks5 = 0; 
-    char *header_end = NULL;
-    int header_len = 0;
-
-    struct hostent *h;
-    struct sockaddr_in a;
-    const char* sni_val;
-    const char* req_path;
-    int offset;
-    int len;
-
-    int flen = 0;
-    unsigned char proto_buf[2048]; 
-    int proto_len = 0;
-    
-    BOOL is_vless;
-    BOOL is_trojan;
-    BOOL is_shadowsocks;
-    BOOL is_mandala; 
-    
-    struct in_addr ip4; 
-    struct in6_addr ip6;
-    
-    fd_set fds; 
-    struct timeval tv; 
-    u_long mode = 1;
-    int hl, pl;
-    long long frame_total;
-    int vless_response_header_stripped = 0;
-    int retry_count = 0;
-    
-    // 初始化
-    memset(&tls, 0, sizeof(tls));
-    c_buf = (char*)malloc(BUFFER_SIZE); 
-    ws_read_buf = (char*)malloc(BUFFER_SIZE); 
-    ws_send_buf = (char*)malloc(BUFFER_SIZE + 4096); 
+    char *c_buf = (char*)malloc(BUFFER_SIZE); 
+    char *ws_read_buf = (char*)malloc(BUFFER_SIZE); 
+    char *ws_send_buf = (char*)malloc(BUFFER_SIZE + 4096); 
+    int ws_buf_len = 0; int flag = 1; 
 
     if (!c_buf || !ws_read_buf || !ws_send_buf) goto cl_end; 
     setsockopt(c, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
     
-    // 读取浏览器首包
-    browser_len = recv_timeout(c, c_buf, BUFFER_SIZE, 10);
+    // 读取浏览器请求
+    int browser_len = recv_timeout(c, c_buf, BUFFER_SIZE, 10);
     if (browser_len <= 0) goto cl_end; 
     c_buf[browser_len] = 0;
     
-    // 协议判断
+    // 简单的协议判断 (SOCKS5 / HTTP)
+    char method[16], host[256]; int port = 80; 
+    int is_socks5 = 0; int is_connect_method = 0;
+    int header_len = 0;
+
     if (c_buf[0] == 0x05) { 
-        send(c, "\x05\x00", 2, 0); 
-        is_socks5 = 1;
+        send(c, "\x05\x00", 2, 0); is_socks5 = 1;
         int n = recv_timeout(c, c_buf, BUFFER_SIZE, 10);
-        if (n <= 0) goto cl_end;
-        browser_len = n;
+        if (n <= 0) goto cl_end; browser_len = n;
         if (c_buf[1] == 0x01) { // CONNECT
              if (c_buf[3] == 0x01) {
                  struct in_addr* addr_ptr = (struct in_addr*)&c_buf[4];
                  port = ntohs(*(unsigned short*)&c_buf[8]);
                  inet_ntop(AF_INET, addr_ptr, host, sizeof(host));
-             } else if (c_buf[3] == 0x03) { // Domain
-                 int dlen = c_buf[4];
-                 memcpy(host, &c_buf[5], dlen);
-                 host[dlen] = 0;
+             } else if (c_buf[3] == 0x03) { 
+                 int dlen = c_buf[4]; memcpy(host, &c_buf[5], dlen); host[dlen] = 0;
                  port = ntohs(*(unsigned short*)&c_buf[5+dlen]);
-             }
-             strcpy(method, "SOCKS5");
-        } else {
-             goto cl_end; 
-        }
-    } 
-    else {
+             } strcpy(method, "SOCKS5");
+        } else { goto cl_end; }
+    } else {
         if (sscanf(c_buf, "%15s %255s", method, host) == 2) {
-            char *p = strchr(host, ':');
-            if (p) { *p = 0; port = atoi(p+1); }
+            char *ptr = strchr(host, ':');
+            if (ptr) { *ptr = 0; port = atoi(ptr+1); }
             else if(stricmp(method, "CONNECT")==0) port = 443;
-            
             if (stricmp(method, "CONNECT") == 0) is_connect_method = 1;
-            
-            header_end = strstr(c_buf, "\r\n\r\n");
-            if (header_end) {
-                header_len = (int)(header_end - c_buf) + 4;
-            } else {
-                header_len = browser_len;
-            }
+            char *hend = strstr(c_buf, "\r\n\r\n");
+            header_len = hend ? (int)(hend - c_buf) + 4 : browser_len;
         } else { goto cl_end; }
     }
     
-    // 连接到代理服务器
-    // [Connection Strategy] 优先解析 Outer SNI IP
-    const char* connect_host = localConfig.host;
-    if (strlen(localConfig.outer_sni) > 0) {
-        connect_host = localConfig.outer_sni;
-    }
-    
-    h = gethostbyname(connect_host);
-    if(!h) { 
-        h = gethostbyname(localConfig.host);
-        if (!h) { log_msg("[Err] DNS Fail: %s", connect_host); goto cl_end; }
-    }
+    // [Connection Strategy] 优先解析 Outer SNI 的 IP
+    const char* connect_host = (strlen(localConfig.outer_sni) > 0) ? localConfig.outer_sni : localConfig.host;
+    struct hostent *h = gethostbyname(connect_host);
+    if(!h) { h = gethostbyname(localConfig.host); if (!h) goto cl_end; }
 
+    int retry_count;
     for (retry_count = 0; retry_count < 3; retry_count++) {
         r = socket(AF_INET, SOCK_STREAM, 0);
         if (r == INVALID_SOCKET) goto cl_end;
         
         setsockopt(r, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
         int timeout_ms = 5000;
-        setsockopt(r, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout_ms, sizeof(int));
-        setsockopt(r, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout_ms, sizeof(int));
+        setsockopt(r, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout_ms, 4);
+        setsockopt(r, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout_ms, 4);
 
-        memset(&a, 0, sizeof(a)); a.sin_family = AF_INET; a.sin_port = htons((unsigned short)localConfig.port);
+        struct sockaddr_in a; memset(&a, 0, sizeof(a)); 
+        a.sin_family = AF_INET; a.sin_port = htons((unsigned short)localConfig.port);
         a.sin_addr = *(struct in_addr*)h->h_addr;
         
         if (connect(r, (struct sockaddr*)&a, sizeof(a)) == 0) {
             tls.sock = r;
-            // [ECH] 传递 Inner SNI (Worker 域名)，OpenSSL 负责处理 Outer SNI
-            if (tls_init_connect(&tls, localConfig.sni, localConfig.host, localConfig.ech) == 0) break;
+            
+            // [CRITICAL FIX] 握手时的 SNI 选择
+            // 如果启用了 ECH (有 keys)，必须使用 Outer SNI (cloudflare-ech.com) 进行 TLS 握手。
+            // 真实的域名 (zoo.cbu.net) 依然作为 HTTP Host 头发送，或由 ECH 封装。
+            const char* handshake_sni = localConfig.sni;
+            if (strlen(localConfig.ech) > 0 && strlen(localConfig.outer_sni) > 0) {
+                handshake_sni = localConfig.outer_sni;
+            }
+
+            if (tls_init_connect(&tls, handshake_sni, localConfig.host, localConfig.ech) == 0) break;
             else tls_close(&tls);
         }
         closesocket(r); r = INVALID_SOCKET;
@@ -242,62 +164,43 @@ DWORD WINAPI client_handler(LPVOID p) {
 
     if (r == INVALID_SOCKET || tls.ssl == NULL) goto cl_end;
     
-    // 3. WebSocket 握手
-    sni_val = (strlen(localConfig.sni) > 0) ? localConfig.sni : localConfig.host;
-    req_path = (strlen(localConfig.path) > 0) ? localConfig.path : "/";
+    // WebSocket 握手 (Host 头必须是真实的 worker 域名)
+    const char* req_host = (strlen(localConfig.sni) > 0) ? localConfig.sni : localConfig.host;
+    const char* req_path = (strlen(localConfig.path) > 0) ? localConfig.path : "/";
     
-    unsigned char rnd_key[16];
-    char ws_key_str[32];
+    unsigned char rnd_key[16]; char ws_key_str[32];
     for(int i=0; i<16; i++) rnd_key[i] = rand() % 256;
     base64_encode_key(rnd_key, ws_key_str);
 
-    offset = snprintf(ws_send_buf, BUFFER_SIZE, 
-        "GET %s HTTP/1.1\r\n"
-        "Host: %s\r\n"
-        "User-Agent: %s\r\n"
-        "Upgrade: websocket\r\n"
-        "Connection: Upgrade\r\n"
-        "Sec-WebSocket-Key: %s\r\n"
-        "Sec-WebSocket-Version: 13\r\n\r\n", 
-        req_path, sni_val, g_userAgentStr, ws_key_str);
+    int offset = snprintf(ws_send_buf, BUFFER_SIZE, 
+        "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n", 
+        req_path, req_host, g_userAgentStr, ws_key_str);
 
     tls_write(&tls, ws_send_buf, offset);
 
     // 读取 WS 响应
-    len = tls_read(&tls, ws_read_buf, BUFFER_SIZE-1);
-    if (len <= 0) goto cl_end;
-    ws_read_buf[len] = 0;
+    int len = tls_read(&tls, ws_read_buf, BUFFER_SIZE-1);
+    if (len <= 0 || !strstr(ws_read_buf, "101")) goto cl_end;
     
-    if (!strstr(ws_read_buf, "101")) { 
-        log_msg("[Err] WS Handshake Fail: %.50s", ws_read_buf);
-        goto cl_end; 
-    }
-    
-    // 检查 Early Data
     char* body_start = strstr(ws_read_buf, "\r\n\r\n");
-    ws_buf_len = 0;
     if (body_start) {
         body_start += 4; 
-        int header_bytes = (int)(body_start - ws_read_buf);
-        int remaining = len - header_bytes;
-        
-        if (remaining > 0) {
-            memmove(ws_read_buf, body_start, remaining);
-            ws_buf_len = remaining;
-        }
-    }
+        int rem = len - (int)(body_start - ws_read_buf);
+        if (rem > 0) { memmove(ws_read_buf, body_start, rem); ws_buf_len = rem; } else ws_buf_len = 0;
+    } else ws_buf_len = 0;
     
-    // 4. 发送代理协议头
-    is_vless = (_stricmp(localConfig.type, "vless") == 0);
-    is_trojan = (_stricmp(localConfig.type, "trojan") == 0);
-    is_shadowsocks = (_stricmp(localConfig.type, "shadowsocks") == 0);
-    is_mandala = (_stricmp(localConfig.type, "mandala") == 0);
+    // 发送代理协议头 (VLESS/Trojan/Shadowsocks)
+    unsigned char proto_buf[2048]; int proto_len = 0;
+    struct in_addr ip4; struct in6_addr ip6;
+    int is_vless = (_stricmp(localConfig.type, "vless") == 0);
+    int is_trojan = (_stricmp(localConfig.type, "trojan") == 0);
+    int is_shadowsocks = (_stricmp(localConfig.type, "shadowsocks") == 0);
+    int is_mandala = (_stricmp(localConfig.type, "mandala") == 0);
 
     if (is_vless) {
         proto_buf[proto_len++] = 0x00; 
         parse_uuid(localConfig.user, proto_buf + proto_len); proto_len += 16; 
-        proto_buf[proto_len++] = 0x00; 
-        proto_buf[proto_len++] = 0x01; 
+        proto_buf[proto_len++] = 0x00; proto_buf[proto_len++] = 0x01; 
         proto_buf[proto_len++] = (port >> 8) & 0xFF; proto_buf[proto_len++] = port & 0xFF;        
         if (inet_pton(AF_INET, host, &ip4) == 1) {
             proto_buf[proto_len++] = 0x01; memcpy(proto_buf + proto_len, &ip4, 4); proto_len += 4;
@@ -307,13 +210,12 @@ DWORD WINAPI client_handler(LPVOID p) {
             proto_buf[proto_len++] = 0x02; proto_buf[proto_len++] = (unsigned char)strlen(host);
             memcpy(proto_buf + proto_len, host, strlen(host)); proto_len += (int)strlen(host);
         }
-        flen = build_ws_frame((char*)proto_buf, proto_len, ws_send_buf);
+        int flen = build_ws_frame((char*)proto_buf, proto_len, ws_send_buf);
         tls_write(&tls, ws_send_buf, flen);
     } else if (is_trojan) {
         char hex_pass[56 + 1]; trojan_password_hash(localConfig.pass, hex_pass);
         memcpy(proto_buf, hex_pass, 56); proto_len = 56;
-        proto_buf[proto_len++] = 0x0D; proto_buf[proto_len++] = 0x0A;
-        proto_buf[proto_len++] = 0x01; 
+        proto_buf[proto_len++] = 0x0D; proto_buf[proto_len++] = 0x0A; proto_buf[proto_len++] = 0x01; 
         if (inet_pton(AF_INET, host, &ip4) == 1) {
              proto_buf[proto_len++] = 0x01; memcpy(proto_buf + proto_len, &ip4, 4); proto_len += 4;
         } else if (inet_pton(AF_INET6, host, &ip6) == 1) {
@@ -324,50 +226,26 @@ DWORD WINAPI client_handler(LPVOID p) {
         }
         proto_buf[proto_len++] = (port >> 8) & 0xFF; proto_buf[proto_len++] = port & 0xFF;
         proto_buf[proto_len++] = 0x0D; proto_buf[proto_len++] = 0x0A;
-        flen = build_ws_frame((char*)proto_buf, proto_len, ws_send_buf);
+        int flen = build_ws_frame((char*)proto_buf, proto_len, ws_send_buf);
         tls_write(&tls, ws_send_buf, flen);
     } else if (is_mandala) { 
-        unsigned char salt[4];
-        for(int i=0; i<4; i++) salt[i] = rand() % 256;
-
-        unsigned char plaintext[2048]; 
-        int p_len = 0;
-
-        char hex_pass[57]; 
-        trojan_password_hash(localConfig.pass, hex_pass);
-        memcpy(plaintext + p_len, hex_pass, 56); p_len += 56;
-
-        int pad_len = rand() % 16; 
-        plaintext[p_len++] = (unsigned char)pad_len;
-        for(int i=0; i<pad_len; i++) plaintext[p_len++] = rand() % 256;
-
-        plaintext[p_len++] = 0x01;
-
-        if (inet_pton(AF_INET, host, &ip4) == 1) {
-             plaintext[p_len++] = 0x01; 
-             memcpy(plaintext + p_len, &ip4, 4); p_len += 4;
-        } else if (inet_pton(AF_INET6, host, &ip6) == 1) {
-             plaintext[p_len++] = 0x04; 
-             memcpy(plaintext + p_len, &ip6, 16); p_len += 16;
-        } else {
-             plaintext[p_len++] = 0x03; 
-             plaintext[p_len++] = (unsigned char)strlen(host);
-             memcpy(plaintext + p_len, host, strlen(host)); p_len += strlen(host);
-        }
-
-        plaintext[p_len++] = (port >> 8) & 0xFF; 
-        plaintext[p_len++] = port & 0xFF;
-
-        plaintext[p_len++] = 0x0D; plaintext[p_len++] = 0x0A;
-
+        unsigned char salt[4]; for(int i=0; i<4; i++) salt[i] = rand() % 256;
+        unsigned char pt[2048]; int pl = 0;
+        char hex_pass[57]; trojan_password_hash(localConfig.pass, hex_pass);
+        memcpy(pt + pl, hex_pass, 56); pl += 56;
+        int pad = rand() % 16; pt[pl++] = (unsigned char)pad;
+        for(int i=0; i<pad; i++) pt[pl++] = rand() % 256;
+        pt[pl++] = 0x01;
+        if (inet_pton(AF_INET, host, &ip4) == 1) { pt[pl++] = 0x01; memcpy(pt + pl, &ip4, 4); pl += 4; } 
+        else if (inet_pton(AF_INET6, host, &ip6) == 1) { pt[pl++] = 0x04; memcpy(pt + pl, &ip6, 16); pl += 16; } 
+        else { pt[pl++] = 0x03; pt[pl++] = (unsigned char)strlen(host); memcpy(pt + pl, host, strlen(host)); pl += strlen(host); }
+        pt[pl++] = (port >> 8) & 0xFF; pt[pl++] = port & 0xFF;
+        pt[pl++] = 0x0D; pt[pl++] = 0x0A;
         memcpy(proto_buf, salt, 4);
-        for(int i=0; i<p_len; i++) {
-            proto_buf[4 + i] = plaintext[i] ^ salt[i % 4];
-        }
-        proto_len = 4 + p_len;
-        flen = build_ws_frame((char*)proto_buf, proto_len, ws_send_buf);
+        for(int i=0; i<pl; i++) proto_buf[4 + i] = pt[i] ^ salt[i % 4];
+        proto_len = 4 + pl;
+        int flen = build_ws_frame((char*)proto_buf, proto_len, ws_send_buf);
         tls_write(&tls, ws_send_buf, flen);
-
     } else if (is_shadowsocks) {
         if (inet_pton(AF_INET, host, &ip4) == 1) {
              proto_buf[proto_len++] = 0x01; memcpy(proto_buf + proto_len, &ip4, 4); proto_len += 4;
@@ -378,146 +256,96 @@ DWORD WINAPI client_handler(LPVOID p) {
              memcpy(proto_buf + proto_len, host, strlen(host)); proto_len += strlen(host);
         }
         proto_buf[proto_len++] = (port >> 8) & 0xFF; proto_buf[proto_len++] = port & 0xFF;
-        flen = build_ws_frame((char*)proto_buf, proto_len, ws_send_buf);
+        int flen = build_ws_frame((char*)proto_buf, proto_len, ws_send_buf);
         tls_write(&tls, ws_send_buf, flen);
-    } else {
-        // SOCKS5 (outbound)
-        char auth[] = {0x05, 0x01, 0x00}; 
-        if (strlen(localConfig.user) > 0) auth[2] = 0x02; 
-        flen = build_ws_frame(auth, 3, ws_send_buf);
+    } else { // SOCKS5 Outbound
+        char auth[] = {0x05, 0x01, 0x00}; if (strlen(localConfig.user) > 0) auth[2] = 0x02; 
+        int flen = build_ws_frame(auth, 3, ws_send_buf);
         tls_write(&tls, ws_send_buf, flen);
         char resp_buf[512]; 
         if (ws_read_payload_exact(&tls, resp_buf, 2) < 2) goto cl_end;
         if (resp_buf[1] == 0x02) {
-            int ulen = strlen(localConfig.user);
-            int plen = strlen(localConfig.pass);
-            unsigned char auth_pkg[512];
-            int ap_len = 0;
-            auth_pkg[ap_len++] = 0x01; 
-            auth_pkg[ap_len++] = ulen; memcpy(auth_pkg+ap_len, localConfig.user, ulen); ap_len += ulen;
-            auth_pkg[ap_len++] = plen; memcpy(auth_pkg+ap_len, localConfig.pass, plen); ap_len += plen;
-            flen = build_ws_frame((char*)auth_pkg, ap_len, ws_send_buf);
-            tls_write(&tls, ws_send_buf, flen);
-            if (ws_read_payload_exact(&tls, resp_buf, 2) < 2) goto cl_end;
-            if (resp_buf[1] != 0x00) goto cl_end;
+            int ulen = strlen(localConfig.user), plen = strlen(localConfig.pass);
+            unsigned char ap[512]; int al = 0;
+            ap[al++] = 0x01; ap[al++] = ulen; memcpy(ap+al, localConfig.user, ulen); al += ulen;
+            ap[al++] = plen; memcpy(ap+al, localConfig.pass, plen); al += plen;
+            flen = build_ws_frame((char*)ap, al, ws_send_buf); tls_write(&tls, ws_send_buf, flen);
+            if (ws_read_payload_exact(&tls, resp_buf, 2) < 2 || resp_buf[1] != 0) goto cl_end;
         } 
-        int slen = 0;
-        unsigned char socks_req[512];
-        socks_req[slen++] = 0x05; socks_req[slen++] = 0x01; socks_req[slen++] = 0x00; 
-        if (inet_pton(AF_INET, host, &ip4) == 1) {
-            socks_req[slen++] = 0x01; memcpy(socks_req + slen, &ip4, 4); slen += 4;
-        } else {
-            socks_req[slen++] = 0x03; socks_req[slen++] = (unsigned char)strlen(host);
-            memcpy(socks_req + slen, host, strlen(host)); slen += (int)strlen(host);
-        }
-        socks_req[slen++] = (port >> 8) & 0xFF; socks_req[slen++] = port & 0xFF;
-        flen = build_ws_frame((char*)socks_req, slen, ws_send_buf);
-        tls_write(&tls, ws_send_buf, flen);
-        if (ws_read_payload_exact(&tls, resp_buf, 4) == 0) goto cl_end;
-        if (resp_buf[1] != 0x00) goto cl_end;
+        unsigned char sr[512]; int sl = 0;
+        sr[sl++] = 0x05; sr[sl++] = 0x01; sr[sl++] = 0x00; 
+        if (inet_pton(AF_INET, host, &ip4) == 1) { sr[sl++] = 0x01; memcpy(sr+sl, &ip4, 4); sl += 4; } 
+        else { sr[sl++] = 0x03; sr[sl++] = strlen(host); memcpy(sr+sl, host, strlen(host)); sl += strlen(host); }
+        sr[sl++] = (port >> 8) & 0xFF; sr[sl++] = port & 0xFF;
+        flen = build_ws_frame((char*)sr, sl, ws_send_buf); tls_write(&tls, ws_send_buf, flen);
+        if (ws_read_payload_exact(&tls, resp_buf, 4) == 0 || resp_buf[1] != 0) goto cl_end;
     }
     
-    // 5. 响应浏览器
-    if (is_socks5) {
-        unsigned char s5_ok[] = {0x05, 0x00, 0x00, 0x01, 0,0,0,0, 0,0};
-        send(c, (char*)s5_ok, 10, 0);
-    } else if (is_connect_method) {
-        const char *ok = "HTTP/1.1 200 Connection Established\r\n\r\n";
-        if (send(c, ok, strlen(ok), 0) == SOCKET_ERROR) goto cl_end;
+    // 响应浏览器
+    if (is_socks5) { unsigned char ok[] = {0x05, 0, 0, 1, 0,0,0,0, 0,0}; send(c, (char*)ok, 10, 0); } 
+    else if (is_connect_method) { 
+        const char *ok = "HTTP/1.1 200 Connection Established\r\n\r\n"; send(c, ok, strlen(ok), 0);
         if (browser_len > header_len) {
-            int extra_len = browser_len - header_len;
-            flen = build_ws_frame(c_buf + header_len, extra_len, ws_send_buf);
+            int flen = build_ws_frame(c_buf + header_len, browser_len - header_len, ws_send_buf);
             tls_write(&tls, ws_send_buf, flen);
         }
     } else {
-        flen = build_ws_frame(c_buf, browser_len, ws_send_buf);
-        tls_write(&tls, ws_send_buf, flen);
+        int flen = build_ws_frame(c_buf, browser_len, ws_send_buf); tls_write(&tls, ws_send_buf, flen);
     }
     
-    // 6. 转发循环
+    // 转发循环
+    fd_set fds; struct timeval tv; u_long mode = 1;
     ioctlsocket(c, FIONBIO, &mode); ioctlsocket(r, FIONBIO, &mode);
+    int vless_stripped = 0; int hl, pl; long long ft;
 
     while(1) {
         FD_ZERO(&fds); FD_SET(c, &fds); FD_SET(r, &fds);
-        int pending = SSL_pending(tls.ssl);
-        tv.tv_sec = 1; tv.tv_usec = 0;
-        if (pending > 0 || ws_buf_len > 0) { tv.tv_sec = 0; tv.tv_usec = 0; }
-        
-        int n = select(0, &fds, NULL, NULL, &tv);
-        if (n < 0) break;
+        tv.tv_sec = 1; tv.tv_usec = 0; int pending = SSL_pending(tls.ssl);
+        if (pending > 0 || ws_buf_len > 0) { tv.tv_sec = 0; }
+        if (select(0, &fds, NULL, NULL, &tv) < 0) break;
         
         if (FD_ISSET(c, &fds)) {
-            len = recv(c, c_buf, BUFFER_SIZE, 0);
-            if (len > 0) {
-                flen = build_ws_frame(c_buf, len, ws_send_buf);
-                if (tls_write(&tls, ws_send_buf, flen) < 0) {
-                    break;
-                }
-            } else if (len == 0) {
-                break;
-            } else if (WSAGetLastError() != WSAEWOULDBLOCK) {
-                break;
-            }
+            int n = recv(c, c_buf, BUFFER_SIZE, 0);
+            if (n > 0) { int fl = build_ws_frame(c_buf, n, ws_send_buf); if (tls_write(&tls, ws_send_buf, fl) < 0) break; }
+            else if (n == 0 || WSAGetLastError() != WSAEWOULDBLOCK) break;
         }
         
         if (FD_ISSET(r, &fds) || pending > 0) {
             if (ws_buf_len < BUFFER_SIZE) {
-                len = tls_read(&tls, ws_read_buf + ws_buf_len, BUFFER_SIZE - ws_buf_len);
-                if (len > 0) ws_buf_len += len;
-                else if (len == -1) {
-                    break; 
-                }
+                int n = tls_read(&tls, ws_read_buf + ws_buf_len, BUFFER_SIZE - ws_buf_len);
+                if (n > 0) ws_buf_len += n; else if (n == -1) break; 
             }
         }
         
         while (ws_buf_len > 0) {
-            frame_total = check_ws_frame((unsigned char*)ws_read_buf, ws_buf_len, &hl, &pl);
-            if (frame_total < 0) goto cl_end;
-            if (frame_total > 0) {
-                int opcode = ws_read_buf[0] & 0x0F;
-                if (opcode == 0x8) goto cl_end; 
-                if ((opcode == 0x1 || opcode == 0x2) && pl > 0) {
-                    char* payload_ptr = ws_read_buf + hl;
-                    int payload_size = pl;
-                    if (is_vless && !vless_response_header_stripped) {
-                        if (payload_size >= 2) {
-                            int addon_len = (unsigned char)payload_ptr[1];
-                            int head_size = 2 + addon_len;
-                            if (payload_size >= head_size) {
-                                payload_ptr += head_size;
-                                payload_size -= head_size;
-                                vless_response_header_stripped = 1;
-                            } else { 
-                                payload_size = 0; 
-                            }
-                        } else { payload_size = 0; }
+            ft = check_ws_frame((unsigned char*)ws_read_buf, ws_buf_len, &hl, &pl);
+            if (ft < 0) goto cl_end;
+            if (ft > 0) {
+                int op = ws_read_buf[0] & 0x0F;
+                if (op == 0x8) goto cl_end; 
+                if ((op == 0x1 || op == 0x2) && pl > 0) {
+                    char* ptr = ws_read_buf + hl; int sz = pl;
+                    if (is_vless && !vless_stripped) {
+                        if (sz >= 2) {
+                            int adl = (unsigned char)ptr[1];
+                            if (sz >= 2 + adl) { ptr += 2 + adl; sz -= 2 + adl; vless_stripped = 1; } else sz = 0;
+                        } else sz = 0;
                     }
-                    if (payload_size > 0) {
-                        if (send_all(c, payload_ptr, payload_size) < 0) goto cl_end;
-                    }
+                    if (sz > 0 && send_all(c, ptr, sz) < 0) goto cl_end;
                 }
-                if (frame_total < ws_buf_len) {
-                    memmove(ws_read_buf, ws_read_buf + frame_total, ws_buf_len - frame_total);
-                }
-                ws_buf_len -= (int)frame_total;
-            } else { 
-                if (ws_buf_len >= BUFFER_SIZE) goto cl_end; 
-                break; 
-            }
+                if (ft < ws_buf_len) memmove(ws_read_buf, ws_read_buf + ft, ws_buf_len - ft);
+                ws_buf_len -= (int)ft;
+            } else { if (ws_buf_len >= BUFFER_SIZE) goto cl_end; break; }
         }
     }
 
 cl_end:
-    if (c_buf) free(c_buf); 
-    if (ws_read_buf) free(ws_read_buf); 
-    if (ws_send_buf) free(ws_send_buf); 
+    if (c_buf) free(c_buf); if (ws_read_buf) free(ws_read_buf); if (ws_send_buf) free(ws_send_buf); 
     tls_close(&tls);
-    if (r != INVALID_SOCKET) closesocket(r); 
-    if (c != INVALID_SOCKET) closesocket(c);
+    if (r != INVALID_SOCKET) closesocket(r); if (c != INVALID_SOCKET) closesocket(c);
     return 0;
 }
 
-// 监听线程与管理函数
 DWORD WINAPI server_thread(LPVOID p) {
     g_listen_sock = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
@@ -534,22 +362,16 @@ DWORD WINAPI server_thread(LPVOID p) {
         if (c != INVALID_SOCKET) {
             ClientContext* ctx = (ClientContext*)malloc(sizeof(ClientContext));
             if (ctx) {
-                ctx->clientSock = c;
-                ctx->config = g_proxyConfig; // 线程安全的配置快照
-                HANDLE hClient = CreateThread(NULL, 0, client_handler, (LPVOID)ctx, 0, NULL);
-                if (hClient) CloseHandle(hClient); 
-                else { free(ctx); closesocket(c); }
-            } else {
-                closesocket(c);
-            }
+                ctx->clientSock = c; ctx->config = g_proxyConfig; 
+                HANDLE h = CreateThread(NULL, 0, client_handler, (LPVOID)ctx, 0, NULL);
+                if (h) CloseHandle(h); else { free(ctx); closesocket(c); }
+            } else closesocket(c);
         } else break;
-    }
-    return 0;
+    } return 0;
 }
 
 void StartProxyCore() {
-    if (g_proxyRunning) return;
-    g_proxyRunning = TRUE;
+    if (g_proxyRunning) return; g_proxyRunning = TRUE;
     hProxyThread = CreateThread(NULL, 0, server_thread, NULL, 0, NULL);
     if (!hProxyThread) { log_msg("CreateThread Failed"); g_proxyRunning = FALSE; }
 }
