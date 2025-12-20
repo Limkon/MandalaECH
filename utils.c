@@ -2,233 +2,282 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <windows.h>
+#include <wininet.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
-#include "crypto.h" 
+#include "crypto.h"
+#include "common.h"
+#include "gui.h" // 引用 GUI 头文件以获取日志窗口句柄
 
-#ifdef _MSC_VER
+// 链接必要的系统库
 #pragma comment(lib, "ws2_32.lib")
-#endif
+#pragma comment(lib, "crypt32.lib")
 
-extern int g_localPort; 
-extern BOOL g_enableLog; 
+// [优化] 全局复用 SSL_CTX，避免每次请求都初始化，显著降低 CPU 占用
+// 这是一个生产级优化，避免频繁分配和释放 SSL 上下文
+static SSL_CTX* g_utils_ctx = NULL;
 
-// --- 日志函数 ---
+// --------------------------------------------------------------------------
+// 日志系统实现
+// --------------------------------------------------------------------------
+
 void log_msg(const char *format, ...) {
-    // 生产环境安全建议：保留 Fatal 错误日志，即使 g_enableLog 为 FALSE
-    if (!g_enableLog && strstr(format, "[Fatal]") == NULL) return;
+    // 如果未开启日志且不是致命错误，则直接返回
+    if (!g_enableLog && strstr(format, "[Fatal]") == NULL) {
+        return;
+    }
 
     char buf[2048]; 
     char time_buf[64]; 
     SYSTEMTIME st; 
+    
+    // 获取本地时间
     GetLocalTime(&st);
     
-    // [Safety] 使用 snprintf 防止溢出
+    // 格式化时间字符串
     snprintf(time_buf, sizeof(time_buf), "[%02d:%02d:%02d] ", st.wHour, st.wMinute, st.wSecond);
     
+    // 格式化日志内容
     va_list args; 
     va_start(args, format); 
-    vsnprintf(buf, sizeof(buf)-64, format, args); 
+    vsnprintf(buf, sizeof(buf) - 64, format, args); 
     va_end(args);
     
+    // 拼接最终日志
     char final_msg[2200]; 
     snprintf(final_msg, sizeof(final_msg), "%s%s\r\n", time_buf, buf);
     
+    // 输出到调试器 (DebugView 等工具可见)
     OutputDebugStringA(final_msg);
+    
+    // 输出到 GUI 日志窗口 (异步发送消息，防止界面卡顿)
+    // 需要获取 gui.c 中定义的全局窗口句柄
+    extern HWND hLogViewerWnd; 
+    
     if (hLogViewerWnd && IsWindow(hLogViewerWnd)) {
+        // 转换为宽字符以发送给 Unicode 窗口
         int wLen = MultiByteToWideChar(CP_UTF8, 0, final_msg, -1, NULL, 0);
         wchar_t* wBuf = (wchar_t*)malloc((wLen + 1) * sizeof(wchar_t));
+        
         if (wBuf) {
             MultiByteToWideChar(CP_UTF8, 0, final_msg, -1, wBuf, wLen);
             wBuf[wLen] = 0;
+            // 发送自定义消息更新 UI，接收方负责 free(wBuf)
             PostMessageW(hLogViewerWnd, WM_LOG_UPDATE, 0, (LPARAM)wBuf);
         }
     }
 }
 
-void log_wsa_error(const char* context) {
-    int err = WSAGetLastError();
-    log_msg("[Error] %s Failed. Code: %d", context, err);
-}
+// --------------------------------------------------------------------------
+// 文件 IO 操作
+// --------------------------------------------------------------------------
 
-// --- 文件操作 ---
-BOOL ReadFileToBuffer(const wchar_t* filename, char** buffer, long* fileSize) {
-    // [Fix] 使用 _wfopen 替代 _wfopen_s 以兼容 MinGW
+BOOL ReadFileToBuffer(const wchar_t* filename, char** buffer, long* size) {
     FILE* f = _wfopen(filename, L"rb");
-    if (!f) { *fileSize=0; return FALSE; }
+    if (!f) {
+        return FALSE;
+    }
     
-    fseek(f, 0, SEEK_END); 
-    *fileSize = ftell(f); 
+    // 获取文件大小
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
     fseek(f, 0, SEEK_SET);
     
-    *buffer = (char*)malloc(*fileSize + 1);
-    if (*buffer) {
-        fread(*buffer, 1, *fileSize, f); 
-        (*buffer)[*fileSize] = 0;
+    // 分配内存
+    *buffer = (char*)malloc(fsize + 1);
+    if (!*buffer) { 
+        fclose(f); 
+        return FALSE; 
     }
-    fclose(f); 
-    return (*buffer != NULL);
-}
-
-BOOL WriteBufferToFile(const wchar_t* filename, const char* buffer) {
-    // [Fix] 使用 _wfopen 替代 _wfopen_s 以兼容 MinGW
-    FILE* f = _wfopen(filename, L"wb");
-    if (!f) return FALSE;
     
-    fwrite(buffer, 1, strlen(buffer), f);
-    fclose(f); 
+    // 读取内容
+    fread(*buffer, 1, fsize, f);
+    (*buffer)[fsize] = 0; // 确保字符串结束符
+    
+    if (size) {
+        *size = fsize;
+    }
+    
+    fclose(f);
     return TRUE;
 }
 
-// --- 字符串处理 ---
-void TrimString(char* str) {
-    if(!str) return;
-    char* p = str; while(isspace((unsigned char)*p)) p++;
-    if(p != str) memmove(str, p, strlen(p)+1);
-    size_t len = strlen(str); while(len > 0 && isspace((unsigned char)str[len-1])) str[--len] = 0;
+BOOL WriteBufferToFile(const wchar_t* filename, const char* buffer) {
+    FILE* f = _wfopen(filename, L"wb");
+    if (!f) {
+        return FALSE;
+    }
+    
+    size_t len = strlen(buffer);
+    fwrite(buffer, 1, len, f);
+    
+    fclose(f);
+    return TRUE;
 }
 
+// --------------------------------------------------------------------------
+// 字符串处理工具
+// --------------------------------------------------------------------------
+
+void TrimString(char* str) {
+    if (!str) return;
+    
+    char* p = str;
+    char* pEnd;
+    
+    // 去除头部空白
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
+        p++;
+    }
+    
+    if (p > str) {
+        memmove(str, p, strlen(p) + 1);
+    }
+    
+    // 去除尾部空白
+    pEnd = str + strlen(str) - 1;
+    while (pEnd >= str && (*pEnd == ' ' || *pEnd == '\t' || *pEnd == '\r' || *pEnd == '\n')) {
+        *pEnd-- = 0;
+    }
+}
+
+// URL 解码 (%xx -> char)
 void UrlDecode(char* dst, const char* src) {
     char a, b;
     while (*src) {
-        if ((*src == '%') && ((a = src[1]) && (b = src[2])) && (isxdigit(a) && isxdigit(b))) {
-            if (a >= 'a') a -= 'a' - 'A'; else if (a >= 'A') a -= ('A' - 10); else a -= '0';
-            if (b >= 'a') b -= 'a' - 'A'; else if (b >= 'A') b -= ('A' - 10); else b -= '0';
-            *dst++ = 16 * a + b; src += 3;
-        } else if (*src == '+') { *dst++ = ' '; src++; } else { *dst++ = *src++; }
+        if ((*src == '%') &&
+            ((a = src[1]) && (b = src[2])) &&
+            (isxdigit(a) && isxdigit(b))) {
+            
+            if (a >= 'a') a -= 'a' - 10;
+            else if (a >= 'A') a -= 'A' - 10;
+            else a -= '0';
+            
+            if (b >= 'a') b -= 'a' - 10;
+            else if (b >= 'A') b -= 'A' - 10;
+            else b -= '0';
+            
+            *dst++ = 16 * a + b;
+            src += 3;
+        } else if (*src == '+') {
+            *dst++ = ' ';
+            src++;
+        } else {
+            *dst++ = *src++;
+        }
     }
-    *dst = '\0';
+    *dst++ = '\0';
 }
 
-// [修复] 循环版 GetQueryParam，增加对 '#' 的判断
+// 简单的查询参数获取 (key=value)
 char* GetQueryParam(const char* query, const char* key) {
     if (!query || !key) return NULL;
-    char keyEq[128]; 
-    // [Security Fix] 使用 snprintf
-    snprintf(keyEq, sizeof(keyEq), "%s=", key);
-    size_t keyEqLen = strlen(keyEq);
-
-    const char* p = query;
-    while ((p = strstr(p, keyEq)) != NULL) {
-        // 确保匹配的是参数名，而不是值的后缀 (例如 key=...&real_key=...)
-        if (p == query || *(p - 1) == '&' || *(p - 1) == '?') {
-            const char* start = p + keyEqLen;
-            size_t len = 0;
-            // 读取直到遇到 '&' 或 '#' 或 字符串结束
-            while (start[len] && start[len] != '&' && start[len] != '#') {
-                len++;
-            }
-            if (len == 0) return NULL;
-            
-            char* value = (char*)malloc(len + 1);
-            if (!value) return NULL;
-            strncpy(value, start, len);
-            value[len] = '\0';
-
-            char* decoded = (char*)malloc(len + 1);
-            if (!decoded) { free(value); return NULL; }
-            UrlDecode(decoded, value);
-            free(value);
-            return decoded;
-        }
-        p += 1; 
-    }
-    return NULL;
-}
-
-// --- Base64 和其他辅助函数 ---
-static int GetBase64Val(char c) {
-    if (c >= 'A' && c <= 'Z') return c - 'A';
-    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
-    if (c >= '0' && c <= '9') return c - '0' + 52;
-    if (c == '+' || c == '-') return 62; 
-    if (c == '/' || c == '_') return 63; 
-    return -1;
-}
-
-unsigned char* Base64Decode(const char* src, size_t* out_len) {
-    if (!src) return NULL;
-    size_t len = strlen(src);
-    // 移除末尾的填充和空白
-    while (len > 0 && (src[len-1] == '\n' || src[len-1] == '\r' || src[len-1] == ' ' || src[len-1] == '=')) len--;
-    if (len == 0) { *out_len = 0; return NULL; }
     
-    *out_len = (len * 3) / 4;
-    unsigned char* out = (unsigned char*)malloc(*out_len + 4); 
-    if (!out) return NULL;
+    char search[128];
+    snprintf(search, sizeof(search), "%s=", key);
+    
+    const char* p = strstr(query, search);
+    if (!p) return NULL;
+    
+    // 防止匹配到类似 "abckey=" 的情况，确保是完整单词或开头
+    if (p != query && *(p-1) != '&' && *(p-1) != '?') {
+        return NULL; 
+    }
+    
+    p += strlen(search);
+    const char* end = strchr(p, '&');
+    int len = end ? (int)(end - p) : (int)strlen(p);
+    
+    char* val = (char*)malloc(len + 1);
+    if (!val) return NULL;
+    
+    strncpy(val, p, len);
+    val[len] = 0;
+    
+    return val;
+}
+
+// --------------------------------------------------------------------------
+// Base64 解码实现
+// --------------------------------------------------------------------------
+
+static const int b64_table[] = {
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
+    52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1,
+    -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
+    15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
+    -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
+    41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1
+};
+
+unsigned char* Base64Decode(const char* input, size_t* out_len) {
+    size_t len = strlen(input);
+    
+    // 估算输出大小 (Base64 大约是原数据的 4/3)
+    size_t out_size = len / 4 * 3;
+    unsigned char* out = (unsigned char*)malloc(out_size + 1);
+    
+    if (!out) {
+        return NULL;
+    }
     
     size_t i = 0, j = 0;
     while (i < len) {
-        // 跳过非 Base64 字符 (换行符等)
-        if (src[i] == '\r' || src[i] == '\n' || src[i] == ' ') { i++; continue; }
+        // 跳过换行符
+        if (input[i] == '\r' || input[i] == '\n') { 
+            i++; 
+            continue; 
+        } 
         
-        int vals[4]; 
-        int val_cnt = 0;
-        while (i < len && val_cnt < 4) {
-            char c = src[i];
-            if (c == '\r' || c == '\n' || c == ' ') { i++; continue; }
-            if (c == '=') { i++; break; } // 遇到填充符提前结束
-            int v = GetBase64Val(c);
-            if (v == -1) { 
-                // 遇到非法字符，视为解码失败
-                free(out); return NULL; 
-            }
-            vals[val_cnt++] = v; 
-            i++;
-        }
+        // 结束标志
+        if (input[i] == '=') break; 
         
-        if (val_cnt > 0) {
-            uint32_t triple = (vals[0] << 18) | 
-                              ((val_cnt > 1 ? vals[1] : 0) << 12) | 
-                              ((val_cnt > 2 ? vals[2] : 0) << 6) | 
-                              ((val_cnt > 3 ? vals[3] : 0));
+        unsigned char a = (unsigned char)input[i];
+        unsigned char b = (unsigned char)input[i+1];
+        unsigned char c = (unsigned char)input[i+2];
+        unsigned char d = (unsigned char)input[i+3];
+        
+        // 边界检查与非法字符检查
+        if (i + 1 >= len) break;
+        if (a > 127 || b64_table[a] == -1) break;
+        if (b > 127 || b64_table[b] == -1) break;
+        
+        uint32_t n = (b64_table[a] << 18) | (b64_table[b] << 12);
+        out[j++] = (n >> 16) & 0xFF;
+        
+        if (i + 2 < len && c != '=' && c < 128 && b64_table[c] != -1) {
+            n |= (b64_table[c] << 6);
+            out[j++] = (n >> 8) & 0xFF;
             
-            if (j < *out_len) out[j++] = (triple >> 16) & 0xFF;
-            if (val_cnt > 2 && j < *out_len) out[j++] = (triple >> 8) & 0xFF;
-            if (val_cnt > 3 && j < *out_len) out[j++] = triple & 0xFF;
+            if (i + 3 < len && d != '=' && d < 128 && b64_table[d] != -1) {
+                n |= b64_table[d];
+                out[j++] = n & 0xFF;
+            }
         }
+        i += 4;
     }
-    out[j] = '\0'; 
-    *out_len = j; 
+    
+    out[j] = 0;
+    if (out_len) {
+        *out_len = j;
+    }
     return out;
 }
 
-char* GetClipboardText() {
-    if (!OpenClipboard(NULL)) return NULL;
-    HANDLE hData = GetClipboardData(CF_UNICODETEXT);
-    if (hData != NULL) {
-        wchar_t* pszTextW = (wchar_t*)GlobalLock(hData);
-        if (pszTextW != NULL) {
-            int utf8Len = WideCharToMultiByte(CP_UTF8, 0, pszTextW, -1, NULL, 0, NULL, NULL);
-            char* text = (char*)malloc(utf8Len + 1);
-            if (text) {
-                WideCharToMultiByte(CP_UTF8, 0, pszTextW, -1, text, utf8Len, NULL, NULL);
-                text[utf8Len] = 0;
-                TrimString(text);
-            }
-            GlobalUnlock(hData); CloseClipboard(); return text;
-        }
-    }
-    hData = GetClipboardData(CF_TEXT);
-    if (hData != NULL) {
-        char* pszText = (char*)GlobalLock(hData);
-        if (pszText != NULL) {
-            char* text = strdup(pszText);
-            GlobalUnlock(hData); CloseClipboard(); 
-            if (text) TrimString(text); 
-            return text;
-        }
-    }
-    CloseClipboard(); return NULL;
-}
+// --------------------------------------------------------------------------
+// 网络请求与 HTTPS 实现
+// --------------------------------------------------------------------------
 
-// --- URL 解析结构 ---
 typedef struct {
     char host[256];
-    char path[2048];
     int port;
+    char path[1024];
 } URL_COMPONENTS_SIMPLE;
 
 static BOOL ParseUrl(const char* url, URL_COMPONENTS_SIMPLE* out) {
@@ -236,24 +285,38 @@ static BOOL ParseUrl(const char* url, URL_COMPONENTS_SIMPLE* out) {
     memset(out, 0, sizeof(URL_COMPONENTS_SIMPLE));
     
     const char* p = url;
-    if (strncmp(p, "https://", 8) == 0) { out->port = 443; p += 8; }
-    else if (strncmp(p, "http://", 7) == 0) { out->port = 80; p += 7; }
-    else return FALSE; 
-
+    if (strncmp(p, "http://", 7) == 0) { 
+        p += 7; 
+        out->port = 80; 
+    }
+    else if (strncmp(p, "https://", 8) == 0) { 
+        p += 8; 
+        out->port = 443; 
+    }
+    else {
+        return FALSE; // 暂不支持其他协议
+    }
+    
     const char* slash = strchr(p, '/');
-    int hostLen = (slash) ? (int)(slash - p) : (int)strlen(p);
-    if (hostLen >= sizeof(out->host)) return FALSE;
+    int hostLen = slash ? (int)(slash - p) : (int)strlen(p);
+    
+    if (hostLen >= sizeof(out->host)) {
+        return FALSE;
+    }
+    
     strncpy(out->host, p, hostLen);
-    out->host[hostLen] = '\0';
-
+    out->host[hostLen] = 0;
+    
     char* colon = strchr(out->host, ':');
     if (colon) {
-        *colon = '\0';
+        *colon = 0;
         out->port = atoi(colon + 1);
     }
-
+    
     if (slash) {
-        if (strlen(slash) >= sizeof(out->path)) return FALSE; 
+        if (strlen(slash) >= sizeof(out->path)) {
+            return FALSE;
+        }
         strcpy(out->path, slash);
     } else {
         strcpy(out->path, "/");
@@ -261,255 +324,235 @@ static BOOL ParseUrl(const char* url, URL_COMPONENTS_SIMPLE* out) {
     return TRUE;
 }
 
-static char* InternalHttpsGet(const char* url, BOOL useProxy) {
+// [优化] 内部 HTTPS GET 实现 (使用全局 CTX + SNI)
+// 包含完整的 DNS 解析、Socket 连接、SSL 握手和 HTTP 协议处理
+static char* InternalHttpsGet(const char* url) {
     URL_COMPONENTS_SIMPLE u;
-    if (!ParseUrl(url, &u)) { log_msg("[Utils] Invalid URL or too long: %s", url); return NULL; }
+    if (!ParseUrl(url, &u)) {
+        log_msg("[Utils] Invalid URL format: %s", url);
+        return NULL;
+    }
 
-    static int ssl_inited = 0;
-    if (!ssl_inited) {
-        SSL_library_init();
-        OpenSSL_add_all_algorithms();
-        SSL_load_error_strings();
-        ssl_inited = 1;
+    // [优化点] 惰性初始化全局工具 CTX
+    if (!g_utils_ctx) {
+        g_utils_ctx = SSL_CTX_new(TLS_client_method());
+        if (!g_utils_ctx) {
+             log_msg("[Utils] SSL_CTX init failed");
+             return NULL;
+        }
+        // 订阅下载通常不进行严格的证书校验 (兼容自签名或 CDN)
+        SSL_CTX_set_verify(g_utils_ctx, SSL_VERIFY_NONE, NULL);
     }
 
     SOCKET s = INVALID_SOCKET;
-    SSL_CTX *ctx = NULL;
     SSL *ssl = NULL;
     char* result = NULL;
-
-    const char* targetHost = useProxy ? "127.0.0.1" : u.host;
-    int targetPort = useProxy ? g_localPort : u.port;
-
-    if (useProxy) log_msg("[Utils] Connecting via Proxy: %s:%d", targetHost, targetPort);
-    else log_msg("[Utils] Connecting DIRECT to: %s:%d", targetHost, targetPort);
-
-    // [Refactor] 使用 getaddrinfo 替代 gethostbyname (Step 3)
-    struct addrinfo hints, *res = NULL, *ptr = NULL;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC; 
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_protocol = IPPROTO_TCP;
-
-    char port_str[16];
-    snprintf(port_str, sizeof(port_str), "%d", targetPort);
-
-    if (getaddrinfo(targetHost, port_str, &hints, &res) != 0) {
-        log_msg("[Utils] DNS resolution failed for %s", targetHost);
-        return NULL;
-    }
-
-    // 遍历连接
-    for (ptr = res; ptr != NULL; ptr = ptr->ai_next) {
-        s = socket(ptr->ai_family, ptr->ai_socktype, ptr->ai_protocol);
-        if (s == INVALID_SOCKET) continue;
-
-        DWORD timeout = 10000; 
-        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
-        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (char*)&timeout, sizeof(timeout));
-
-        if (connect(s, ptr->ai_addr, (int)ptr->ai_addrlen) == 0) {
-            break; // 连接成功
-        }
-        closesocket(s);
-        s = INVALID_SOCKET;
-    }
-
-    if (res) freeaddrinfo(res);
-
-    if (s == INVALID_SOCKET) {
-        log_wsa_error("Socket Connect");
-        return NULL;
-    }
-
-    if (useProxy) {
-        char connectReq[512];
-        // [Safety] snprintf
-        snprintf(connectReq, sizeof(connectReq), 
-            "CONNECT %s:%d HTTP/1.1\r\n"
-            "Host: %s:%d\r\n"
-            "\r\n", 
-            u.host, u.port, u.host, u.port);
-        
-        send(s, connectReq, (int)strlen(connectReq), 0);
-
-        char buf[1024];
-        int n = recv(s, buf, sizeof(buf)-1, 0);
-        if (n <= 0) { log_msg("[Utils] Proxy handshake failed (recv)"); closesocket(s); return NULL; }
-        buf[n] = 0;
-        if (!strstr(buf, "200 Connection Established")) {
-            log_msg("[Utils] Proxy handshake failed. Response: %s", buf);
-            closesocket(s);
-            return NULL;
-        }
-    }
-
-    ctx = SSL_CTX_new(TLS_client_method());
-    if (!ctx) { closesocket(s); return NULL; }
+    struct addrinfo hints, *res = NULL;
     
-    // [Note] 下载订阅时暂不验证证书，防止自签证书订阅失败
-    SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC; // 支持 IPv4/IPv6
+    hints.ai_socktype = SOCK_STREAM;
+    
+    char portStr[16]; 
+    snprintf(portStr, 16, "%d", u.port);
+    
+    // 1. DNS 解析
+    if (getaddrinfo(u.host, portStr, &hints, &res) != 0) {
+        log_msg("[Utils] DNS resolution failed: %s", u.host);
+        return NULL;
+    }
+    
+    // 2. 创建 Socket
+    s = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (s == INVALID_SOCKET) {
+        freeaddrinfo(res);
+        log_msg("[Utils] Socket creation failed");
+        return NULL;
+    }
+    
+    // 设置超时 (5秒)，防止网络卡死
+    DWORD timeout = 5000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
 
-    ssl = SSL_new(ctx);
+    // 3. 建立 TCP 连接
+    if (connect(s, res->ai_addr, (int)res->ai_addrlen) != 0) {
+        log_msg("[Utils] Connection failed: %s", u.host);
+        closesocket(s);
+        freeaddrinfo(res);
+        return NULL;
+    }
+    freeaddrinfo(res);
+
+    // 4. 初始化 SSL 对象
+    ssl = SSL_new(g_utils_ctx);
+    if (!ssl) { 
+        closesocket(s); 
+        return NULL; 
+    }
+    
     SSL_set_fd(ssl, (int)s);
-
+    
+    // [关键修复] 设置 SNI (Server Name Indication)
+    // 这是访问 Cloudflare 等 CDN 后端服务的必要条件
     SSL_set_tlsext_host_name(ssl, u.host);
 
+    // 5. 执行 SSL 握手
     if (SSL_connect(ssl) != 1) {
-        log_msg("[Utils] SSL Handshake Failed.");
+        log_msg("[Utils] SSL Handshake failed: %s", u.host);
         goto cleanup;
     }
 
-    char request[4096];
-    // [Safety] snprintf
-    snprintf(request, sizeof(request),
+    // 6. 发送 HTTP GET 请求
+    char req[2048];
+    snprintf(req, sizeof(req), 
         "GET %s HTTP/1.1\r\n"
         "Host: %s\r\n"
-        "User-Agent: Mandala/1.0\r\n"
-        "Connection: close\r\n"
-        "\r\n",
+        "User-Agent: Mandala-Client/1.0\r\n"
+        "Connection: close\r\n\r\n", 
         u.path, u.host);
-    
-    if (SSL_write(ssl, request, (int)strlen(request)) <= 0) goto cleanup;
+        
+    if (SSL_write(ssl, req, strlen(req)) <= 0) {
+        log_msg("[Utils] Failed to send request");
+        goto cleanup;
+    }
 
-    int buffer_size = 65536; 
-    int total_read = 0;
-    char* resp_buf = (char*)malloc(buffer_size);
-    if(!resp_buf) goto cleanup;
+    // 7. 读取响应数据
+    int total_cap = 65536; // 初始分配 64KB
+    int total_len = 0;
+    char* buf = (char*)malloc(total_cap);
+    
+    if (!buf) {
+        goto cleanup;
+    }
 
     while (1) {
-        if (total_read + 4096 >= buffer_size) {
-            buffer_size *= 2;
-            char* new_buf = (char*)realloc(resp_buf, buffer_size);
-            if (!new_buf) { free(resp_buf); resp_buf=NULL; goto cleanup; }
-            resp_buf = new_buf;
+        // 检查缓冲区是否需要扩容
+        if (total_len >= total_cap - 1024) {
+            total_cap *= 2;
+            char* new_buf = (char*)realloc(buf, total_cap);
+            if (!new_buf) { 
+                free(buf); 
+                buf = NULL; 
+                goto cleanup; 
+            }
+            buf = new_buf;
         }
-        int r = SSL_read(ssl, resp_buf + total_read, 4096);
-        if (r <= 0) break; 
-        total_read += r;
-    }
-    resp_buf[total_read] = 0;
-
-    char* body_start = strstr(resp_buf, "\r\n\r\n");
-    if (!body_start) {
-        body_start = strstr(resp_buf, "\n\n");
-    }
-
-    if (body_start) {
-        if (body_start[0] == '\r') body_start += 4;
-        else body_start += 2;
-
-        int header_len = (int)(body_start - resp_buf);
-        int body_len = total_read - header_len;
         
-        if (body_len > 0) {
-            result = (char*)malloc(body_len + 1);
-            memcpy(result, body_start, body_len);
-            result[body_len] = 0;
+        int n = SSL_read(ssl, buf + total_len, total_cap - total_len - 1);
+        if (n <= 0) {
+            break; // 读取完毕或出错
         }
-    } else {
-        log_msg("[Utils] Invalid HTTP response format");
+        total_len += n;
+    }
+    
+    if (buf) {
+        buf[total_len] = 0; // 确保以 Null 结尾
     }
 
-    free(resp_buf); 
+    // 8. 解析 HTTP Body (跳过 Header)
+    char* body = strstr(buf, "\r\n\r\n");
+    if (body) {
+        body += 4;
+        result = strdup(body);
+        free(buf);
+    } else {
+        // 如果没找到头分隔符，可能只有 body 或者数据异常，这里选择返回全部数据
+        result = buf; 
+    }
 
 cleanup:
-    if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); }
-    if (ctx) SSL_CTX_free(ctx);
-    if (s != INVALID_SOCKET) closesocket(s);
+    // 清理资源
+    if (ssl) { 
+        SSL_shutdown(ssl); 
+        SSL_free(ssl); 
+    }
+    if (s != INVALID_SOCKET) {
+        closesocket(s);
+    }
+    // [注意] g_utils_ctx 不释放，留给下次复用
+    
     return result;
 }
 
 char* Utils_HttpGet(const char* url) {
-    if (!url) return NULL;
-    
-    if (g_localPort > 0) {
-        char* res = InternalHttpsGet(url, TRUE);
-        if (res) return res;
-        log_msg("[Utils] Proxy download failed, falling back to DIRECT mode...");
+    if (!url || strncmp(url, "http", 4) != 0) {
+        return NULL;
     }
-    return InternalHttpsGet(url, FALSE);
+    return InternalHttpsGet(url);
 }
 
-// ... (Proxy settings) ...
-BOOL IsWindows8OrGreater() {
-    HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
-    if (hKernel32 == NULL) return FALSE;
-    FARPROC pFunc = GetProcAddress(hKernel32, "SetProcessMitigationPolicy");
-    return (pFunc != NULL);
+// --------------------------------------------------------------------------
+// 剪贴板操作
+// --------------------------------------------------------------------------
+
+char* GetClipboardText() {
+    if (!OpenClipboard(NULL)) {
+        return NULL;
+    }
+    
+    HANDLE hData = GetClipboardData(CF_TEXT);
+    if (!hData) { 
+        CloseClipboard(); 
+        return NULL; 
+    }
+    
+    char* pszText = (char*)GlobalLock(hData);
+    if (!pszText) { 
+        CloseClipboard(); 
+        return NULL; 
+    }
+    
+    char* text = strdup(pszText);
+    
+    GlobalUnlock(hData);
+    CloseClipboard();
+    
+    return text;
 }
+
+// --------------------------------------------------------------------------
+// 系统代理设置 (注册表操作)
+// --------------------------------------------------------------------------
 
 void SetSystemProxy(BOOL enable) {
-    if (enable && g_localPort <= 0) return;
-    wchar_t proxyServerString[256] = {0};
-    wchar_t proxyBypassString[64] = {0};
-    if (enable) {
-        // [Fix] 使用 _snwprintf 替代 wsprintfW
-        _snwprintf(proxyServerString, 256, L"127.0.0.1:%d", g_localPort);
-        wcsncpy(proxyBypassString, L"<local>", 63);
-    }
-    if (IsWindows8OrGreater()) {
-        HKEY hKey;
-        if (RegCreateKeyExW(HKEY_CURRENT_USER, REG_PATH_PROXY, 0, NULL, REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
-            if (enable) {
-                DWORD dwEnable = 1;
-                RegSetValueExW(hKey, L"ProxyEnable", 0, REG_DWORD, (const BYTE*)&dwEnable, sizeof(dwEnable));
-                RegSetValueExW(hKey, L"ProxyOverride", 0, REG_SZ, (const BYTE*)proxyBypassString, (wcslen(proxyBypassString) + 1) * sizeof(wchar_t));
-                RegSetValueExW(hKey, L"ProxyServer", 0, REG_SZ, (const BYTE*)proxyServerString, (wcslen(proxyServerString) + 1) * sizeof(wchar_t));
-                RegDeleteValueW(hKey, L"SocksProxyServer"); 
-                RegDeleteValueW(hKey, L"AutoConfigURL"); 
-            } else {
-                DWORD dwEnable = 0;
-                RegSetValueExW(hKey, L"ProxyEnable", 0, REG_DWORD, (const BYTE*)&dwEnable, sizeof(dwEnable));
-                RegSetValueExW(hKey, L"ProxyServer", 0, REG_SZ, (const BYTE*)L"", sizeof(wchar_t));
-                RegDeleteValueW(hKey, L"SocksProxyServer");
-            }
-            RegCloseKey(hKey);
-        }
-    } else {
-        INTERNET_PER_CONN_OPTION_LISTW list;
-        INTERNET_PER_CONN_OPTIONW options[3];
-        DWORD dwBufSize = sizeof(list);
-        options[0].dwOption = INTERNET_PER_CONN_FLAGS;
-        options[1].dwOption = INTERNET_PER_CONN_PROXY_SERVER;
-        options[2].dwOption = INTERNET_PER_CONN_PROXY_BYPASS;
+    HKEY hKey;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings", 
+        0, KEY_WRITE, &hKey) == ERROR_SUCCESS) {
+        
+        DWORD dwEnable = enable ? 1 : 0;
+        RegSetValueExW(hKey, L"ProxyEnable", 0, REG_DWORD, (BYTE*)&dwEnable, sizeof(DWORD));
+        
         if (enable) {
-            options[0].Value.dwValue = PROXY_TYPE_PROXY;
-            options[1].Value.pszValue = proxyServerString;
-            options[2].Value.pszValue = proxyBypassString;
-        } else {
-            options[0].Value.dwValue = PROXY_TYPE_DIRECT;
-            options[1].Value.pszValue = L"";
-            options[2].Value.pszValue = L"";
+            // 从 common.h 或 globals.c 获取 g_localPort
+            extern int g_localPort; 
+            wchar_t server[64];
+            swprintf_s(server, 64, L"127.0.0.1:%d", g_localPort);
+            RegSetValueExW(hKey, L"ProxyServer", 0, REG_SZ, (BYTE*)server, (wcslen(server)+1)*sizeof(wchar_t));
         }
-        list.dwSize = sizeof(list);
-        list.pszConnection = NULL;
-        list.dwOptionCount = 3;
-        list.dwOptionError = 0;
-        list.pOptions = options;
-        InternetSetOptionW(NULL, INTERNET_OPTION_PER_CONNECTION_OPTION, &list, dwBufSize);
+        
+        RegCloseKey(hKey);
+        
+        // 通知系统设置已更改，使其立即生效
+        InternetSetOption(NULL, INTERNET_OPTION_SETTINGS_CHANGED, NULL, 0);
+        InternetSetOption(NULL, INTERNET_OPTION_REFRESH, NULL, 0);
     }
-    InternetSetOptionW(NULL, INTERNET_OPTION_SETTINGS_CHANGED, NULL, 0);
-    InternetSetOptionW(NULL, INTERNET_OPTION_REFRESH, NULL, 0);
 }
 
 BOOL IsSystemProxyEnabled() {
+    BOOL enabled = FALSE;
     HKEY hKey;
-    DWORD dwEnable = 0;
-    DWORD dwSize = sizeof(dwEnable);
-    wchar_t proxyServer[1024] = {0};
-    DWORD dwProxySize = sizeof(proxyServer);
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_PATH_PROXY, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-        if (RegQueryValueExW(hKey, L"ProxyEnable", NULL, NULL, (LPBYTE)&dwEnable, &dwSize) == ERROR_SUCCESS) {
-            if (dwEnable == 1) {
-                if (RegQueryValueExW(hKey, L"ProxyServer", NULL, NULL, (LPBYTE)proxyServer, &dwProxySize) == ERROR_SUCCESS) {
-                    wchar_t expectedPart[64];
-                    _snwprintf(expectedPart, 64, L"127.0.0.1:%d", g_localPort);
-                    if (wcsstr(proxyServer, expectedPart) != NULL) return TRUE;
-                }
-            }
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings", 
+        0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        
+        DWORD dwValue = 0;
+        DWORD dwSize = sizeof(DWORD);
+        
+        if (RegQueryValueExW(hKey, L"ProxyEnable", NULL, NULL, (BYTE*)&dwValue, &dwSize) == ERROR_SUCCESS) {
+            enabled = (dwValue == 1);
         }
+        
         RegCloseKey(hKey);
     }
-    return FALSE;
+    return enabled;
 }
