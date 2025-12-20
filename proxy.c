@@ -84,17 +84,11 @@ DWORD WINAPI client_handler(LPVOID p) {
     ProxyConfig localConfig = ctx->config; 
     free(ctx); 
 
-    // [ECH Logic Update] 参考 ech-workers.go
-    // ECH 的核心逻辑是：
-    // 1. 获取 Outer SNI (如 cloudflare-ech.com) 的 ECH 配置
-    // 2. 使用该配置加密 ClientHello
-    // 3. ClientHello 的 Inner SNI 是真实的 Worker 域名
+    // [ECH Logic Update]
     if (strlen(localConfig.outer_sni) > 0) {
-        
         // 如果没有配置静态 ECH，尝试从 DoH 获取
         if (strlen(localConfig.ech) == 0) {
-            // [Critical Fix] 必须查询 Outer SNI 的 keys
-            // Cloudflare Worker 通常共用 cloudflare-ech.com 的密钥
+            // 查询 Outer SNI (Provider) 的密钥
             const char* ech_provider = localConfig.outer_sni;
             
             log_msg("[ECH] Fetching keys for provider: %s", ech_provider);
@@ -108,6 +102,9 @@ DWORD WINAPI client_handler(LPVOID p) {
                 log_msg("[ECH] Failed to fetch ECH for %s. Connection may fail.", ech_provider);
             }
         }
+        // [IMPORTANT] 我们删除了覆盖 localConfig.sni 的代码。
+        // OpenSSL 会自动使用 ECH 配置中的 Public Name (Outer SNI)。
+        // 保持 localConfig.sni 为真实的 Worker 域名 (Inner SNI) 是正确的做法。
     }
 
     TLSContext tls; 
@@ -209,8 +206,7 @@ DWORD WINAPI client_handler(LPVOID p) {
     }
     
     // 连接到代理服务器
-    // [Connection Strategy] 
-    // 优先连接 Outer SNI (Public IP)，例如 Cloudflare 的 IP
+    // [Connection Strategy] 优先解析 Outer SNI IP
     const char* connect_host = localConfig.host;
     if (strlen(localConfig.outer_sni) > 0) {
         connect_host = localConfig.outer_sni;
@@ -236,9 +232,7 @@ DWORD WINAPI client_handler(LPVOID p) {
         
         if (connect(r, (struct sockaddr*)&a, sizeof(a)) == 0) {
             tls.sock = r;
-            // [ECH] 
-            // Inner SNI = localConfig.sni (例如 worker 域名)
-            // Outer SNI = 自动从 ECH Config (来自 localConfig.ech) 提取
+            // [ECH] 传递 Inner SNI (Worker 域名)，OpenSSL 负责处理 Outer SNI
             if (tls_init_connect(&tls, localConfig.sni, localConfig.host, localConfig.ech) == 0) break;
             else tls_close(&tls);
         }
