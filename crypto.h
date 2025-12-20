@@ -1,36 +1,32 @@
-#ifndef CRYPTO_H
-#define CRYPTO_H
+#ifndef UTILS_H
+#define UTILS_H
 
-#include "common.h"
-#include <openssl/ssl.h>
-#include <openssl/bio.h>
+#include <windows.h>
 
-// 定义 TLS 上下文结构体
-typedef struct {
-    SOCKET sock;
-    SSL *ssl;
-} TLSContext;
+// 日志
+#define WM_LOG_UPDATE (WM_USER + 1)
+void log_msg(const char *format, ...);
+void log_wsa_error(const char* context);
 
-// --- BIO 分片过滤器 ---
-BIO_METHOD *BIO_f_fragment(void);
+// 网络与 HTTP
+char* Utils_HttpGet(const char* url);
+char* Utils_HttpBytesGet(const char* url, int* out_len);
+char* FetchECHFromDoH(const char* dohUrl, const char* sni);
 
-// --- OpenSSL 全局初始化与销毁 ---
-void init_openssl_global();
-void FreeGlobalSSLContext();
+// 编码解码
+unsigned char* Base64Decode(const char* src, size_t* out_len);
+void Base64Encode(const unsigned char* src, int len, char* dst);
+void Base64UrlEncode(const unsigned char* src, int len, char* dst);
 
-// --- TLS 连接函数 (增加 ECH 参数) ---
-// target_sni, target_host, ech_config_b64
-int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target_host, const char* ech_config_b64);
+// 其他工具
+BOOL ReadFileToBuffer(const wchar_t* filename, char** buffer, long* fileSize);
+BOOL WriteBufferToFile(const wchar_t* filename, const char* buffer);
+char* GetClipboardText();
+void TrimString(char* str);
+char* GetQueryParam(const char* query, const char* key);
 
-// --- TLS 读写函数 ---
-int tls_write(TLSContext *ctx, const char *data, int len);
-int tls_read(TLSContext *ctx, char *out, int max);
-int tls_read_exact(TLSContext *ctx, char *buf, int len);
-void tls_close(TLSContext *ctx);
+// 系统代理
+void SetSystemProxy(BOOL enable);
+BOOL IsSystemProxyEnabled();
 
-// --- WebSocket 辅助函数 ---
-int build_ws_frame(const char *in, int len, char *out);
-long long check_ws_frame(unsigned char *in, int len, int *head_len, int *payload_len);
-int ws_read_payload_exact(TLSContext *tls, char *out_buf, int expected_len);
-
-#endif // CRYPTO_H
+#endif // UTILS_H
