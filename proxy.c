@@ -1,6 +1,6 @@
 #include "proxy.h"
 #include "crypto.h"
-#include "utils.h"
+#include "utils.h" // [新增] 包含此头文件以引用 FetchECHFromDoH
 #include <ws2tcpip.h>
 #include <openssl/sha.h>
 
@@ -10,9 +10,9 @@ typedef struct {
     ProxyConfig config; // 完整的配置副本，避免读取全局变量导致的竞争条件
 } ClientContext;
 
-// 声明外部 ECH 获取函数 (utils.c)
-extern char* FetchECHFromDoH(const char* dohUrl, const char* sni);
-// 声明外部 DoH 地址 (config.c)
+// [删除] 不需要手动声明 extern，已在 utils.h 中声明
+// extern char* FetchECHFromDoH(const char* dohUrl, const char* sni);
+
 extern char g_dohUrl[512];
 
 // --- 辅助函数：解析 UUID (支持带横杠或不带) ---
@@ -110,9 +110,10 @@ DWORD WINAPI client_handler(LPVOID p) {
             }
         }
         
-        // 2. 将 Outer SNI 设为本次 TLS 连接的握手 SNI (明文部分)
-        // 真实的 SNI (host) 将被封装在 ECH 内部
-        snprintf(localConfig.sni, sizeof(localConfig.sni), "%s", localConfig.outer_sni);
+        // [Fix] 不要覆盖 localConfig.sni！
+        // localConfig.sni 必须保持为 Inner SNI (真实目标域名)，以便被 ECH 加密。
+        // Outer SNI (Public Name) 会自动从 ECH 配置中提取。
+        // 删除此行: snprintf(localConfig.sni, sizeof(localConfig.sni), "%s", localConfig.outer_sni);
     }
 
     TLSContext tls; 
@@ -214,10 +215,9 @@ DWORD WINAPI client_handler(LPVOID p) {
     }
     
     // 连接到代理服务器
-    // 注意：如果使用了 ECH，host 字段可能是真实目标域名，DNS 解析应该解析它
-    // 或者，为了防止 DNS 泄漏，应该解析 Outer SNI 对应的 IP
-    // 这里简单起见，我们解析配置文件中的 host (真实目标)
-    // 更好的做法：如果 ECH 开启，解析 Outer SNI (config.sni) 的 IP
+    // [ECH DNS Logic]
+    // 理想情况下应该解析 Outer SNI 对应的 IP，以避免通过 IP 泄露真实目标。
+    // 如果配置了 Outer SNI，优先解析 Outer SNI。
     const char* connect_host = localConfig.host;
     if (strlen(localConfig.outer_sni) > 0) {
         connect_host = localConfig.outer_sni;
@@ -225,7 +225,7 @@ DWORD WINAPI client_handler(LPVOID p) {
     
     h = gethostbyname(connect_host);
     if(!h) { 
-        // Fallback: try original host if outer sni failed
+        // Fallback: 如果 Outer SNI 解析失败，尝试解析 Host
         h = gethostbyname(localConfig.host);
         if (!h) { log_msg("[Err] DNS Fail: %s", connect_host); goto cl_end; }
     }
@@ -244,7 +244,7 @@ DWORD WINAPI client_handler(LPVOID p) {
         
         if (connect(r, (struct sockaddr*)&a, sizeof(a)) == 0) {
             tls.sock = r;
-            // [ECH Refactor] 传递本地配置的 SNI (可能是 Outer SNI), Host (Inner SNI) 和 ECH 配置
+            // [ECH] 传递 localConfig.sni (必须是 Inner SNI)
             if (tls_init_connect(&tls, localConfig.sni, localConfig.host, localConfig.ech) == 0) break;
             else tls_close(&tls);
         }
@@ -572,4 +572,3 @@ void StopProxyCore() {
     if (hProxyThread) { WaitForSingleObject(hProxyThread, 2000); CloseHandle(hProxyThread); hProxyThread = NULL; }
     log_msg("Proxy Stopped");
 }
-
