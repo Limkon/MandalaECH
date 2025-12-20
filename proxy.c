@@ -58,10 +58,10 @@ int send_all(SOCKET s, const char *buf, int len) {
                 fd_set wfd; 
                 FD_ZERO(&wfd); 
                 FD_SET(s, &wfd);
-                struct timeval tv = { 1, 0 }; // 1秒超时，防止死锁
+                struct timeval tv = { 1, 0 }; // 1秒超时
                 int res = select(0, NULL, &wfd, NULL, &tv);
                 if (res > 0) continue; // Socket 可写，重试发送
-                if (res == 0) continue; // 超时，继续重试或根据需要处理
+                if (res == 0) continue; // 超时，继续重试
                 return -1; // select 错误
             }
             return -1;
@@ -129,8 +129,10 @@ DWORD WINAPI client_handler(LPVOID p) {
     char *header_end = NULL;
     int header_len = 0;
 
-    struct hostent *h;
-    struct sockaddr_in a;
+    // [Refactor] 使用 addrinfo 替代 hostent
+    struct addrinfo hints, *res = NULL, *ptr = NULL;
+    char port_str[16];
+
     const char* sni_val;
     const char* req_path;
     int offset;
@@ -159,7 +161,7 @@ DWORD WINAPI client_handler(LPVOID p) {
     // 初始化
     memset(&tls, 0, sizeof(tls));
     
-    // [Refactor] 使用小缓冲区初始化，避免内存爆炸
+    // [Refactor] 使用小缓冲区初始化
     c_buf = (char*)malloc(IO_BUFFER_SIZE); 
     ws_read_buf = (char*)malloc(ws_read_buf_cap); 
     ws_send_buf = (char*)malloc(IO_BUFFER_SIZE + 4096); 
@@ -167,7 +169,7 @@ DWORD WINAPI client_handler(LPVOID p) {
     if (!c_buf || !ws_read_buf || !ws_send_buf) goto cl_end; 
     setsockopt(c, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
     
-    // 1. 读取浏览器首包 (使用 IO_BUFFER_SIZE)
+    // 1. 读取浏览器首包
     browser_len = recv_timeout(c, c_buf, IO_BUFFER_SIZE, 10);
     if (browser_len <= 0) goto cl_end; 
     c_buf[browser_len] = 0;
@@ -212,30 +214,61 @@ DWORD WINAPI client_handler(LPVOID p) {
         } else { goto cl_end; }
     }
     
-    // [Refactor] 使用 localConfig 代替 g_proxyConfig
-    h = gethostbyname(localConfig.host);
-    if(!h) { log_msg("[Err] DNS Fail: %s", localConfig.host); goto cl_end; }
+    // [Refactor] 使用 getaddrinfo 实现 DNS 解析 (Step 3)
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC; // 支持 IPv4 和 IPv6
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
 
+    snprintf(port_str, sizeof(port_str), "%d", localConfig.port);
+
+    if (getaddrinfo(localConfig.host, port_str, &hints, &res) != 0) {
+        log_msg("[Err] DNS Fail: %s", localConfig.host);
+        goto cl_end;
+    }
+
+    // 连接重试循环
     for (retry_count = 0; retry_count < 3; retry_count++) {
-        r = socket(AF_INET, SOCK_STREAM, 0);
-        if (r == INVALID_SOCKET) goto cl_end;
-        
-        setsockopt(r, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
-        int timeout_ms = 5000;
-        setsockopt(r, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout_ms, sizeof(int));
-        setsockopt(r, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout_ms, sizeof(int));
+        // 遍历 DNS 返回的所有地址 (Happy Eyeballs 简化版)
+        for (ptr = res; ptr != NULL; ptr = ptr->ai_next) {
+            r = socket(ptr->ai_family, ptr->ai_socktype, ptr->ai_protocol);
+            if (r == INVALID_SOCKET) continue;
 
-        memset(&a, 0, sizeof(a)); a.sin_family = AF_INET; a.sin_port = htons((unsigned short)localConfig.port);
-        a.sin_addr = *(struct in_addr*)h->h_addr;
-        
-        if (connect(r, (struct sockaddr*)&a, sizeof(a)) == 0) {
-            tls.sock = r;
-            // [Security] 传递本地配置的 SNI 和 Host
-            if (tls_init_connect(&tls, localConfig.sni, localConfig.host) == 0) break;
-            else tls_close(&tls);
+            setsockopt(r, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
+            int timeout_ms = 5000;
+            setsockopt(r, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout_ms, sizeof(int));
+            setsockopt(r, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout_ms, sizeof(int));
+
+            // 尝试连接
+            if (connect(r, ptr->ai_addr, (int)ptr->ai_addrlen) == 0) {
+                tls.sock = r;
+                // [Security] 传递本地配置的 SNI 和 Host
+                if (tls_init_connect(&tls, localConfig.sni, localConfig.host) == 0) {
+                    // 连接成功且 SSL 握手成功
+                    break;
+                } else {
+                    // SSL 握手失败
+                    tls_close(&tls);
+                    closesocket(r);
+                    r = INVALID_SOCKET;
+                }
+            } else {
+                // TCP 连接失败
+                closesocket(r);
+                r = INVALID_SOCKET;
+            }
         }
-        closesocket(r); r = INVALID_SOCKET;
-        Sleep(200);
+        
+        // 如果成功建立连接，跳出重试循环
+        if (r != INVALID_SOCKET && tls.ssl != NULL) break;
+        
+        Sleep(200); // 重试间隔
+    }
+    
+    // 释放地址信息结构
+    if (res) {
+        freeaddrinfo(res);
+        res = NULL;
     }
 
     if (r == INVALID_SOCKET || tls.ssl == NULL) goto cl_end;
@@ -521,7 +554,7 @@ DWORD WINAPI client_handler(LPVOID p) {
                 }
                 ws_buf_len -= (int)frame_total;
             } else { 
-                // [Refactor] 如果缓冲区已满但仍未解析出完整帧（说明帧大小 > 当前容量）
+                // [Refactor] 如果缓冲区已满但仍未解析出完整帧
                 if (ws_buf_len >= ws_read_buf_cap) {
                      if (ws_read_buf_cap >= MAX_WS_FRAME_SIZE) goto cl_end;
                 }
@@ -531,6 +564,7 @@ DWORD WINAPI client_handler(LPVOID p) {
     }
 
 cl_end:
+    if (res) freeaddrinfo(res); // 确保在异常退出时释放资源
     if (c_buf) free(c_buf); 
     if (ws_read_buf) free(ws_read_buf); 
     if (ws_send_buf) free(ws_send_buf); 
