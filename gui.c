@@ -774,10 +774,18 @@ void OpenLogViewer(BOOL bShow) {
         if (bShow) { ShowWindow(hLogViewerWnd, SW_SHOW); if (IsIconic(hLogViewerWnd)) ShowWindow(hLogViewerWnd, SW_RESTORE); SetForegroundWindow(hLogViewerWnd); }
         return;
     }
+    
+    // [Fix] 明确指定背景画刷为 COLOR_BTNFACE+1 (标准灰色背景)
+    // 防止背景未绘制导致的黑色或透明视觉残留，以及解决与复选框控件背景色的差异
     WNDCLASSW wc = {0}; 
     if (!GetClassInfoW(GetModuleHandle(NULL), L"LogWnd", &wc)) {
-        wc.lpfnWndProc = LogWndProc; wc.hInstance = GetModuleHandle(NULL); wc.lpszClassName = L"LogWnd"; RegisterClassW(&wc);
+        wc.lpfnWndProc = LogWndProc; 
+        wc.hInstance = GetModuleHandle(NULL); 
+        wc.lpszClassName = L"LogWnd"; 
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1); // 修复：设置背景色
+        RegisterClassW(&wc);
     }
+    
     hLogViewerWnd = CreateWindowW(L"LogWnd", L"运行日志", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,0,600,400, NULL,NULL,GetModuleHandle(NULL),NULL);
     if (bShow) ShowWindow(hLogViewerWnd, SW_SHOW); else ShowWindow(hLogViewerWnd, SW_HIDE);
 }
