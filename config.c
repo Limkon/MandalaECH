@@ -459,9 +459,6 @@ int Internal_BatchAddNodesFromText(const char* text, cJSON* outbounds) {
     }
     
     // 如果 sourceText 是我们 duplicated 的，需要释放
-    // 如果 sourceText 指向 decoded，也需要释放 decoded
-    // 为简化，直接释放 sourceText (如果它指向 malloc 的内存)
-    // 注意：如果是 decoded，sourceText = decoded，free(sourceText) 等同于 free(decoded)
     free(sourceText); 
     
     return count;
@@ -567,7 +564,18 @@ cJSON* ParseSocks(const char* link) {
     char* tag = hash ? (char*)malloc(strlen(hash+1)+1) : strdup("Socks-Import"); if(hash) UrlDecode(tag, hash+1);
     const char* query = qMark ? qMark + 1 : NULL;
     char* sni = GetQueryParam(query, "sni"); if (!sni) sni = GetQueryParam(query, "peer");
-    char* path = GetQueryParam(query, "path"); char* type = GetQueryParam(query, "type"); if (!type) type = GetQueryParam(query, "transport");
+    
+    // [Fix] UrlDecode path (防止 %2F 导致 WS 400)
+    char* path = GetQueryParam(query, "path");
+    if (path) {
+        char* decodedPath = strdup(path);
+        if (decodedPath) {
+             UrlDecode(decodedPath, path);
+             free(path); path = decodedPath;
+        }
+    }
+    
+    char* type = GetQueryParam(query, "type"); if (!type) type = GetQueryParam(query, "transport");
     char* security = GetQueryParam(query, "security"); char* hostHeader = GetQueryParam(query, "host");
     cJSON* outbound = cJSON_CreateObject();
     cJSON_AddStringToObject(outbound, "type", "socks_tls"); cJSON_AddStringToObject(outbound, "tag", tag);
@@ -736,8 +744,19 @@ cJSON* ParseVlessOrTrojan(const char* link) {
     char* type = GetQueryParam(query, "type");
     if (type && strcmp(type, "ws") == 0) {
         cJSON* t = cJSON_CreateObject(); cJSON_AddStringToObject(t, "type", "ws");
+        
+        // [Fix] UrlDecode path
         char* path = GetQueryParam(query, "path");
-        if (path) { cJSON_AddStringToObject(t, "path", path); free(path); }
+        if (path) { 
+            char* decodedPath = strdup(path); 
+            if(decodedPath) {
+                UrlDecode(decodedPath, path);
+                cJSON_AddStringToObject(t, "path", decodedPath);
+                free(decodedPath);
+            }
+            free(path); 
+        }
+        
         char* hHeader = GetQueryParam(query, "host");
         if (hHeader) {
             cJSON* headers = cJSON_CreateObject(); cJSON_AddStringToObject(headers, "Host", hHeader);
@@ -815,8 +834,17 @@ cJSON* ParseMandala(const char* link) {
         cJSON* t = cJSON_CreateObject(); 
         cJSON_AddStringToObject(t, "type", "ws");
         
+        // [Fix] UrlDecode path (防止 %2F 导致 400 错误)
         char* path = GetQueryParam(query, "path");
-        if (path) { cJSON_AddStringToObject(t, "path", path); free(path); }
+        if (path) { 
+            char* decodedPath = strdup(path); 
+            if (decodedPath) {
+                UrlDecode(decodedPath, path);
+                cJSON_AddStringToObject(t, "path", decodedPath); 
+                free(decodedPath);
+            }
+            free(path); 
+        }
         
         char* hHeader = GetQueryParam(query, "host");
         if (hHeader) {
@@ -846,4 +874,3 @@ cJSON* ParseMandala(const char* link) {
     free(uuid); free(host); free(tag); 
     return outbound;
 }
-
