@@ -1,10 +1,8 @@
 #include "gui.h"
 #include "config.h"
 #include "proxy.h"
-#include <time.h>
 #include "utils.h"
 #include "crypto.h"
-#include "resource.h"
 #include <commctrl.h>
 #include <stdio.h>
 #include <wchar.h> // for swprintf_s
@@ -23,10 +21,6 @@ static HWND hSubWnd = NULL;
 #define ID_SUB_UPD_BTN  3003
 #define ID_SUB_URL_EDIT 3004
 #define ID_SUB_SAVE_BTN 3005
-
-// [ECH] 新增控件 ID
-#define ID_EDIT_DOH_URL 1050
-#define ID_EDIT_ECH_SNI 2050
 
 // 定义更新完成消息
 #define WM_UPDATE_FINISH (WM_USER + 200)
@@ -98,7 +92,6 @@ void LoadNodeToEdit(HWND hWnd, const wchar_t* tag) {
         if(user) SetDlgItemTextA(hWnd, ID_EDIT_USER, user->valuestring);
         cJSON* pass = cJSON_GetObjectItem(target, "password");
         if(pass) SetDlgItemTextA(hWnd, ID_EDIT_PASS, pass->valuestring);
-        
         cJSON* trans = cJSON_GetObjectItem(target, "transport"); 
         if (!trans) trans = cJSON_GetObjectItem(target, "streamSettings");
         HWND hNet = GetDlgItem(hWnd, ID_EDIT_NET);
@@ -107,7 +100,6 @@ void LoadNodeToEdit(HWND hWnd, const wchar_t* tag) {
         if (trans) netType = cJSON_GetObjectItem(trans, "type");
         if (!netType) netType = cJSON_GetObjectItem(target, "network");
         if (netType && strcmp(netType->valuestring, "ws") == 0) SendMessage(hNet, CB_SETCURSEL, 1, 0);
-        
         cJSON* wsSettings = NULL;
         if (trans) wsSettings = cJSON_GetObjectItem(trans, "wsSettings");
         if (!wsSettings && trans && netType && strcmp(netType->valuestring, "ws") == 0) wsSettings = trans;
@@ -120,7 +112,6 @@ void LoadNodeToEdit(HWND hWnd, const wchar_t* tag) {
                  if (host) SetDlgItemTextA(hWnd, ID_EDIT_HOST, host->valuestring);
              }
         }
-        
         HWND hTls = GetDlgItem(hWnd, ID_EDIT_TLS);
         SendMessage(hTls, CB_SETCURSEL, 0, 0); 
         cJSON* tls = cJSON_GetObjectItem(target, "tls");
@@ -130,11 +121,6 @@ void LoadNodeToEdit(HWND hWnd, const wchar_t* tag) {
              cJSON* sni = NULL;
              if (tls) sni = cJSON_GetObjectItem(tls, "server_name");
              if (sni) SetDlgItemTextA(hWnd, ID_EDIT_HOST, sni->valuestring);
-             
-             // [ECH] 读取伪装域名 (Outer SNI)
-             cJSON* outer = NULL;
-             if (tls) outer = cJSON_GetObjectItem(tls, "ech_outer_sni");
-             if (outer) SetDlgItemTextA(hWnd, ID_EDIT_ECH_SNI, outer->valuestring);
         }
     }
     cJSON_Delete(root);
@@ -142,8 +128,8 @@ void LoadNodeToEdit(HWND hWnd, const wchar_t* tag) {
 
 // [修复] 保存节点时保留原始协议类型 (vless/trojan)，防止被误判为 vmess
 void SaveEditedNode(HWND hWnd) {
-    wchar_t wTag[256], wAddr[256], wUser[256], wPass[256], wHost[256], wPath[256], wEch[256];
-    char tag[256], addr[256], user[256], pass[256], host[256], path[256], echSni[256];
+    wchar_t wTag[256], wAddr[256], wUser[256], wPass[256], wHost[256], wPath[256];
+    char tag[256], addr[256], user[256], pass[256], host[256], path[256];
     
     int port = GetDlgItemInt(hWnd, ID_EDIT_PORT, NULL, FALSE);
     if (port <= 0 || port > 65535) {
@@ -157,7 +143,6 @@ void SaveEditedNode(HWND hWnd) {
     GetDlgItemTextW(hWnd, ID_EDIT_PASS, wPass, 256);
     GetDlgItemTextW(hWnd, ID_EDIT_HOST, wHost, 256);
     GetDlgItemTextW(hWnd, ID_EDIT_PATH, wPath, 256);
-    GetDlgItemTextW(hWnd, ID_EDIT_ECH_SNI, wEch, 256); // [ECH]
     
     WideCharToMultiByte(CP_UTF8, 0, wTag, -1, tag, 256, NULL, NULL);
     WideCharToMultiByte(CP_UTF8, 0, wAddr, -1, addr, 256, NULL, NULL);
@@ -165,7 +150,6 @@ void SaveEditedNode(HWND hWnd) {
     WideCharToMultiByte(CP_UTF8, 0, wPass, -1, pass, 256, NULL, NULL);
     WideCharToMultiByte(CP_UTF8, 0, wHost, -1, host, 256, NULL, NULL);
     WideCharToMultiByte(CP_UTF8, 0, wPath, -1, path, 256, NULL, NULL);
-    WideCharToMultiByte(CP_UTF8, 0, wEch, -1, echSni, 256, NULL, NULL); // [ECH]
     
     int netIdx = SendMessage(GetDlgItem(hWnd, ID_EDIT_NET), CB_GETCURSEL, 0, 0);
     int tlsIdx = SendMessage(GetDlgItem(hWnd, ID_EDIT_TLS), CB_GETCURSEL, 0, 0);
@@ -237,9 +221,7 @@ void SaveEditedNode(HWND hWnd) {
     if (tlsIdx == 1) {
         cJSON* tlsObj = cJSON_CreateObject();
         cJSON_AddBoolToObject(tlsObj, "enabled", cJSON_True);
-        if (strlen(host) > 0) cJSON_AddStringToObject(tlsObj, "server_name", host); // Inner SNI
-        // [ECH] 保存伪装域名
-        if (strlen(echSni) > 0) cJSON_AddStringToObject(tlsObj, "ech_outer_sni", echSni);
+        if (strlen(host) > 0) cJSON_AddStringToObject(tlsObj, "server_name", host);
         cJSON_AddItemToObject(newNode, "tls", tlsObj);
     }
 
@@ -297,13 +279,6 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             CreateWindowW(L"STATIC", L"本地代理端口:", WS_CHILD|WS_VISIBLE, 25, y, 140, 20, hWnd, NULL,NULL,NULL);
             hPortEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", NULL, WS_CHILD|WS_VISIBLE|ES_NUMBER, 160, y-3, 100, 25, hWnd, (HMENU)ID_PORT_EDIT, NULL,NULL);
             SetDlgItemInt(hWnd, ID_PORT_EDIT, g_localPort, FALSE);
-
-            // [ECH] DoH 配置区域
-            y += 40;
-            CreateWindowW(L"STATIC", L"ECH DoH 查询地址:", WS_CHILD|WS_VISIBLE, 25, y, 140, 20, hWnd, NULL,NULL,NULL);
-            HWND hDoh = CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_AUTOHSCROLL, 160, y-3, 270, 25, hWnd, (HMENU)ID_EDIT_DOH_URL, NULL,NULL);
-            wchar_t wDoh[512]; MultiByteToWideChar(CP_UTF8, 0, g_dohUrl, -1, wDoh, 512);
-            SetWindowTextW(hDoh, wDoh);
 
             // 抗封锁设置 GroupBox
             y += 50;
@@ -376,11 +351,6 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
                 if (idx >= 0 && idx < 5) SetDlgItemTextA(hWnd, ID_EDIT_UA_STR, UA_TEMPLATES[idx]);
             }
             if (LOWORD(wParam) == IDOK) {
-                // [ECH] 保存 DoH 设置
-                char doh[512] = {0};
-                GetDlgItemTextA(hWnd, ID_EDIT_DOH_URL, doh, 511);
-                if (strlen(doh) > 0) snprintf(g_dohUrl, sizeof(g_dohUrl), "%s", doh);
-
                 // 保存逻辑
                 int fMin = GetDlgItemInt(hWnd, ID_EDIT_FRAG_MIN, NULL, FALSE);
                 int fMax = GetDlgItemInt(hWnd, ID_EDIT_FRAG_MAX, NULL, FALSE);
@@ -434,7 +404,7 @@ void OpenSettingsWindow() {
     }
     WNDCLASSW wc = {0}; wc.lpfnWndProc=SettingsWndProc; wc.hInstance=GetModuleHandle(NULL); wc.lpszClassName=L"Settings"; wc.hbrBackground=(HBRUSH)(COLOR_BTNFACE+1);
     WNDCLASSW temp; if (!GetClassInfoW(GetModuleHandle(NULL), L"Settings", &temp)) RegisterClassW(&wc);
-    hSettingsWnd = CreateWindowW(L"Settings", L"软件设置", WS_VISIBLE|WS_CAPTION|WS_SYSMENU, CW_USEDEFAULT,0,480,660, hwnd,NULL,wc.hInstance,NULL); // 增加高度适配新控件
+    hSettingsWnd = CreateWindowW(L"Settings", L"软件设置", WS_VISIBLE|WS_CAPTION|WS_SYSMENU, CW_USEDEFAULT,0,480,560, hwnd,NULL,wc.hInstance,NULL);
     ShowWindow(hSettingsWnd, SW_SHOW);
 }
 
@@ -640,10 +610,7 @@ LRESULT CALLBACK NodeEditWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             CREATE_LABEL(L"伪装类型:"); HWND hType = CREATE_COMBO(ID_EDIT_TYPE); AddComboItem(hType, L"none", TRUE); y += gap;
             CREATE_LABEL(L"伪装域名:"); CREATE_EDIT(ID_EDIT_HOST, ES_AUTOHSCROLL); y += gap;
             CREATE_LABEL(L"请求路径:"); CREATE_EDIT(ID_EDIT_PATH, ES_AUTOHSCROLL); y += gap;
-            CREATE_LABEL(L"传输安全:"); HWND hTls = CREATE_COMBO(ID_EDIT_TLS); AddComboItem(hTls, L"none", TRUE); AddComboItem(hTls, L"tls", FALSE); y += gap;
-            // [ECH]
-            CREATE_LABEL(L"ECH 伪装域名:"); CREATE_EDIT(ID_EDIT_ECH_SNI, ES_AUTOHSCROLL); y += gap + 30;
-
+            CREATE_LABEL(L"传输安全:"); HWND hTls = CREATE_COMBO(ID_EDIT_TLS); AddComboItem(hTls, L"none", TRUE); AddComboItem(hTls, L"tls", FALSE); y += gap + 30;
             CreateWindowW(L"BUTTON", L"确定", WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON, 120, y, 100, 32, hWnd, (HMENU)IDOK, NULL, NULL);
             CreateWindowW(L"BUTTON", L"取消", WS_CHILD|WS_VISIBLE, 260, y, 100, 32, hWnd, (HMENU)IDCANCEL, NULL, NULL); y += 80; 
             g_nEditContentHeight = y; g_nEditScrollPos = 0;
@@ -831,18 +798,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nSho
     hLogFont = CreateFontW(14,0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,0,0,0,0,L"Consolas");
     
     OpenLogViewer(FALSE); 
-    // 初始化 set.ini 路徑 (用於存儲軟件設置)
     GetModuleFileNameW(NULL, g_iniFilePath, MAX_PATH);
-    wchar_t* p = wcsrchr(g_iniFilePath, L'\\'); 
-    // [修正] 將 L'\\set.ini' 改為 L"\\set.ini" (雙引號)
-    if (p) { *p = 0; wcscat(g_iniFilePath, L"\\set.ini"); } 
-    else wcscpy(g_iniFilePath, L"set.ini");
-    
-    // [新增] 初始化 config.json 路徑 (用於存儲節點信息)
-    GetModuleFileNameW(NULL, g_configFilePath, MAX_PATH);
-    p = wcsrchr(g_configFilePath, L'\\');
-    if (p) { *p = 0; wcscat(g_configFilePath, L"\\config.json"); }
-    else wcscpy(g_configFilePath, L"config.json");
+    wchar_t* p = wcsrchr(g_iniFilePath, L'\\'); if (p) { *p = 0; wcscat(g_iniFilePath, L"\\set.ini"); } else wcscpy(g_iniFilePath, L"set.ini");
     
     LoadSettings();
     CreateThread(NULL, 0, AutoUpdateThread, NULL, 0, NULL);
@@ -875,7 +832,3 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nSho
     
     return 0;
 }
-
-
-
-

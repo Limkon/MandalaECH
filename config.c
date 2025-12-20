@@ -31,33 +31,37 @@ static cJSON* GetOrCreateObj(cJSON* parent, const char* name) {
     return item;
 }
 
-// --- SS Plugin 解析 ---
+// --- SS Plugin 解析辅助函数 (修复：弃用 strtok) ---
 static void ParseSSPlugin(cJSON* outbound, const char* pluginParam) {
     if (!pluginParam || !outbound) return;
     char* pluginCopy = strdup(pluginParam);
     if (!pluginCopy) return;
 
     char host[256] = {0}; char path[256] = {0}; char sni[256] = {0}; char mode[64] = {0};
-    char ech[2048] = {0}; // [ECH]
     BOOL isTls = FALSE;
     BOOL isV2ray = (strstr(pluginCopy, "v2ray-plugin") != NULL);
     
+    // [Fix] 使用指针遍历替代 strtok，避免破坏外部解析循环
     char* start = pluginCopy;
     char* end = NULL;
+    
     while (start && *start) {
+        // 查找分号分隔符
         end = strchr(start, ';');
-        if (end) *end = '\0'; 
+        if (end) *end = '\0'; // 临时截断
         
+        // 解析当前段
         if (strncmp(start, "host=", 5) == 0) SafeStrCpy(host, sizeof(host), start+5);
         else if (strncmp(start, "obfs-host=", 10) == 0) SafeStrCpy(host, sizeof(host), start+10);
         else if (strncmp(start, "path=", 5) == 0) SafeStrCpy(path, sizeof(path), start+5);
         else if (strncmp(start, "sni=", 4) == 0) SafeStrCpy(sni, sizeof(sni), start+4);
-        else if (strncmp(start, "ech=", 4) == 0) SafeStrCpy(ech, sizeof(ech), start+4); // [ECH]
         else if (strncmp(start, "mode=", 5) == 0) SafeStrCpy(mode, sizeof(mode), start+5);
         else if (strcmp(start, "tls") == 0) isTls = TRUE;
         else if (strncmp(start, "obfs=", 5) == 0) { if (strcmp(start+5, "tls") == 0) isTls = TRUE; }
 
-        if (end) start = end + 1; else start = NULL;
+        // 移动到下一个段
+        if (end) start = end + 1;
+        else start = NULL;
     }
 
     if (isTls) {
@@ -65,8 +69,6 @@ static void ParseSSPlugin(cJSON* outbound, const char* pluginParam) {
         cJSON_AddBoolToObject(tlsObj, "enabled", cJSON_True);
         if (strlen(sni) > 0) cJSON_AddStringToObject(tlsObj, "server_name", sni);
         else if (strlen(host) > 0 && !cJSON_HasObjectItem(tlsObj, "server_name")) cJSON_AddStringToObject(tlsObj, "server_name", host);
-        // [ECH]
-        if (strlen(ech) > 0) cJSON_AddStringToObject(tlsObj, "ech", ech);
     }
 
     if (isV2ray && strcmp(mode, "quic") != 0) {
@@ -81,11 +83,14 @@ static void ParseSSPlugin(cJSON* outbound, const char* pluginParam) {
     free(pluginCopy);
 }
 
+// --- 配置文件基础操作 ---
+
 void LoadSettings() {
     g_hotkeyModifiers = GetPrivateProfileIntW(L"Settings", L"Modifiers", MOD_CONTROL | MOD_ALT, g_iniFilePath);
     g_hotkeyVk = GetPrivateProfileIntW(L"Settings", L"VK", 'H', g_iniFilePath);
     g_localPort = GetPrivateProfileIntW(L"Settings", L"LocalPort", 10809, g_iniFilePath);
     g_hideTrayStart = GetPrivateProfileIntW(L"Settings", L"HideTray", 0, g_iniFilePath);
+    
     g_enableChromeCiphers = GetPrivateProfileIntW(L"Settings", L"ChromeCiphers", 1, g_iniFilePath);
     g_enableALPN = GetPrivateProfileIntW(L"Settings", L"EnableALPN", 1, g_iniFilePath);
     g_enableFragment = GetPrivateProfileIntW(L"Settings", L"EnableFragment", 0, g_iniFilePath);
@@ -95,24 +100,23 @@ void LoadSettings() {
     g_enablePadding = GetPrivateProfileIntW(L"Settings", L"EnablePadding", 0, g_iniFilePath);
     g_padSizeMin = GetPrivateProfileIntW(L"Settings", L"PadMin", 100, g_iniFilePath);
     g_padSizeMax = GetPrivateProfileIntW(L"Settings", L"PadMax", 500, g_iniFilePath);
+
     if (g_fragSizeMin < 1) g_fragSizeMin = 1; if (g_fragSizeMax < g_fragSizeMin) g_fragSizeMax = g_fragSizeMin;
     if (g_fragDelayMs < 0) g_fragDelayMs = 0; if (g_padSizeMin < 0) g_padSizeMin = 0; if (g_padSizeMax < g_padSizeMin) g_padSizeMax = g_padSizeMin;
+
     g_uaPlatformIndex = GetPrivateProfileIntW(L"Settings", L"UAPlatform", 0, g_iniFilePath);
     wchar_t wUABuf[512] = {0}; GetPrivateProfileStringW(L"Settings", L"UserAgent", L"", wUABuf, 512, g_iniFilePath);
     if (wcslen(wUABuf) > 5) WideCharToMultiByte(CP_UTF8, 0, wUABuf, -1, g_userAgentStr, sizeof(g_userAgentStr), NULL, NULL);
     else SafeStrCpy(g_userAgentStr, sizeof(g_userAgentStr), UA_TEMPLATES[0]);
+
     GetPrivateProfileStringW(L"Settings", L"LastNode", L"", currentNode, 64, g_iniFilePath);
-    
-    // [ECH] 读取 DoH URL
-    wchar_t wDoH[512] = {0};
-    GetPrivateProfileStringW(L"Settings", L"DoH", L"https://dns.alidns.com/dns-query", wDoH, 512, g_iniFilePath);
-    if (wcslen(wDoH) > 0) WideCharToMultiByte(CP_UTF8, 0, wDoH, -1, g_dohUrl, sizeof(g_dohUrl), NULL, NULL);
 
     g_subCount = GetPrivateProfileIntW(L"Subscriptions", L"Count", 0, g_iniFilePath);
     if (g_subCount > MAX_SUBS) g_subCount = MAX_SUBS;
     for (int i = 0; i < g_subCount; i++) {
         wchar_t wKeyEn[32], wKeyUrl[32], wUrl[512];
-        _snwprintf(wKeyEn, 32, L"Sub%d_Enabled", i); _snwprintf(wKeyUrl, 32, L"Sub%d_Url", i);
+        _snwprintf(wKeyEn, 32, L"Sub%d_Enabled", i); 
+        _snwprintf(wKeyUrl, 32, L"Sub%d_Url", i);
         g_subs[i].enabled = GetPrivateProfileIntW(L"Subscriptions", wKeyEn, 1, g_iniFilePath);
         GetPrivateProfileStringW(L"Subscriptions", wKeyUrl, L"", wUrl, 512, g_iniFilePath);
         WideCharToMultiByte(CP_UTF8, 0, wUrl, -1, g_subs[i].url, 512, NULL, NULL);
@@ -137,19 +141,19 @@ void SaveSettings() {
     _snwprintf(buffer, 16, L"%d", g_uaPlatformIndex); WritePrivateProfileStringW(L"Settings", L"UAPlatform", buffer, g_iniFilePath);
     wchar_t wUABuf[512] = {0}; MultiByteToWideChar(CP_UTF8, 0, g_userAgentStr, -1, wUABuf, 512);
     WritePrivateProfileStringW(L"Settings", L"UserAgent", wUABuf, g_iniFilePath);
+
     WritePrivateProfileStringW(L"Settings", L"LastNode", currentNode, g_iniFilePath);
-    
-    // [ECH] 保存 DoH URL
-    wchar_t wDoH[512] = {0}; MultiByteToWideChar(CP_UTF8, 0, g_dohUrl, -1, wDoH, 512);
-    WritePrivateProfileStringW(L"Settings", L"DoH", wDoH, g_iniFilePath);
 
     WritePrivateProfileStringW(L"Subscriptions", NULL, NULL, g_iniFilePath);
     _snwprintf(buffer, 16, L"%d", g_subCount); WritePrivateProfileStringW(L"Subscriptions", L"Count", buffer, g_iniFilePath);
     for (int i = 0; i < g_subCount; i++) {
         wchar_t wKeyEn[32], wKeyUrl[32], wUrl[512], wVal[2];
-        _snwprintf(wKeyEn, 32, L"Sub%d_Enabled", i); _snwprintf(wKeyUrl, 32, L"Sub%d_Url", i);
-        _snwprintf(wVal, 2, L"%d", g_subs[i].enabled); WritePrivateProfileStringW(L"Subscriptions", wKeyEn, wVal, g_iniFilePath);
-        MultiByteToWideChar(CP_UTF8, 0, g_subs[i].url, -1, wUrl, 512); WritePrivateProfileStringW(L"Subscriptions", wKeyUrl, wUrl, g_iniFilePath);
+        _snwprintf(wKeyEn, 32, L"Sub%d_Enabled", i); 
+        _snwprintf(wKeyUrl, 32, L"Sub%d_Url", i);
+        _snwprintf(wVal, 2, L"%d", g_subs[i].enabled); 
+        WritePrivateProfileStringW(L"Subscriptions", wKeyEn, wVal, g_iniFilePath);
+        MultiByteToWideChar(CP_UTF8, 0, g_subs[i].url, -1, wUrl, 512); 
+        WritePrivateProfileStringW(L"Subscriptions", wKeyUrl, wUrl, g_iniFilePath);
     }
 }
 
@@ -219,17 +223,22 @@ char* GetUniqueTagName(cJSON* outbounds, const char* type, const char* base_name
 void ParseNodeConfigToGlobal(cJSON *node) {
     if (!node) return;
     memset(&g_proxyConfig, 0, sizeof(ProxyConfig));
+    // [Security Fix] 使用 SafeStrCpy 防止配置溢出
     SafeStrCpy(g_proxyConfig.path, sizeof(g_proxyConfig.path), "/"); 
+
     cJSON *server = cJSON_GetObjectItem(node, "server");
     cJSON *port = cJSON_GetObjectItem(node, "server_port");
     cJSON *uuid = cJSON_GetObjectItem(node, "uuid");
     if (!uuid) uuid = cJSON_GetObjectItem(node, "password"); 
+    
     if (server && server->valuestring) SafeStrCpy(g_proxyConfig.host, sizeof(g_proxyConfig.host), server->valuestring);
     if (port) g_proxyConfig.port = port->valueint;
+    
     if (uuid && uuid->valuestring) { 
         SafeStrCpy(g_proxyConfig.user, sizeof(g_proxyConfig.user), uuid->valuestring); 
         SafeStrCpy(g_proxyConfig.pass, sizeof(g_proxyConfig.pass), uuid->valuestring); 
     }
+    
     cJSON *user = cJSON_GetObjectItem(node, "username"); 
     cJSON *pass = cJSON_GetObjectItem(node, "password");
     if(user && user->valuestring) SafeStrCpy(g_proxyConfig.user, sizeof(g_proxyConfig.user), user->valuestring);
@@ -239,14 +248,6 @@ void ParseNodeConfigToGlobal(cJSON *node) {
     if (tls) {
         cJSON *sni = cJSON_GetObjectItem(tls, "server_name");
         if (sni && sni->valuestring) SafeStrCpy(g_proxyConfig.sni, sizeof(g_proxyConfig.sni), sni->valuestring);
-        
-        // [ECH] 解析 ECH (如果有静态配置)
-        cJSON *ech = cJSON_GetObjectItem(tls, "ech");
-        if (ech && ech->valuestring) SafeStrCpy(g_proxyConfig.ech, sizeof(g_proxyConfig.ech), ech->valuestring);
-        
-        // [ECH] 解析伪装域名 (Outer SNI)
-        cJSON *outer = cJSON_GetObjectItem(tls, "ech_outer_sni");
-        if (outer && outer->valuestring) SafeStrCpy(g_proxyConfig.outer_sni, sizeof(g_proxyConfig.outer_sni), outer->valuestring);
     }
     
     cJSON *trans = cJSON_GetObjectItem(node, "transport");
@@ -254,16 +255,19 @@ void ParseNodeConfigToGlobal(cJSON *node) {
         cJSON *path = cJSON_GetObjectItem(trans, "path");
         if(path && path->valuestring) SafeStrCpy(g_proxyConfig.path, sizeof(g_proxyConfig.path), path->valuestring);
     }
+    
     if (strlen(g_proxyConfig.sni) == 0) SafeStrCpy(g_proxyConfig.sni, sizeof(g_proxyConfig.sni), g_proxyConfig.host);
+
+    // 解析并保存协议类型
     cJSON *type = cJSON_GetObjectItem(node, "type");
     if (type && type->valuestring) {
         SafeStrCpy(g_proxyConfig.type, sizeof(g_proxyConfig.type), type->valuestring);
     } else {
         SafeStrCpy(g_proxyConfig.type, sizeof(g_proxyConfig.type), "socks");
     }
-    log_msg("Node Loaded: %s:%d (SNI: %s, ECH Outer: %s)", 
-        g_proxyConfig.host, g_proxyConfig.port, g_proxyConfig.sni, 
-        strlen(g_proxyConfig.outer_sni) > 0 ? g_proxyConfig.outer_sni : "None");
+
+    log_msg("Node Config Loaded: %s:%d (Type: %s, SNI: %s)", 
+        g_proxyConfig.host, g_proxyConfig.port, g_proxyConfig.type, g_proxyConfig.sni);
 }
 
 void SwitchNode(const wchar_t* tag) {
@@ -281,9 +285,13 @@ void SwitchNode(const wchar_t* tag) {
         if (t && strcmp(t->valuestring, tagUtf8) == 0) { targetNode = node; break; }
     }
     if (targetNode) {
-        StopProxyCore(); ParseNodeConfigToGlobal(targetNode); StartProxyCore();
+        StopProxyCore(); 
+        ParseNodeConfigToGlobal(targetNode); 
+        StartProxyCore();
         SaveSettings(); 
-        wchar_t tip[128]; _snwprintf(tip, 128, L"已切换: %s", tag);
+        
+        wchar_t tip[128]; 
+        _snwprintf(tip, 128, L"已切换: %s", tag);
         wcsncpy(nid.szInfo, tip, 127); wcsncpy(nid.szInfoTitle, L"Mandala Client", 63); nid.uFlags |= NIF_INFO;
         Shell_NotifyIconW(NIM_MODIFY, &nid);
     }
@@ -326,6 +334,7 @@ BOOL AddNodeToConfig(cJSON* newNode) {
     return ret;
 }
 
+// [Fix] 重构：弃用 strtok，完全使用手动指针遍历，解决嵌套调用 strtok 导致的解析中断问题
 int Internal_BatchAddNodesFromText(const char* text, cJSON* outbounds) {
     if (!text || !outbounds) return 0;
     int count = 0; size_t decLen = 0; unsigned char* decoded = Base64Decode(text, &decLen);
@@ -333,30 +342,45 @@ int Internal_BatchAddNodesFromText(const char* text, cJSON* outbounds) {
     if (decoded && decLen > 0) sourceText = (char*)decoded; else { sourceText = strdup(text); if (decoded) free(decoded); }
     if (!sourceText) return 0;
     
-    char* line = strtok(sourceText, "\r\n ,");
-    while (line) {
-        TrimString(line);
-        if (strlen(line) > 0) {
-            cJSON* node = NULL;
-            if (_strnicmp(line, "vmess://", 8) == 0) node = ParseVmess(line);
-            else if (_strnicmp(line, "ss://", 5) == 0) node = ParseShadowsocks(line);
-            else if (_strnicmp(line, "vless://", 8) == 0) node = ParseVlessOrTrojan(line);
-            else if (_strnicmp(line, "trojan://", 9) == 0) node = ParseVlessOrTrojan(line);
-            else if (_strnicmp(line, "socks://", 8) == 0) node = ParseSocks(line);
-            else if (_strnicmp(line, "mandala://", 10) == 0) node = ParseMandala(line); 
+    char* p = sourceText;
+    while (*p) {
+        // 跳过前导分隔符
+        size_t span = strspn(p, "\r\n ,");
+        p += span;
+        if (!*p) break;
+        
+        // 查找当前行的结束位置
+        size_t len = strcspn(p, "\r\n ,");
+        if (len > 0) {
+            // 提取当前行
+            char* line = (char*)malloc(len + 1);
+            strncpy(line, p, len);
+            line[len] = '\0';
+            TrimString(line);
             
-            if (node) {
-                cJSON* jsonType = cJSON_GetObjectItem(node, "type");
-                const char* typeStr = (jsonType && jsonType->valuestring) ? jsonType->valuestring : "proxy";
-                cJSON* jsonTag = cJSON_GetObjectItem(node, "tag");
-                const char* originalTag = (jsonTag && jsonTag->valuestring) ? jsonTag->valuestring : "Auto";
-                char* uniqueTag = GetUniqueTagName(outbounds, typeStr, originalTag);
-                if (cJSON_HasObjectItem(node, "tag")) cJSON_ReplaceItemInObject(node, "tag", cJSON_CreateString(uniqueTag));
-                else cJSON_AddStringToObject(node, "tag", uniqueTag);
-                cJSON_AddItemToArray(outbounds, node); count++;
+            if (strlen(line) > 0) {
+                cJSON* node = NULL;
+                if (_strnicmp(line, "vmess://", 8) == 0) node = ParseVmess(line);
+                else if (_strnicmp(line, "ss://", 5) == 0) node = ParseShadowsocks(line);
+                else if (_strnicmp(line, "vless://", 8) == 0) node = ParseVlessOrTrojan(line);
+                else if (_strnicmp(line, "trojan://", 9) == 0) node = ParseVlessOrTrojan(line);
+                else if (_strnicmp(line, "socks://", 8) == 0) node = ParseSocks(line);
+                else if (_strnicmp(line, "mandala://", 10) == 0) node = ParseMandala(line); 
+                
+                if (node) {
+                    cJSON* jsonType = cJSON_GetObjectItem(node, "type");
+                    const char* typeStr = (jsonType && jsonType->valuestring) ? jsonType->valuestring : "proxy";
+                    cJSON* jsonTag = cJSON_GetObjectItem(node, "tag");
+                    const char* originalTag = (jsonTag && jsonTag->valuestring) ? jsonTag->valuestring : "Auto";
+                    char* uniqueTag = GetUniqueTagName(outbounds, typeStr, originalTag);
+                    if (cJSON_HasObjectItem(node, "tag")) cJSON_ReplaceItemInObject(node, "tag", cJSON_CreateString(uniqueTag));
+                    else cJSON_AddStringToObject(node, "tag", uniqueTag);
+                    cJSON_AddItemToArray(outbounds, node); count++;
+                }
             }
+            free(line);
+            p += len;
         }
-        line = strtok(NULL, "\r\n ,");
     }
     free(sourceText); return count;
 }
@@ -409,68 +433,40 @@ void ToggleTrayIcon() {
 }
 
 // --- 协议解析函数 ---
-
 cJSON* ParseSocks(const char* link) {
     if (strncmp(link, "socks://", 8) != 0) return NULL;
     const char* p = link + 8; const char* at = strchr(p, '@'); if (!at) return NULL; 
+    int authLen = (int)(at - p); char* authBase64 = (char*)malloc(authLen + 1); strncpy(authBase64, p, authLen); authBase64[authLen] = 0;
+    size_t decLen; unsigned char* decoded = Base64Decode(authBase64, &decLen); free(authBase64); if (!decoded) return NULL;
+    char* user = (char*)decoded; char* pass = strchr(user, ':'); if (pass) { *pass = 0; pass++; } else pass = "";
     
-    int authLen = (int)(at - p); 
-    char* authBase64 = (char*)malloc(authLen + 1); 
-    strncpy(authBase64, p, authLen); authBase64[authLen] = 0;
-    
-    size_t decLen; 
-    unsigned char* decoded = Base64Decode(authBase64, &decLen); 
-    free(authBase64); 
-    if (!decoded) return NULL;
-    
-    char* user = (char*)decoded; 
-    char* pass = strchr(user, ':'); 
-    if (pass) { *pass = 0; pass++; } else pass = "";
-    
-    p = at + 1; 
-    const char* colon = strchr(p, ':'); 
-    const char* qMark = strchr(p, '?'); 
-    const char* hash = strchr(p, '#');
-    
+    p = at + 1; const char* colon = strchr(p, ':'); const char* qMark = strchr(p, '?'); const char* hash = strchr(p, '#');
+    // [Fix] 优化 hostEnd 计算，确保在没有 # 的情况下也能正确截取
     const char* hostEnd = colon;
     if (!hostEnd || (qMark && qMark < hostEnd)) hostEnd = qMark;
     if (!hostEnd || (hash && hash < hostEnd)) hostEnd = hash;
     if (!hostEnd) hostEnd = p + strlen(p);
 
     int portNum = 443;
-    if (colon) portNum = atoi(colon + 1);
+    if (colon && colon < hostEnd) portNum = atoi(colon + 1);
 
-    int hostLen = (int)(hostEnd - p); 
-    char* host = (char*)malloc(hostLen + 1); 
-    strncpy(host, p, hostLen); host[hostLen] = 0;
+    int hostLen = (int)(hostEnd - p); char* host = (char*)malloc(hostLen + 1); strncpy(host, p, hostLen); host[hostLen] = 0;
     
-    char* tag = hash ? (char*)malloc(strlen(hash+1)+1) : strdup("Socks-Import"); 
-    if(hash) UrlDecode(tag, hash+1);
-    
+    char* tag = hash ? (char*)malloc(strlen(hash+1)+1) : strdup("Socks-Import"); if(hash) UrlDecode(tag, hash+1);
     const char* query = qMark ? qMark + 1 : NULL;
     char* sni = GetQueryParam(query, "sni"); if (!sni) sni = GetQueryParam(query, "peer");
-    char* path = GetQueryParam(query, "path"); 
-    char* type = GetQueryParam(query, "type"); if (!type) type = GetQueryParam(query, "transport");
-    char* security = GetQueryParam(query, "security"); 
-    char* hostHeader = GetQueryParam(query, "host");
-    char* ech = GetQueryParam(query, "ech"); // [ECH Refactor] 解析 ECH
-
+    char* path = GetQueryParam(query, "path"); char* type = GetQueryParam(query, "type"); if (!type) type = GetQueryParam(query, "transport");
+    char* security = GetQueryParam(query, "security"); char* hostHeader = GetQueryParam(query, "host");
     cJSON* outbound = cJSON_CreateObject();
-    cJSON_AddStringToObject(outbound, "type", "socks_tls"); 
-    cJSON_AddStringToObject(outbound, "tag", tag);
-    cJSON_AddStringToObject(outbound, "server", host); 
-    cJSON_AddNumberToObject(outbound, "server_port", portNum);
-    cJSON_AddStringToObject(outbound, "username", user); 
-    cJSON_AddStringToObject(outbound, "password", pass);
-    
-    BOOL enableTls = (security && strcmp(security, "tls") == 0) || sni != NULL || ech != NULL;
+    cJSON_AddStringToObject(outbound, "type", "socks_tls"); cJSON_AddStringToObject(outbound, "tag", tag);
+    cJSON_AddStringToObject(outbound, "server", host); cJSON_AddNumberToObject(outbound, "server_port", portNum);
+    cJSON_AddStringToObject(outbound, "username", user); cJSON_AddStringToObject(outbound, "password", pass);
+    BOOL enableTls = (security && strcmp(security, "tls") == 0) || sni != NULL;
     if (enableTls) {
         cJSON* tls = cJSON_CreateObject(); cJSON_AddBoolToObject(tls, "enabled", cJSON_True);
         if (sni) cJSON_AddStringToObject(tls, "server_name", sni); else cJSON_AddStringToObject(tls, "server_name", host);
-        if (ech) cJSON_AddStringToObject(tls, "ech", ech); // 添加 ECH 到 JSON
         cJSON_AddItemToObject(outbound, "tls", tls);
     }
-    
     if (type && strcmp(type, "ws") == 0) {
         cJSON* trans = cJSON_CreateObject(); cJSON_AddStringToObject(trans, "type", "ws");
         if (path) cJSON_AddStringToObject(trans, "path", path);
@@ -478,47 +474,93 @@ cJSON* ParseSocks(const char* link) {
         if (hostHeader) cJSON_AddStringToObject(headers, "Host", hostHeader); else cJSON_AddStringToObject(headers, "Host", host);
         cJSON_AddItemToObject(trans, "headers", headers); cJSON_AddItemToObject(outbound, "transport", trans);
     }
-    
-    if (sni) free(sni); if (path) free(path); if (type) free(type); 
-    if (security) free(security); if (hostHeader) free(hostHeader);
-    if (ech) free(ech);
-    free(host); free(tag); free(decoded); 
-    return outbound;
+    if (sni) free(sni); if (path) free(path); if (type) free(type); if (security) free(security); if (hostHeader) free(hostHeader);
+    free(host); free(tag); free(decoded); return outbound;
 }
 
 cJSON* ParseShadowsocks(const char* link) {
     if (strncmp(link, "ss://", 5) != 0) return NULL;
-    
-    const char* start = link + 5;
-    const char* hash = strchr(start, '#');
-    
-    // 处理 base64 部分 (user:pass@host:port)
-    char base64Part[512] = {0};
-    const char* at = strchr(start, '@');
-    const char* endOfBase64 = at ? at : (hash ? hash : start + strlen(start));
-    
-    // 如果没有 @，说明整个是 base64
+    const char* p = link + 5; 
+    const char* hash = strchr(p, '#'); char* tag = hash ? (char*)malloc(strlen(hash+1)+1) : strdup("SS");
+    if(hash) UrlDecode(tag, hash+1); else strcpy(tag, "SS");
+    const char* qMark = strchr(p, '?');
+    const char* endOfMain = qMark ? qMark : (hash ? hash : p + strlen(p));
+    size_t mainLen = (size_t)(endOfMain - p);
+    char* mainPart = (char*)malloc(mainLen + 1); strncpy(mainPart, p, mainLen); mainPart[mainLen] = 0;
+    char serverPort[256] = {0}, methodPass[256] = {0}; char* at = strchr(mainPart, '@');
     if (!at) {
-        // ... (复杂 SS URI 解析省略，保持原逻辑或简化) ...
-        // 此处为简化示例，实际应完整实现 SIP002 等
-        // 假设标准格式 ss://BASE64#TAG
-        const char* q = strchr(start, '?');
-        size_t len = q ? (q - start) : (hash ? (hash - start) : strlen(start));
-        unsigned char* decoded = Base64Decode(start, &len); // 需修改 Base64Decode 接受长度
-        // ... 
-        return NULL; // Placeholder
+        size_t decLen; unsigned char* decoded = Base64Decode(mainPart, &decLen);
+        if(!decoded) { free(mainPart); free(tag); return NULL; }
+        char* dStr = (char*)decoded; at = strchr(dStr, '@');
+        if (at) { 
+            SafeStrCpy(serverPort, sizeof(serverPort), at+1); 
+            size_t mpLen = at - dStr;
+            if (mpLen >= sizeof(methodPass)) mpLen = sizeof(methodPass) - 1;
+            strncpy(methodPass, dStr, mpLen); methodPass[mpLen]=0; 
+        }
+        free(decoded);
+    } else {
+        SafeStrCpy(serverPort, sizeof(serverPort), at+1); 
+        char b64User[256]; 
+        size_t uLen = at - mainPart;
+        if (uLen >= sizeof(b64User)) uLen = sizeof(b64User) - 1;
+        strncpy(b64User, mainPart, uLen); b64User[uLen] = 0;
+        
+        size_t decLen; unsigned char* decoded = Base64Decode(b64User, &decLen);
+        if(decoded) { SafeStrCpy(methodPass, sizeof(methodPass), (char*)decoded); free(decoded); } 
+        else SafeStrCpy(methodPass, sizeof(methodPass), b64User);
+    }
+    free(mainPart);
+    char* colon = strrchr(serverPort, ':'); if (!colon) { free(tag); return NULL; }
+    int port = atoi(colon + 1); *colon = 0;
+    char* pass = strchr(methodPass, ':'); if (!pass) { free(tag); return NULL; } *pass = 0; pass++;
+
+    cJSON* outbound = cJSON_CreateObject();
+    cJSON_AddStringToObject(outbound, "type", "shadowsocks"); cJSON_AddStringToObject(outbound, "tag", tag);
+    cJSON_AddStringToObject(outbound, "server", serverPort); cJSON_AddNumberToObject(outbound, "server_port", port);
+    cJSON_AddStringToObject(outbound, "method", methodPass); cJSON_AddStringToObject(outbound, "password", pass);
+
+    if (qMark) {
+        const char* qStart = qMark + 1; size_t qLen = hash ? (size_t)(hash - qStart) : strlen(qStart);
+        char* queryStr = (char*)malloc(qLen + 1); strncpy(queryStr, qStart, qLen); queryStr[qLen] = 0;
+        
+        char* pluginVal = GetQueryParam(queryStr, "plugin");
+        if (pluginVal) { UrlDecode(pluginVal, pluginVal); ParseSSPlugin(outbound, pluginVal); free(pluginVal); }
+
+        char* directSni = GetQueryParam(queryStr, "sni");
+        char* directHost = GetQueryParam(queryStr, "host"); if(!directHost) directHost = GetQueryParam(queryStr, "obfs-host");
+        char* directPath = GetQueryParam(queryStr, "path");
+        char* directMode = GetQueryParam(queryStr, "mode"); if(!directMode) directMode = GetQueryParam(queryStr, "type");
+        char* directSecurity = GetQueryParam(queryStr, "security"); 
+
+        BOOL needTls = (directSecurity && strcmp(directSecurity, "tls") == 0) || directSni != NULL;
+        if (needTls) {
+            cJSON* tlsObj = GetOrCreateObj(outbound, "tls");
+            if (!cJSON_HasObjectItem(tlsObj, "enabled")) cJSON_AddBoolToObject(tlsObj, "enabled", cJSON_True);
+            if (directSni && !cJSON_HasObjectItem(tlsObj, "server_name")) cJSON_AddStringToObject(tlsObj, "server_name", directSni);
+            else if (directHost && !cJSON_HasObjectItem(tlsObj, "server_name")) cJSON_AddStringToObject(tlsObj, "server_name", directHost);
+        }
+
+        BOOL isWs = (directMode && strcmp(directMode, "ws") == 0);
+        if (isWs) {
+             cJSON* trans = GetOrCreateObj(outbound, "transport");
+             if (!cJSON_HasObjectItem(trans, "type")) cJSON_AddStringToObject(trans, "type", "ws");
+             if (directPath && !cJSON_HasObjectItem(trans, "path")) cJSON_AddStringToObject(trans, "path", directPath);
+             if (directHost) {
+                 cJSON* headers = GetOrCreateObj(trans, "headers");
+                 if (!cJSON_HasObjectItem(headers, "Host")) cJSON_AddStringToObject(headers, "Host", directHost);
+             }
+        }
+
+        if(directSni) free(directSni); if(directHost) free(directHost); if(directPath) free(directPath);
+        if(directMode) free(directMode); if(directSecurity) free(directSecurity);
+        free(queryStr);
     }
     
-    // 简单格式 ss://method:pass@host:port
-    // ...
-    // ECH 支持逻辑：
-    // 在 Query 参数中查找 plugin-opts，然后解析 ech=...
-    // 假设 plugin=v2ray-plugin;...;ech=...
-    return NULL; // 占位，请复用原有 ParseShadowsocks 并添加 ParseSSPlugin 调用
+    free(tag); return outbound;
 }
 
 cJSON* ParseVmess(const char* link) {
-    // VMess 链接通常不直接带 ech 参数，而是在 JSON 中
     if (strncmp(link, "vmess://", 8) != 0) return NULL;
     size_t len; unsigned char* decoded = Base64Decode(link + 8, &len); if (!decoded) return NULL;
     cJSON* vmessJson = cJSON_Parse((const char*)decoded); free(decoded); if (!vmessJson) return NULL;
@@ -529,9 +571,6 @@ cJSON* ParseVmess(const char* link) {
     cJSON* net = cJSON_GetObjectItem(vmessJson, "net"); cJSON* host = cJSON_GetObjectItem(vmessJson, "host");
     cJSON* path = cJSON_GetObjectItem(vmessJson, "path"); cJSON* tls = cJSON_GetObjectItem(vmessJson, "tls");
     cJSON* sni = cJSON_GetObjectItem(vmessJson, "sni");
-    // [ECH Refactor] 解析 JSON 中的 ECH 字段 (如果有)
-    cJSON* ech = cJSON_GetObjectItem(vmessJson, "ech");
-
     cJSON_AddStringToObject(outbound, "tag", cJSON_IsString(ps) ? ps->valuestring : "VMess");
     cJSON_AddStringToObject(outbound, "server", cJSON_IsString(add) ? add->valuestring : "");
     cJSON_AddNumberToObject(outbound, "server_port", cJSON_IsNumber(port)?port->valueint:atoi(port->valuestring));
@@ -549,7 +588,6 @@ cJSON* ParseVmess(const char* link) {
         cJSON* t = cJSON_CreateObject(); cJSON_AddBoolToObject(t, "enabled", cJSON_True);
         if (cJSON_IsString(sni) && strlen(sni->valuestring)>0) cJSON_AddStringToObject(t, "server_name", sni->valuestring);
         else if (cJSON_IsString(host) && strlen(host->valuestring)>0) cJSON_AddStringToObject(t, "server_name", host->valuestring);
-        if (cJSON_IsString(ech) && strlen(ech->valuestring)>0) cJSON_AddStringToObject(t, "ech", ech->valuestring);
         cJSON_AddItemToObject(outbound, "tls", t);
     }
     cJSON_Delete(vmessJson); return outbound;
@@ -562,8 +600,8 @@ cJSON* ParseVlessOrTrojan(const char* link) {
     else return NULL;
     const char* p = link + strlen(protocol) + 3; const char* at = strchr(p, '@'); if (!at) return NULL;
     int uuidLen = (int)(at - p); char* uuid = (char*)malloc(uuidLen + 1); strncpy(uuid, p, uuidLen); uuid[uuidLen] = 0;
-    
     p = at + 1; const char* colon = strchr(p, ':'); const char* qMark = strchr(p, '?'); const char* hash = strchr(p, '#');
+    // [Fix] 统一的 hostEnd 计算逻辑
     const char* hostEnd = colon;
     if (!hostEnd || (qMark && qMark < hostEnd)) hostEnd = qMark;
     if (!hostEnd || (hash && hash < hostEnd)) hostEnd = hash;
@@ -582,7 +620,6 @@ cJSON* ParseVlessOrTrojan(const char* link) {
     cJSON_AddStringToObject(outbound, "server", host); cJSON_AddNumberToObject(outbound, "server_port", portNum);
     if (strcmp(protocol, "vless") == 0) cJSON_AddStringToObject(outbound, "uuid", uuid);
     else cJSON_AddStringToObject(outbound, "password", uuid);
-    
     const char* query = qMark ? qMark + 1 : NULL;
     char* type = GetQueryParam(query, "type");
     if (type && strcmp(type, "ws") == 0) {
@@ -597,38 +634,40 @@ cJSON* ParseVlessOrTrojan(const char* link) {
         cJSON_AddItemToObject(outbound, "transport", t);
     }
     if (type) free(type);
-    
     char* security = GetQueryParam(query, "security");
-    // [ECH Refactor] 提取 ech 参数
-    char* ech = GetQueryParam(query, "ech");
-    if ((security && strcmp(security, "tls") == 0) || ech) {
+    if (security && strcmp(security, "tls") == 0) {
         cJSON* tlsObj = cJSON_CreateObject(); cJSON_AddBoolToObject(tlsObj, "enabled", cJSON_True);
         char* sni = GetQueryParam(query, "sni");
         if (sni) { cJSON_AddStringToObject(tlsObj, "server_name", sni); free(sni); }
         else cJSON_AddStringToObject(tlsObj, "server_name", host);
-        if (ech) { cJSON_AddStringToObject(tlsObj, "ech", ech); free(ech); }
         cJSON_AddItemToObject(outbound, "tls", tlsObj);
     }
     if (security) free(security);
     free(uuid); free(host); free(tag); return outbound;
 }
 
+// [新增] Mandala 链接解析函数
 cJSON* ParseMandala(const char* link) {
     if (strncmp(link, "mandala://", 10) != 0) return NULL;
+    
+    // 格式: mandala://uuid@host:port?params#remark
     const char* p = link + 10; 
     const char* at = strchr(p, '@'); 
     if (!at) return NULL;
 
+    // 1. 提取 UUID (作为密码)
     int uuidLen = (int)(at - p); 
     char* uuid = (char*)malloc(uuidLen + 1); 
     strncpy(uuid, p, uuidLen); 
     uuid[uuidLen] = 0;
 
+    // 2. 提取 Host 和 Port
     p = at + 1; 
     const char* colon = strchr(p, ':'); 
     const char* qMark = strchr(p, '?'); 
     const char* hash = strchr(p, '#');
     
+    // [Fix] 统一的 hostEnd 计算逻辑
     const char* hostEnd = colon;
     if (!hostEnd || (qMark && qMark < hostEnd)) hostEnd = qMark;
     if (!hostEnd || (hash && hash < hostEnd)) hostEnd = hash;
@@ -643,23 +682,30 @@ cJSON* ParseMandala(const char* link) {
     
     int portNum = portStart ? atoi(portStart) : 443;
 
+    // 3. 提取 Tag (备注)
     char* tag = hash ? (char*)malloc(strlen(hash+1)+1) : strdup("Mandala");
     if(hash) UrlDecode(tag, hash+1);
 
+    // 4. 构建 JSON
     cJSON* outbound = cJSON_CreateObject();
-    cJSON_AddStringToObject(outbound, "type", "mandala"); 
+    cJSON_AddStringToObject(outbound, "type", "mandala"); // 类型标记为 mandala
     cJSON_AddStringToObject(outbound, "tag", tag);
     cJSON_AddStringToObject(outbound, "server", host); 
     cJSON_AddNumberToObject(outbound, "server_port", portNum);
-    cJSON_AddStringToObject(outbound, "password", uuid); 
+    cJSON_AddStringToObject(outbound, "password", uuid); // Mandala 使用 password 字段存储 ID
 
+    // 5. 解析参数
     const char* query = qMark ? qMark + 1 : NULL;
+    
+    // 解析 WebSocket
     char* type = GetQueryParam(query, "type");
     if (type && strcmp(type, "ws") == 0) {
         cJSON* t = cJSON_CreateObject(); 
         cJSON_AddStringToObject(t, "type", "ws");
+        
         char* path = GetQueryParam(query, "path");
         if (path) { cJSON_AddStringToObject(t, "path", path); free(path); }
+        
         char* hHeader = GetQueryParam(query, "host");
         if (hHeader) {
             cJSON* headers = cJSON_CreateObject(); 
@@ -671,15 +717,16 @@ cJSON* ParseMandala(const char* link) {
     }
     if (type) free(type);
 
+    // 解析 TLS
     char* security = GetQueryParam(query, "security");
-    char* ech = GetQueryParam(query, "ech"); // [ECH Refactor]
-    if ((security && strcmp(security, "tls") == 0) || ech) {
+    if (security && strcmp(security, "tls") == 0) {
         cJSON* tlsObj = cJSON_CreateObject(); 
         cJSON_AddBoolToObject(tlsObj, "enabled", cJSON_True);
+        
         char* sni = GetQueryParam(query, "sni");
         if (sni) { cJSON_AddStringToObject(tlsObj, "server_name", sni); free(sni); }
         else cJSON_AddStringToObject(tlsObj, "server_name", host);
-        if (ech) { cJSON_AddStringToObject(tlsObj, "ech", ech); free(ech); }
+        
         cJSON_AddItemToObject(outbound, "tls", tlsObj);
     }
     if (security) free(security);
@@ -687,4 +734,3 @@ cJSON* ParseMandala(const char* link) {
     free(uuid); free(host); free(tag); 
     return outbound;
 }
-
