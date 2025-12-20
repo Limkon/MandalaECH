@@ -329,7 +329,7 @@ static char* InternalHttpsGet(const char* url, BOOL useProxy, int* out_len_binar
     }
     resp_buf[total_read] = 0;
 
-    // [Fix] 检查 HTTP 200 OK
+    // [Fix] 检查 HTTP 200 OK，防止把 404/403 页面当作密钥
     if (!strstr(resp_buf, "HTTP/1.1 200") && !strstr(resp_buf, "HTTP/1.0 200") && !strstr(resp_buf, "HTTP/2 200")) {
         log_msg("[Utils] HTTP Request Failed (Not 200 OK). Url: %s", url);
         free(resp_buf); resp_buf = NULL;
@@ -409,7 +409,7 @@ char* FetchECHFromDoH(const char* dohUrl, const char* sni) {
     int pos = 12; // Skip DNS Header
     while (pos < resp_len && resp[pos] != 0) {
         int label_len = resp[pos];
-        if (pos + label_len + 1 > resp_len) { free(resp); return NULL; } // Safety
+        if (pos + label_len + 1 > resp_len) { free(resp); return NULL; } 
         pos += label_len + 1; 
     }
     pos += 5; // Null(1) + QTYPE(2) + QCLASS(2)
@@ -418,7 +418,6 @@ char* FetchECHFromDoH(const char* dohUrl, const char* sni) {
     int ancount = (resp[6] << 8) | resp[7];
     for (int i = 0; i < ancount; i++) {
         if (pos >= resp_len) break;
-        // Skip Name
         if ((resp[pos] & 0xC0) == 0xC0) { pos += 2; } 
         else {
             while (pos < resp_len && resp[pos] != 0) {
@@ -444,7 +443,7 @@ char* FetchECHFromDoH(const char* dohUrl, const char* sni) {
             else {
                 while (rpos < rdlen && rdata[rpos] != 0) {
                     int l = rdata[rpos];
-                    if (rpos + l + 1 > rdlen) break; // 防止越界
+                    if (rpos + l + 1 > rdlen) break; 
                     rpos += l + 1;
                 }
                 rpos++;
@@ -457,14 +456,11 @@ char* FetchECHFromDoH(const char* dohUrl, const char* sni) {
                 if (rpos + vlen > rdlen) break;
                 
                 if (key == 5) { 
-                    // [Debug] 打印 ECH Version 前两个字节 (Hex)
-                    if (vlen >= 2) {
-                        log_msg("[ECH] Found Config. Version: %02X%02X", rdata[rpos], rdata[rpos+1]);
-                    }
                     int b64len = (vlen * 4 / 3) + 8;
                     char* out = (char*)malloc(b64len);
                     Base64Encode(rdata + rpos, vlen, out); 
                     free(resp);
+                    log_msg("[ECH] Found config, len: %d (base64 len: %d)", vlen, strlen(out));
                     return out;
                 }
                 rpos += vlen;
