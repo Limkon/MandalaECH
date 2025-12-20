@@ -752,6 +752,10 @@ LRESULT CALLBACK LogWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_COMMAND:
             if (LOWORD(wParam) == ID_LOG_CHK) {
                 g_enableLog = (IsDlgButtonChecked(hWnd, ID_LOG_CHK) == BST_CHECKED);
+                // [Fix] 切换开关时增加日志提示，给用户反馈
+                if (g_enableLog) {
+                    log_msg("[System] 日志记录已开启。");
+                }
             }
             break;
 
