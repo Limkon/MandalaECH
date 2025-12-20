@@ -339,8 +339,9 @@ long long check_ws_frame(unsigned char *in, int len, int *head_len, int *payload
     
     if (in[1] & 0x80) hl += 4; 
 
-    if (pl > BUFFER_SIZE) {
-        log_msg("[Err] WS Frame too large: %llu (Max: %d). Dropping connection.", pl, BUFFER_SIZE);
+    // [Refactor] 检查逻辑修改为 MAX_WS_FRAME_SIZE
+    if (pl > MAX_WS_FRAME_SIZE) {
+        log_msg("[Err] WS Frame too large: %llu (Max: %d). Dropping connection.", pl, MAX_WS_FRAME_SIZE);
         return -1; 
     }
 
