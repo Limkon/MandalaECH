@@ -168,12 +168,11 @@ static BOOL ParseUrl(const char* url, URL_COMP* out) {
     if (sl) strcpy(out->path, sl); else strcpy(out->path, "/"); return TRUE;
 }
 
-// [新功能] Chunked 数据解码器
-// 将 raw_body (包含 hex 长度行) 解码为纯净数据到 new_body
+// [智能功能] Chunked 数据解码器
+// 解析 HTTP 分块传输编码，还原原始数据
 static char* DechunkBody(const char* raw_body, int raw_len, int* out_len) {
     if (!raw_body || raw_len <= 0) return NULL;
-    
-    char* new_buf = (char*)malloc(raw_len + 1); // 分配最大可能空间
+    char* new_buf = (char*)malloc(raw_len + 1); 
     if (!new_buf) return NULL;
     
     int write_pos = 0;
@@ -181,10 +180,10 @@ static char* DechunkBody(const char* raw_body, int raw_len, int* out_len) {
     const char* end = raw_body + raw_len;
     
     while (p < end) {
-        // 读取 Chunk Size (Hex)
+        // 读取块大小 (Hex)
         char hex_str[16] = {0};
         const char* eol = strstr(p, "\r\n");
-        if (!eol) break; // 格式错误或结束
+        if (!eol) break; 
         
         int hex_len = (int)(eol - p);
         if (hex_len > 15) hex_len = 15;
@@ -228,7 +227,7 @@ static char* InternalHttpsGet(const char* url, BOOL useProxy, int* out_len) {
     SSL *ssl = SSL_new(ctx); SSL_set_fd(ssl, (int)s); SSL_set_tlsext_host_name(ssl, u.host);
     if (SSL_connect(ssl) != 1) { SSL_free(ssl); SSL_CTX_free(ctx); closesocket(s); return NULL; }
 
-    // [恢复] 使用 HTTP/1.1
+    // [智能] 使用 HTTP/1.1
     char req[4096]; const char* acc = out_len ? "application/dns-message" : "*/*";
     snprintf(req, 4096, "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mandala/1.0\r\nAccept: %s\r\nConnection: close\r\n\r\n", u.path, u.host, acc);
     SSL_write(ssl, req, strlen(req));
@@ -245,8 +244,8 @@ static char* InternalHttpsGet(const char* url, BOOL useProxy, int* out_len) {
         free(resp); SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); closesocket(s); return NULL; 
     }
 
-    // 检查是否 Chunked
-    BOOL isChunked = (strstr(resp, "Transfer-Encoding: chunked") != NULL);
+    // 检查是否 Chunked (不区分大小写简单检查)
+    BOOL isChunked = (strstr(resp, "Transfer-Encoding: chunked") != NULL) || (strstr(resp, "transfer-encoding: chunked") != NULL);
 
     char* body = strstr(resp, "\r\n\r\n"); if (!body) body = strstr(resp, "\n\n");
     char* final_res = NULL;
@@ -257,7 +256,7 @@ static char* InternalHttpsGet(const char* url, BOOL useProxy, int* out_len) {
         
         if (raw_len > 0) {
             if (isChunked) {
-                // [智能] 如果是 Chunked，解码它
+                // [智能] 解码 Chunked 数据
                 int dechunked_len = 0;
                 final_res = DechunkBody(body, raw_len, &dechunked_len);
                 if (out_len) *out_len = dechunked_len;
