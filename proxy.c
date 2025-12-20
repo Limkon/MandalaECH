@@ -46,14 +46,24 @@ int recv_timeout(SOCKET s, char *buf, int len, int timeout_sec) {
     return recv(s, buf, len, 0);
 }
 
-// 发送全部数据辅助函数
+// [Refactor] 发送全部数据辅助函数 (移除 Busy Wait)
 int send_all(SOCKET s, const char *buf, int len) {
     int total = 0; int bytesleft = len; int n;
     while(total < len) {
         n = send(s, buf+total, bytesleft, 0);
         if (n == -1) {
             int err = WSAGetLastError();
-            if (err == WSAEWOULDBLOCK) { Sleep(1); continue; }
+            if (err == WSAEWOULDBLOCK) { 
+                // [Optimization] 使用 select 等待 Socket 可写，替代 Sleep(1)
+                fd_set wfd; 
+                FD_ZERO(&wfd); 
+                FD_SET(s, &wfd);
+                struct timeval tv = { 1, 0 }; // 1秒超时，防止死锁
+                int res = select(0, NULL, &wfd, NULL, &tv);
+                if (res > 0) continue; // Socket 可写，重试发送
+                if (res == 0) continue; // 超时，继续重试或根据需要处理
+                return -1; // select 错误
+            }
             return -1;
         }
         total += n; bytesleft -= n;
@@ -452,8 +462,7 @@ DWORD WINAPI client_handler(LPVOID p) {
         
         if (FD_ISSET(r, &fds) || pending > 0) {
             // [Refactor] 动态扩容逻辑
-            // 检查剩余空间是否足够，如果空间快满了，则扩容
-            if (ws_buf_len >= ws_read_buf_cap - 1024) { // 预留一点空间以防万一
+            if (ws_buf_len >= ws_read_buf_cap - 1024) { 
                 if (ws_read_buf_cap < MAX_WS_FRAME_SIZE) {
                     int new_cap = ws_read_buf_cap * 2;
                     if (new_cap > MAX_WS_FRAME_SIZE) new_cap = MAX_WS_FRAME_SIZE;
@@ -468,7 +477,6 @@ DWORD WINAPI client_handler(LPVOID p) {
                         ws_read_buf_cap = new_cap;
                     }
                 } else {
-                    // 如果已经达到最大限制且缓冲区满了，说明帧太大或者处理不及时
                     if (ws_buf_len >= MAX_WS_FRAME_SIZE) goto cl_end;
                 }
             }
@@ -515,7 +523,6 @@ DWORD WINAPI client_handler(LPVOID p) {
             } else { 
                 // [Refactor] 如果缓冲区已满但仍未解析出完整帧（说明帧大小 > 当前容量）
                 if (ws_buf_len >= ws_read_buf_cap) {
-                     // 此时会触发外层的扩容逻辑；但如果已经达到 MAX_WS_FRAME_SIZE，则会在下一次循环或扩容检查中失败
                      if (ws_read_buf_cap >= MAX_WS_FRAME_SIZE) goto cl_end;
                 }
                 break; 
