@@ -8,8 +8,15 @@
 #define _UNICODE
 #endif
 
+// [Fix] 添加宏定义检查，防止与系统头文件冲突导致的重定义警告
+#ifndef _WIN32_IE
 #define _WIN32_IE 0x0601
+#endif
+
+#ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0601
+#endif
+
 #define WIN32_LEAN_AND_MEAN
 #define MAX_CONNECTIONS 512
 
@@ -162,5 +169,3 @@ void InitGlobalLocks();
 void DeleteGlobalLocks();
 
 #endif // COMMON_H
-
-
