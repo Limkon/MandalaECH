@@ -92,8 +92,16 @@ DWORD WINAPI client_handler(LPVOID p) {
     ProxyConfig localConfig = ctx->config; // 线程本地副本
     free(ctx); 
 
-    // [ECH Logic] 自动获取 ECH
-    // 如果配置了伪装域名 (Outer SNI)，则启用 ECH 流程
+    // [Fix] 定义用于 TLS 握手的 SNI (Outer SNI)
+    // 初始值设为配置中的 SNI，如果没有配置则使用目标 host
+    char tls_handshake_sni[256];
+    if (strlen(localConfig.sni) > 0) {
+        strncpy(tls_handshake_sni, localConfig.sni, sizeof(tls_handshake_sni));
+    } else {
+        strncpy(tls_handshake_sni, localConfig.host, sizeof(tls_handshake_sni));
+    }
+
+    // [ECH Logic] 处理 ECH 逻辑
     if (strlen(localConfig.outer_sni) > 0) {
         log_msg("[ECH] Processing Outer SNI: %s", localConfig.outer_sni);
         
@@ -102,7 +110,6 @@ DWORD WINAPI client_handler(LPVOID p) {
             char* dynEch = FetchECHFromDoH(g_dohUrl, localConfig.outer_sni);
             if (dynEch) {
                 log_msg("[ECH] Auto-fetched ECH config from DoH");
-                // 更新本地副本的 ECH
                 snprintf(localConfig.ech, sizeof(localConfig.ech), "%s", dynEch);
                 free(dynEch);
             } else {
@@ -110,9 +117,9 @@ DWORD WINAPI client_handler(LPVOID p) {
             }
         }
         
-        // 2. 将 Outer SNI 设为本次 TLS 连接的握手 SNI (明文部分)
-        // 真实的 SNI (host) 将被封装在 ECH 内部
-        snprintf(localConfig.sni, sizeof(localConfig.sni), "%s", localConfig.outer_sni);
+        // 2. 将 Outer SNI 设为本次 TLS 连接的明文握手 SNI
+        // 真实的域名 (localConfig.host) 将通过 ECH 扩展加密封装
+        snprintf(tls_handshake_sni, sizeof(tls_handshake_sni), "%s", localConfig.outer_sni);
     }
 
     TLSContext tls; 
@@ -213,21 +220,15 @@ DWORD WINAPI client_handler(LPVOID p) {
         } else { goto cl_end; }
     }
     
-    // 连接到代理服务器
-    // 注意：如果使用了 ECH，host 字段可能是真实目标域名，DNS 解析应该解析它
-    // 或者，为了防止 DNS 泄漏，应该解析 Outer SNI 对应的 IP
-    // 这里简单起见，我们解析配置文件中的 host (真实目标)
-    // 更好的做法：如果 ECH 开启，解析 Outer SNI (config.sni) 的 IP
-    const char* connect_host = localConfig.host;
-    if (strlen(localConfig.outer_sni) > 0) {
-        connect_host = localConfig.outer_sni;
-    }
+    // 2. 连接到代理服务器
+    // 如果启用了 ECH，我们需要连接到伪装域名（CDN 节点）对应的 IP
+    const char* connect_target = (strlen(localConfig.outer_sni) > 0) ? localConfig.outer_sni : localConfig.host;
     
-    h = gethostbyname(connect_host);
+    h = gethostbyname(connect_target);
     if(!h) { 
-        // Fallback: try original host if outer sni failed
+        // Fallback: 如果伪装域名解析失败，尝试原始配置域名
         h = gethostbyname(localConfig.host);
-        if (!h) { log_msg("[Err] DNS Fail: %s", connect_host); goto cl_end; }
+        if (!h) { log_msg("[Err] DNS Fail: %s", connect_target); goto cl_end; }
     }
 
     for (retry_count = 0; retry_count < 3; retry_count++) {
@@ -244,8 +245,8 @@ DWORD WINAPI client_handler(LPVOID p) {
         
         if (connect(r, (struct sockaddr*)&a, sizeof(a)) == 0) {
             tls.sock = r;
-            // [ECH Refactor] 传递本地配置的 SNI (可能是 Outer SNI), Host (Inner SNI) 和 ECH 配置
-            if (tls_init_connect(&tls, localConfig.sni, localConfig.host, localConfig.ech) == 0) break;
+            // [Fix] 传入分离后的 tls_handshake_sni 用于握手，localConfig.host 仅用于 ECH 内部识别
+            if (tls_init_connect(&tls, tls_handshake_sni, localConfig.host, localConfig.ech) == 0) break;
             else tls_close(&tls);
         }
         closesocket(r); r = INVALID_SOCKET;
@@ -255,6 +256,7 @@ DWORD WINAPI client_handler(LPVOID p) {
     if (r == INVALID_SOCKET || tls.ssl == NULL) goto cl_end;
     
     // 3. WebSocket 握手
+    // [Fix] 这里的 Host 头部必须是真实的目标域名，否则服务器会返回 403
     sni_val = (strlen(localConfig.sni) > 0) ? localConfig.sni : localConfig.host;
     req_path = (strlen(localConfig.path) > 0) ? localConfig.path : "/";
     
@@ -281,7 +283,7 @@ DWORD WINAPI client_handler(LPVOID p) {
     ws_read_buf[len] = 0;
     
     if (!strstr(ws_read_buf, "101")) { 
-        log_msg("[Err] WS Handshake Fail: %.50s", ws_read_buf);
+        log_msg("[Err] WS Handshake Fail: %.100s", ws_read_buf);
         goto cl_end; 
     }
     
@@ -572,4 +574,3 @@ void StopProxyCore() {
     if (hProxyThread) { WaitForSingleObject(hProxyThread, 2000); CloseHandle(hProxyThread); hProxyThread = NULL; }
     log_msg("Proxy Stopped");
 }
-
