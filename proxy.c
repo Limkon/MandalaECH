@@ -768,3 +768,4 @@ void StopProxyCore() {
         hProxyThread = NULL; 
     }
     log_msg("Proxy Stopped");
+}
