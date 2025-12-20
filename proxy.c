@@ -1,10 +1,10 @@
 #include "proxy.h"
 #include "crypto.h"
-#include "utils.h" // 包含此头文件以引用 FetchECHFromDoH
+#include "utils.h" 
 #include <ws2tcpip.h>
 #include <openssl/sha.h>
 
-// [Concurrency Fix] 客户端线程上下文
+// 客户端线程上下文
 typedef struct {
     SOCKET clientSock;
     ProxyConfig config;
@@ -12,7 +12,7 @@ typedef struct {
 
 extern char g_dohUrl[512];
 
-// --- 辅助函数：解析 UUID ---
+// --- 辅助函数 ---
 void parse_uuid(const char* uuid_str, unsigned char* out) {
     const char* p = uuid_str;
     int i = 0;
@@ -25,12 +25,11 @@ void parse_uuid(const char* uuid_str, unsigned char* out) {
             out[i++] = (unsigned char)v;
             p += 2;
         } else {
-            p++; // 跳过非十六进制字符
+            p++; 
         }
     }
 }
 
-// --- 辅助函数：Trojan 密码哈希 ---
 void trojan_password_hash(const char* password, char* out_hex) {
     unsigned char digest[SHA224_DIGEST_LENGTH];
     SHA224((unsigned char*)password, strlen(password), digest);
@@ -40,7 +39,6 @@ void trojan_password_hash(const char* password, char* out_hex) {
     out_hex[SHA224_DIGEST_LENGTH * 2] = 0;
 }
 
-// 接收超时辅助函数
 int recv_timeout(SOCKET s, char *buf, int len, int timeout_sec) {
     fd_set fds; FD_ZERO(&fds); FD_SET(s, &fds);
     struct timeval tv = { timeout_sec, 0 };
@@ -49,7 +47,6 @@ int recv_timeout(SOCKET s, char *buf, int len, int timeout_sec) {
     return recv(s, buf, len, 0);
 }
 
-// 发送全部数据辅助函数
 int send_all(SOCKET s, const char *buf, int len) {
     int total = 0; int bytesleft = len; int n;
     while(total < len) {
@@ -64,7 +61,6 @@ int send_all(SOCKET s, const char *buf, int len) {
     return total;
 }
 
-// --- Base64 编码 (用于生成随机 WS Key) ---
 void base64_encode_key(const unsigned char* src, char* dst) {
     const char* table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     for(int i=0; i<16; i+=3) {
@@ -79,34 +75,37 @@ void base64_encode_key(const unsigned char* src, char* dst) {
     *dst = 0;
 }
 
-// --- 客户端处理线程 (核心逻辑) ---
+// --- 客户端处理线程 ---
 DWORD WINAPI client_handler(LPVOID p) {
     ClientContext* ctx = (ClientContext*)p;
     if (!ctx) return 0;
 
     SOCKET c = ctx->clientSock;
-    ProxyConfig localConfig = ctx->config; // 线程本地副本
+    ProxyConfig localConfig = ctx->config; 
     free(ctx); 
 
-    // [ECH Logic] 自动获取 ECH
-    // 如果配置了伪装域名 (Outer SNI)，说明用户希望使用 ECH 相关的抗封锁功能
+    // [ECH Logic Update] 参考 ech-workers.go
+    // ECH 的核心逻辑是：
+    // 1. 获取 Outer SNI (如 cloudflare-ech.com) 的 ECH 配置
+    // 2. 使用该配置加密 ClientHello
+    // 3. ClientHello 的 Inner SNI 是真实的 Worker 域名
     if (strlen(localConfig.outer_sni) > 0) {
         
-        // 1. 如果没有配置静态 ECH，尝试从 DoH 获取
-        // [Critical Fix] 必须查询“真实目标域名”(localConfig.sni) 的 keys，而不是伪装域名的 keys
+        // 如果没有配置静态 ECH，尝试从 DoH 获取
         if (strlen(localConfig.ech) == 0) {
-            // 如果 SNI 为空，则使用 Host
-            const char* target_domain = (strlen(localConfig.sni) > 0) ? localConfig.sni : localConfig.host;
+            // [Critical Fix] 必须查询 Outer SNI 的 keys
+            // Cloudflare Worker 通常共用 cloudflare-ech.com 的密钥
+            const char* ech_provider = localConfig.outer_sni;
             
-            log_msg("[ECH] Fetching keys for target: %s", target_domain);
-            char* dynEch = FetchECHFromDoH(g_dohUrl, target_domain);
+            log_msg("[ECH] Fetching keys for provider: %s", ech_provider);
+            char* dynEch = FetchECHFromDoH(g_dohUrl, ech_provider);
             
             if (dynEch) {
-                log_msg("[ECH] Success. Got ECH config for %s", target_domain);
+                log_msg("[ECH] Success. Got ECH config for %s", ech_provider);
                 snprintf(localConfig.ech, sizeof(localConfig.ech), "%s", dynEch);
                 free(dynEch);
             } else {
-                log_msg("[ECH] Failed to fetch ECH for %s. Connection may fail or fallback to plain SNI.", target_domain);
+                log_msg("[ECH] Failed to fetch ECH for %s. Connection may fail.", ech_provider);
             }
         }
     }
@@ -164,7 +163,7 @@ DWORD WINAPI client_handler(LPVOID p) {
     if (!c_buf || !ws_read_buf || !ws_send_buf) goto cl_end; 
     setsockopt(c, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
     
-    // 1. 读取浏览器首包
+    // 读取浏览器首包
     browser_len = recv_timeout(c, c_buf, BUFFER_SIZE, 10);
     if (browser_len <= 0) goto cl_end; 
     c_buf[browser_len] = 0;
@@ -211,9 +210,7 @@ DWORD WINAPI client_handler(LPVOID p) {
     
     // 连接到代理服务器
     // [Connection Strategy] 
-    // 1. 如果配置了 Outer SNI (伪装域名)，则连接到该伪装域名的 IP (通常是 CDN 节点)。
-    // 2. 否则，连接到真实 Host 的 IP。
-    // 这允许我们在不知道真实目标 IP (或被污染) 的情况下，通过连接到 CDN 边缘节点来访问目标。
+    // 优先连接 Outer SNI (Public IP)，例如 Cloudflare 的 IP
     const char* connect_host = localConfig.host;
     if (strlen(localConfig.outer_sni) > 0) {
         connect_host = localConfig.outer_sni;
@@ -239,7 +236,9 @@ DWORD WINAPI client_handler(LPVOID p) {
         
         if (connect(r, (struct sockaddr*)&a, sizeof(a)) == 0) {
             tls.sock = r;
-            // [ECH] 传递 Inner SNI (真实目标) 和 对应的 ECH 配置
+            // [ECH] 
+            // Inner SNI = localConfig.sni (例如 worker 域名)
+            // Outer SNI = 自动从 ECH Config (来自 localConfig.ech) 提取
             if (tls_init_connect(&tls, localConfig.sni, localConfig.host, localConfig.ech) == 0) break;
             else tls_close(&tls);
         }
@@ -280,7 +279,7 @@ DWORD WINAPI client_handler(LPVOID p) {
         goto cl_end; 
     }
     
-    // 检查 Early Data (粘包)
+    // 检查 Early Data
     char* body_start = strstr(ws_read_buf, "\r\n\r\n");
     ws_buf_len = 0;
     if (body_start) {
@@ -294,7 +293,7 @@ DWORD WINAPI client_handler(LPVOID p) {
         }
     }
     
-    // 4. 发送代理协议头 (使用 localConfig)
+    // 4. 发送代理协议头
     is_vless = (_stricmp(localConfig.type, "vless") == 0);
     is_trojan = (_stricmp(localConfig.type, "trojan") == 0);
     is_shadowsocks = (_stricmp(localConfig.type, "shadowsocks") == 0);
