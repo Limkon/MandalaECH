@@ -4,18 +4,19 @@
 #include "common.h"
 #include <openssl/sha.h>
 
-// [Safety] 全局活跃连接计数器，防止线程爆炸
+// [Safety] 全局活躍連接計數器，防止線程爆炸
 static volatile LONG g_active_connections = 0;
 
-// [Concurrency Fix] 客户端线程上下文，保存配置副本
-// 生产级修正：将所有可能在运行时变更的全局配置都进行快照
+// [Concurrency Fix] 客戶端線程上下文
+// 保存所有配置的副本，確保 Worker 線程運行時不受 UI 修改全局變量的影響
 typedef struct {
     SOCKET clientSock;
-    ProxyConfig config;  // 完整的节点配置副本
-    char userAgent[512]; // 独立的 UA 副本
+    ProxyConfig config;          // 節點配置副本
+    char userAgent[512];         // User-Agent 副本
+    CryptoSettings cryptoSettings; // 加密層配置副本 (分片、填充等)
 } ClientContext;
 
-// --- 辅助函数：解析 UUID (支持带横杠或不带) ---
+// --- 輔助函數：解析 UUID (支持帶橫槓或不帶) ---
 void parse_uuid(const char* uuid_str, unsigned char* out) {
     const char* p = uuid_str;
     int i = 0;
@@ -28,12 +29,12 @@ void parse_uuid(const char* uuid_str, unsigned char* out) {
             out[i++] = (unsigned char)v;
             p += 2;
         } else {
-            p++; // 跳过非十六进制字符
+            p++; // 跳過非十六進制字符
         }
     }
 }
 
-// --- 辅助函数：Trojan 密码哈希 (SHA224) ---
+// --- 輔助函數：Trojan 密碼哈希 (SHA224) ---
 void trojan_password_hash(const char* password, char* out_hex) {
     unsigned char digest[SHA224_DIGEST_LENGTH];
     SHA224((unsigned char*)password, strlen(password), digest);
@@ -43,81 +44,90 @@ void trojan_password_hash(const char* password, char* out_hex) {
     out_hex[SHA224_DIGEST_LENGTH * 2] = 0;
 }
 
-// 接收超时辅助函数 (使用 select 避免阻塞)
-// 返回值: >0 接收字节数, 0 连接关闭, -1 错误, -2 超时
+// 接收超時輔助函數 (使用 select 避免阻塞)
+// 返回值: >0 接收字節數, 0 連接關閉, -1 錯誤, -2 超時
 int recv_timeout(SOCKET s, char *buf, int len, int timeout_sec) {
-    fd_set fds; FD_ZERO(&fds); FD_SET(s, &fds);
+    fd_set fds; 
+    FD_ZERO(&fds); 
+    FD_SET(s, &fds);
+    
     struct timeval tv = { timeout_sec, 0 };
     int n = select(0, &fds, NULL, NULL, &tv);
+    
     if (n == 0) return -2; // Timeout
     if (n < 0) return -1;  // Error
+    
     return recv(s, buf, len, 0);
 }
 
-// [Robustness Fix] 健壮的头部读取函数
-// 循环读取直到发现完整的 HTTP 头或 SOCKS 握手包
+// [Robustness Fix] 健壯的頭部讀取函數
+// 循環讀取直到發現完整的 HTTP 頭 (\r\n\r\n) 或 SOCKS 握手包
 int read_header_robust(SOCKET s, char* buf, int max_len, int timeout_sec) {
     int total_read = 0;
     int remaining_time = timeout_sec;
     
-    // 简单的超时控制，每次循环扣除估算时间
+    // 簡單的超時控制，每次循環扣除估算時間
     while (total_read < max_len - 1 && remaining_time > 0) {
-        // 每次最多等待 1 秒，检查是否有数据
+        // 每次最多等待 1 秒，檢查是否有數據
         int n = recv_timeout(s, buf + total_read, max_len - 1 - total_read, 1);
         
-        if (n == -2) { // 单次 select 超时
+        if (n == -2) { // 單次 select 超時
             remaining_time--;
             continue;
         }
-        if (n <= 0) return -1; // 连接关闭或错误
+        if (n <= 0) return -1; // 連接關閉或錯誤
         
         total_read += n;
-        buf[total_read] = 0; // 确保字符串安全结尾
+        buf[total_read] = 0; // 確保字符串安全結尾
 
-        // 1. 协议探测：SOCKS5
+        // 1. 協議探測：SOCKS5
         // SOCKS5 初始握手通常很短 (VER NMETHODS METHODS)，如 05 01 00
-        // 只要开头是 0x05 且长度足够，我们就可以认为读取到了关键信息
         if (buf[0] == 0x05) {
             if (total_read >= 2) return total_read; 
         }
-        // 2. 协议探测：HTTP
-        // 检查是否包含双换行，标志 HTTP Header 结束
+        // 2. 協議探測：HTTP
+        // 檢查是否包含雙換行，標誌 HTTP Header 結束
         else {
             if (strstr(buf, "\r\n\r\n")) return total_read;
         }
 
-        // 如果读取了太多数据仍未找到边界，可能是非标协议或攻击，强制中断
+        // 如果讀取了太多數據仍未找到邊界，可能是非標協議或攻擊，強制中斷
         if (total_read > 8192) break; 
     }
     return total_read > 0 ? total_read : -1;
 }
 
-// [Refactor] 发送全部数据辅助函数 (移除 Busy Wait)
+// [Refactor] 發送全部數據輔助函數 (移除 Busy Wait，使用 select)
 int send_all(SOCKET s, const char *buf, int len) {
-    int total = 0; int bytesleft = len; int n;
+    int total = 0; 
+    int bytesleft = len; 
+    int n;
+    
     while(total < len) {
         n = send(s, buf+total, bytesleft, 0);
         if (n == -1) {
             int err = WSAGetLastError();
             if (err == WSAEWOULDBLOCK) { 
-                // [Optimization] 使用 select 等待 Socket 可写
+                // [Optimization] 使用 select 等待 Socket 可寫
                 fd_set wfd; 
                 FD_ZERO(&wfd); 
                 FD_SET(s, &wfd);
-                struct timeval tv = { 1, 0 }; // 1秒超时
+                struct timeval tv = { 1, 0 }; // 1秒超時
+                
                 int res = select(0, NULL, &wfd, NULL, &tv);
-                if (res > 0) continue; // Socket 可写，重试发送
-                if (res == 0) continue; // 超时，继续重试
-                return -1; // select 错误
+                if (res > 0) continue; // Socket 可寫，重試發送
+                if (res == 0) continue; // 超時，繼續重試
+                return -1; // select 錯誤
             }
             return -1;
         }
-        total += n; bytesleft -= n;
+        total += n; 
+        bytesleft -= n;
     }
     return total;
 }
 
-// 调试日志
+// 調試日誌輔助
 void log_hex_simple(const char* tag, unsigned char* data, int len) {
     if (len <= 0) return;
     char buf[64] = {0};
@@ -129,7 +139,7 @@ void log_hex_simple(const char* tag, unsigned char* data, int len) {
     log_msg("%s %d bytes: %s...", tag, len, buf);
 }
 
-// --- Base64 编码 (用于生成随机 WS Key) ---
+// --- Base64 編碼 (用於生成隨機 WS Key) ---
 void base64_encode_key(const unsigned char* src, char* dst) {
     const char* table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     for(int i=0; i<16; i+=3) {
@@ -144,9 +154,9 @@ void base64_encode_key(const unsigned char* src, char* dst) {
     *dst = 0;
 }
 
-// --- 客户端处理线程 (核心逻辑) ---
+// --- 客戶端處理線程 (核心邏輯) ---
 DWORD WINAPI client_handler(LPVOID p) {
-    // [Safety] 连接数 +1
+    // [Safety] 連接數 +1
     InterlockedIncrement(&g_active_connections);
 
     ClientContext* ctx = (ClientContext*)p;
@@ -157,14 +167,14 @@ DWORD WINAPI client_handler(LPVOID p) {
 
     SOCKET c = ctx->clientSock;
     
-    // [Thread Safety] 完全使用线程局部的配置副本，不访问全局变量
+    // [Thread Safety] 完全使用線程局部的配置副本，不訪問全局變量
     ProxyConfig localConfig = ctx->config; 
+    CryptoSettings localCrypto = ctx->cryptoSettings;
     char localUserAgent[512];
-    // 使用 strncpy 确保安全
     strncpy(localUserAgent, ctx->userAgent, sizeof(localUserAgent)-1);
     localUserAgent[sizeof(localUserAgent)-1] = 0;
 
-    free(ctx); // 上下文数据已提取，立即释放
+    free(ctx); // 上下文數據已提取，立即釋放
 
     TLSContext tls; 
     SOCKET r = INVALID_SOCKET;      
@@ -173,7 +183,7 @@ DWORD WINAPI client_handler(LPVOID p) {
     char *ws_read_buf = NULL; 
     char *ws_send_buf = NULL; 
     
-    // [Refactor] 动态缓冲区状态变量
+    // [Refactor] 動態緩衝區狀態變量
     int ws_read_buf_cap = IO_BUFFER_SIZE; // 初始容量
     int ws_buf_len = 0; 
 
@@ -219,27 +229,27 @@ DWORD WINAPI client_handler(LPVOID p) {
     // 初始化
     memset(&tls, 0, sizeof(tls));
     
-    // [Refactor] 使用小缓冲区初始化，避免内存爆炸
+    // [Refactor] 使用小緩衝區初始化，避免內存爆炸
     c_buf = (char*)malloc(IO_BUFFER_SIZE); 
     ws_read_buf = (char*)malloc(ws_read_buf_cap); 
     ws_send_buf = (char*)malloc(IO_BUFFER_SIZE + 4096); 
 
     if (!c_buf || !ws_read_buf || !ws_send_buf) goto cl_end; 
+    
     setsockopt(c, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
     
-    // 1. [Robustness Fix] 读取浏览器首包 (使用循环读取确保完整性)
+    // 1. [Robustness Fix] 讀取瀏覽器首包 (使用循環讀取確保完整性)
     browser_len = read_header_robust(c, c_buf, IO_BUFFER_SIZE, 10);
     if (browser_len <= 0) goto cl_end; 
     c_buf[browser_len] = 0;
     
-    // 协议判断
+    // 協議判斷
     if (c_buf[0] == 0x05) { 
-        // Socks5 处理逻辑
-        send(c, "\x05\x00", 2, 0); // 无需认证
+        // Socks5 處理邏輯
+        send(c, "\x05\x00", 2, 0); // 無需認證
         is_socks5 = 1;
         
-        // 读取后续请求 (CMD)
-        // 注意：Socks5 的后续请求包也非常小，通常一次 recv 即可
+        // 讀取後續請求 (CMD)
         int n = recv_timeout(c, c_buf, IO_BUFFER_SIZE, 10);
         if (n <= 0) goto cl_end;
         browser_len = n;
@@ -255,7 +265,7 @@ DWORD WINAPI client_handler(LPVOID p) {
                  host[dlen] = 0;
                  port = ntohs(*(unsigned short*)&c_buf[5+dlen]);
              } else {
-                 // IPv6 暂略或不支持
+                 // IPv6 暫略或不支持
                  goto cl_end;
              }
              strcpy(method, "SOCKS5");
@@ -264,7 +274,7 @@ DWORD WINAPI client_handler(LPVOID p) {
         }
     } 
     else {
-        // HTTP/HTTPS 处理逻辑
+        // HTTP/HTTPS 處理邏輯
         if (sscanf(c_buf, "%15s %255s", method, host) == 2) {
             char *p = strchr(host, ':');
             if (p) { *p = 0; port = atoi(p+1); }
@@ -281,7 +291,7 @@ DWORD WINAPI client_handler(LPVOID p) {
         } else { goto cl_end; }
     }
     
-    // [Refactor] 使用 getaddrinfo 实现 DNS 解析
+    // [Refactor] 使用 getaddrinfo 實現 DNS 解析
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC; // 支持 IPv4 和 IPv6
     hints.ai_socktype = SOCK_STREAM;
@@ -294,9 +304,9 @@ DWORD WINAPI client_handler(LPVOID p) {
         goto cl_end;
     }
 
-    // 连接重试循环
+    // 連接重試循環
     for (retry_count = 0; retry_count < 3; retry_count++) {
-        // 遍历 DNS 返回的所有地址
+        // 遍歷 DNS 返回的所有地址
         for (ptr = res; ptr != NULL; ptr = ptr->ai_next) {
             r = socket(ptr->ai_family, ptr->ai_socktype, ptr->ai_protocol);
             if (r == INVALID_SOCKET) continue;
@@ -306,11 +316,11 @@ DWORD WINAPI client_handler(LPVOID p) {
             setsockopt(r, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout_ms, sizeof(int));
             setsockopt(r, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout_ms, sizeof(int));
 
-            // 尝试连接
+            // 嘗試連接
             if (connect(r, ptr->ai_addr, (int)ptr->ai_addrlen) == 0) {
                 tls.sock = r;
-                // [Security] 传递本地配置的 SNI 和 Host
-                if (tls_init_connect(&tls, localConfig.sni, localConfig.host) == 0) {
+                // [Security] 使用傳入的 localCrypto 參數進行 TLS 連接，支持分片/填充
+                if (tls_init_connect(&tls, localConfig.sni, localConfig.host, &localCrypto) == 0) {
                     break;
                 } else {
                     tls_close(&tls);
@@ -324,7 +334,7 @@ DWORD WINAPI client_handler(LPVOID p) {
         }
         
         if (r != INVALID_SOCKET && tls.ssl != NULL) break;
-        Sleep(200); // 重试间隔
+        Sleep(200); // 重試間隔
     }
     
     if (r == INVALID_SOCKET || tls.ssl == NULL) goto cl_end;
@@ -338,7 +348,7 @@ DWORD WINAPI client_handler(LPVOID p) {
     for(int i=0; i<16; i++) rnd_key[i] = rand() % 256;
     base64_encode_key(rnd_key, ws_key_str);
 
-    // [Fix] 使用线程本地的 localUserAgent
+    // [Fix] 使用線程本地的 localUserAgent
     offset = snprintf(ws_send_buf, IO_BUFFER_SIZE, 
         "GET %s HTTP/1.1\r\n"
         "Host: %s\r\n"
@@ -351,7 +361,7 @@ DWORD WINAPI client_handler(LPVOID p) {
 
     tls_write(&tls, ws_send_buf, offset);
 
-    // 读取 WS 响应
+    // 讀取 WS 響應
     len = tls_read(&tls, ws_read_buf, ws_read_buf_cap - 1);
     if (len <= 0) goto cl_end;
     ws_read_buf[len] = 0;
@@ -361,7 +371,7 @@ DWORD WINAPI client_handler(LPVOID p) {
         goto cl_end; 
     }
     
-    // 检查 Early Data (粘包)
+    // 檢查 Early Data (粘包)
     char* body_start = strstr(ws_read_buf, "\r\n\r\n");
     ws_buf_len = 0;
     if (body_start) {
@@ -375,7 +385,7 @@ DWORD WINAPI client_handler(LPVOID p) {
         }
     }
     
-    // 4. 发送代理协议头 (使用 localConfig)
+    // 4. 發送代理協議頭 (使用 localConfig)
     is_vless = (_stricmp(localConfig.type, "vless") == 0);
     is_trojan = (_stricmp(localConfig.type, "trojan") == 0);
     is_shadowsocks = (_stricmp(localConfig.type, "shadowsocks") == 0);
@@ -505,7 +515,7 @@ DWORD WINAPI client_handler(LPVOID p) {
         if (resp_buf[1] != 0x00) goto cl_end;
     }
     
-    // 5. 响应浏览器
+    // 5. 響應瀏覽器
     if (is_socks5) {
         unsigned char s5_ok[] = {0x05, 0x00, 0x00, 0x01, 0,0,0,0, 0,0};
         send(c, (char*)s5_ok, 10, 0);
@@ -522,18 +532,29 @@ DWORD WINAPI client_handler(LPVOID p) {
         tls_write(&tls, ws_send_buf, flen);
     }
     
-    // 6. 转发循环
-    ioctlsocket(c, FIONBIO, &mode); ioctlsocket(r, FIONBIO, &mode);
+    // 6. 轉發循環
+    ioctlsocket(c, FIONBIO, &mode); 
+    ioctlsocket(r, FIONBIO, &mode);
 
     while(1) {
-        FD_ZERO(&fds); FD_SET(c, &fds); FD_SET(r, &fds);
+        FD_ZERO(&fds); 
+        FD_SET(c, &fds); 
+        FD_SET(r, &fds);
+        
         int pending = SSL_pending(tls.ssl);
-        tv.tv_sec = 1; tv.tv_usec = 0;
-        if (pending > 0 || ws_buf_len > 0) { tv.tv_sec = 0; tv.tv_usec = 0; }
+        tv.tv_sec = 1; 
+        tv.tv_usec = 0;
+        
+        // 如果有緩存數據，立即處理，不等待 select
+        if (pending > 0 || ws_buf_len > 0) { 
+            tv.tv_sec = 0; 
+            tv.tv_usec = 0; 
+        }
         
         int n = select(0, &fds, NULL, NULL, &tv);
         if (n < 0) break;
         
+        // 瀏覽器 -> 代理服務器
         if (FD_ISSET(c, &fds)) {
             // [Refactor] Recv 使用 IO_BUFFER_SIZE
             len = recv(c, c_buf, IO_BUFFER_SIZE, 0);
@@ -549,9 +570,10 @@ DWORD WINAPI client_handler(LPVOID p) {
             }
         }
         
+        // 代理服務器 -> 瀏覽器
         if (FD_ISSET(r, &fds) || pending > 0) {
-            // [Refactor] 动态扩容逻辑
-            // 检查剩余空间是否足够，如果空间快满了，则扩容
+            // [Refactor] 動態擴容邏輯
+            // 檢查剩餘空間是否足夠，如果空間快滿了，則擴容
             if (ws_buf_len >= ws_read_buf_cap - 1024) { 
                 if (ws_read_buf_cap < MAX_WS_FRAME_SIZE) {
                     int new_cap = ws_read_buf_cap * 2;
@@ -567,7 +589,7 @@ DWORD WINAPI client_handler(LPVOID p) {
                         ws_read_buf_cap = new_cap;
                     }
                 } else {
-                    // 如果已经达到最大限制且缓冲区满了，说明帧太大或者处理不及时
+                    // 如果已經達到最大限制且緩衝區滿了，說明幀太大或者處理不及時
                     if (ws_buf_len >= MAX_WS_FRAME_SIZE) goto cl_end;
                 }
             }
@@ -581,15 +603,20 @@ DWORD WINAPI client_handler(LPVOID p) {
             }
         }
         
+        // 解析 WebSocket 幀
         while (ws_buf_len > 0) {
             frame_total = check_ws_frame((unsigned char*)ws_read_buf, ws_buf_len, &hl, &pl);
             if (frame_total < 0) goto cl_end;
             if (frame_total > 0) {
                 int opcode = ws_read_buf[0] & 0x0F;
-                if (opcode == 0x8) goto cl_end; 
+                if (opcode == 0x8) goto cl_end; // Close Frame
+                
+                // Text or Binary Frame
                 if ((opcode == 0x1 || opcode == 0x2) && pl > 0) {
                     char* payload_ptr = ws_read_buf + hl;
                     int payload_size = pl;
+                    
+                    // VLESS 響應頭剝離邏輯
                     if (is_vless && !vless_response_header_stripped) {
                         if (payload_size >= 2) {
                             int addon_len = (unsigned char)payload_ptr[1];
@@ -599,24 +626,27 @@ DWORD WINAPI client_handler(LPVOID p) {
                                 payload_size -= head_size;
                                 vless_response_header_stripped = 1;
                             } else { 
-                                payload_size = 0; 
+                                payload_size = 0; // 數據不足，等待下一幀
                             }
                         } else { payload_size = 0; }
                     }
+                    
                     if (payload_size > 0) {
                         if (send_all(c, payload_ptr, payload_size) < 0) goto cl_end;
                     }
                 }
+                
+                // 移除已處理的幀
                 if (frame_total < ws_buf_len) {
                     memmove(ws_read_buf, ws_read_buf + frame_total, ws_buf_len - frame_total);
                 }
                 ws_buf_len -= (int)frame_total;
             } else { 
-                // [Refactor] 如果缓冲区已满但仍未解析出完整帧（说明帧大小 > 当前容量）
+                // [Refactor] 如果緩衝區已滿但仍未解析出完整幀（說明幀大小 > 當前容量）
                 if (ws_buf_len >= ws_read_buf_cap) {
                      if (ws_read_buf_cap >= MAX_WS_FRAME_SIZE) goto cl_end;
                 }
-                break; 
+                break; // 數據不完整，等待更多數據
             }
         }
     }
@@ -626,49 +656,71 @@ cl_end:
     if (c_buf) free(c_buf); 
     if (ws_read_buf) free(ws_read_buf); 
     if (ws_send_buf) free(ws_send_buf); 
+    
     tls_close(&tls);
+    
     if (r != INVALID_SOCKET) closesocket(r); 
     if (c != INVALID_SOCKET) closesocket(c);
     
-    // [Safety] 连接数 -1
+    // [Safety] 連接數 -1
     InterlockedDecrement(&g_active_connections);
     return 0;
 }
 
-// 监听线程与管理函数
+// 監聽線程與管理函數
 DWORD WINAPI server_thread(LPVOID p) {
     g_listen_sock = socket(AF_INET, SOCK_STREAM, 0);
-    struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET; addr.sin_port = htons(g_localPort);
+    struct sockaddr_in addr; 
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET; 
+    addr.sin_port = htons(g_localPort);
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    int opt = 1; setsockopt(g_listen_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
+    
+    int opt = 1; 
+    setsockopt(g_listen_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
+    
     if (bind(g_listen_sock, (struct sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
-        log_msg("Port %d bind fail", g_localPort); g_proxyRunning = FALSE; return 0;
+        log_msg("Port %d bind fail", g_localPort); 
+        g_proxyRunning = FALSE; 
+        return 0;
     }
+    
     listen(g_listen_sock, 100);
     log_msg("Proxy Started: 127.0.0.1:%d", g_localPort);
     
     while(g_proxyRunning) {
         SOCKET c = accept(g_listen_sock, NULL, NULL);
         if (c != INVALID_SOCKET) {
-            // [Safety] 检查是否超过最大连接数
+            // [Safety] 檢查是否超過最大連接數
             if (g_active_connections >= MAX_CONNECTIONS) {
                 log_msg("[Warn] Max connections (%d) reached. Dropping request.", MAX_CONNECTIONS);
                 closesocket(c);
-                Sleep(10); // 稍微退避
+                Sleep(10); // 稍微退避，防止 CPU 空轉
                 continue;
             }
 
-            // [Concurrency Fix] 分配上下文并安全复制配置
+            // [Concurrency Fix] 分配上下文並複製配置
             ClientContext* ctx = (ClientContext*)malloc(sizeof(ClientContext));
             if (ctx) {
                 ctx->clientSock = c;
                 
-                // [Lock] 锁住全局变量，确保复制的原子性
+                // [Lock] 鎖住全局變量，確保複製的原子性
                 EnterCriticalSection(&g_configLock);
+                
                 ctx->config = g_proxyConfig; 
                 strncpy(ctx->userAgent, g_userAgentStr, sizeof(ctx->userAgent)-1);
                 ctx->userAgent[sizeof(ctx->userAgent)-1] = 0;
+                
+                // [Snapshot] 快照加密配置
+                ctx->cryptoSettings.enableFragment = g_enableFragment;
+                ctx->cryptoSettings.fragMin = g_fragSizeMin;
+                ctx->cryptoSettings.fragMax = g_fragSizeMax;
+                ctx->cryptoSettings.fragDelay = g_fragDelayMs;
+                ctx->cryptoSettings.enablePadding = g_enablePadding;
+                ctx->cryptoSettings.padMin = g_padSizeMin;
+                ctx->cryptoSettings.padMax = g_padSizeMax;
+                ctx->cryptoSettings.enableChromeCiphers = g_enableChromeCiphers;
+
                 LeaveCriticalSection(&g_configLock);
 
                 HANDLE hClient = CreateThread(NULL, 0, client_handler, (LPVOID)ctx, 0, NULL);
@@ -691,12 +743,22 @@ void StartProxyCore() {
     if (g_proxyRunning) return;
     g_proxyRunning = TRUE;
     hProxyThread = CreateThread(NULL, 0, server_thread, NULL, 0, NULL);
-    if (!hProxyThread) { log_msg("CreateThread Failed"); g_proxyRunning = FALSE; }
+    if (!hProxyThread) { 
+        log_msg("CreateThread Failed"); 
+        g_proxyRunning = FALSE; 
+    }
 }
 
 void StopProxyCore() {
     g_proxyRunning = FALSE;
-    if (g_listen_sock != INVALID_SOCKET) { closesocket(g_listen_sock); g_listen_sock = INVALID_SOCKET; }
-    if (hProxyThread) { WaitForSingleObject(hProxyThread, 2000); CloseHandle(hProxyThread); hProxyThread = NULL; }
+    if (g_listen_sock != INVALID_SOCKET) { 
+        closesocket(g_listen_sock); 
+        g_listen_sock = INVALID_SOCKET; 
+    }
+    if (hProxyThread) { 
+        WaitForSingleObject(hProxyThread, 2000); 
+        CloseHandle(hProxyThread); 
+        hProxyThread = NULL; 
+    }
     log_msg("Proxy Stopped");
 }
