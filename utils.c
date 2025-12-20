@@ -284,25 +284,41 @@ static char* InternalHttpsGet(const char* url, BOOL useProxy) {
     if (useProxy) log_msg("[Utils] Connecting via Proxy: %s:%d", targetHost, targetPort);
     else log_msg("[Utils] Connecting DIRECT to: %s:%d", targetHost, targetPort);
 
-    struct hostent *he = gethostbyname(targetHost);
-    if (!he) { log_msg("[Utils] DNS resolution failed for %s", targetHost); return NULL; }
+    // [Refactor] 使用 getaddrinfo 替代 gethostbyname (Step 3)
+    struct addrinfo hints, *res = NULL, *ptr = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC; 
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
 
-    s = socket(AF_INET, SOCK_STREAM, 0);
-    if (s == INVALID_SOCKET) return NULL;
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%d", targetPort);
 
-    DWORD timeout = 10000; 
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
-    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (char*)&timeout, sizeof(timeout));
+    if (getaddrinfo(targetHost, port_str, &hints, &res) != 0) {
+        log_msg("[Utils] DNS resolution failed for %s", targetHost);
+        return NULL;
+    }
 
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(targetPort);
-    addr.sin_addr = *((struct in_addr *)he->h_addr);
+    // 遍历连接
+    for (ptr = res; ptr != NULL; ptr = ptr->ai_next) {
+        s = socket(ptr->ai_family, ptr->ai_socktype, ptr->ai_protocol);
+        if (s == INVALID_SOCKET) continue;
 
-    if (connect(s, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        log_wsa_error("Socket Connect");
+        DWORD timeout = 10000; 
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
+        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (char*)&timeout, sizeof(timeout));
+
+        if (connect(s, ptr->ai_addr, (int)ptr->ai_addrlen) == 0) {
+            break; // 连接成功
+        }
         closesocket(s);
+        s = INVALID_SOCKET;
+    }
+
+    if (res) freeaddrinfo(res);
+
+    if (s == INVALID_SOCKET) {
+        log_wsa_error("Socket Connect");
         return NULL;
     }
 
