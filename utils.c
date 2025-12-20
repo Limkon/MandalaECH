@@ -16,10 +16,23 @@
 // 链接必要的系统库
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "crypt32.lib")
+#pragma comment(lib, "wininet.lib") // [Fix] 确保链接 wininet
 
 // [优化] 全局复用 SSL_CTX，避免每次请求都初始化，显著降低 CPU 占用
 // 这是一个生产级优化，避免频繁分配和释放 SSL 上下文
 static SSL_CTX* g_utils_ctx = NULL;
+
+// --------------------------------------------------------------------------
+// 辅助函数：系统版本判断 (新增，参考 sing.c)
+// --------------------------------------------------------------------------
+static BOOL IsWindows8OrGreater() {
+    HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
+    if (hKernel32 == NULL) {
+        return FALSE;
+    }
+    FARPROC pFunc = GetProcAddress(hKernel32, "SetProcessMitigationPolicy");
+    return (pFunc != NULL);
+}
 
 // --------------------------------------------------------------------------
 // 日志系统实现
@@ -526,58 +539,114 @@ char* GetClipboardText() {
 }
 
 // --------------------------------------------------------------------------
-// 系统代理设置 (注册表操作)
+// 系统代理设置 (重写，完全参考 sing.c 逻辑修复 BUG)
 // --------------------------------------------------------------------------
 
 void SetSystemProxy(BOOL enable) {
-    HKEY hKey;
-    // [Fix] 使用 RegCreateKeyExW 替代 RegOpenKeyExW，参考 sing.c 确保权限和键存在
-    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings", 
-        0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
-        
-        DWORD dwEnable = enable ? 1 : 0;
-        RegSetValueExW(hKey, L"ProxyEnable", 0, REG_DWORD, (BYTE*)&dwEnable, sizeof(DWORD));
-        
-        if (enable) {
-            // 从 common.h 或 globals.c 获取 g_localPort
-            extern int g_localPort; 
-            wchar_t server[64];
-            swprintf_s(server, 64, L"127.0.0.1:%d", g_localPort);
-            RegSetValueExW(hKey, L"ProxyServer", 0, REG_SZ, (BYTE*)server, (wcslen(server)+1)*sizeof(wchar_t));
+    extern int g_localPort;
+    if (g_localPort <= 0) g_localPort = 1080; // 防止端口未初始化
 
-            // [Fix] 增加 ProxyOverride 设置，跳过本地地址，参考 sing.c
-            const wchar_t* override = L"<local>";
-            RegSetValueExW(hKey, L"ProxyOverride", 0, REG_SZ, (BYTE*)override, (wcslen(override)+1)*sizeof(wchar_t));
-        } else {
-             // [Fix] 禁用时显式清空 ProxyServer，防止残留导致的显示错误
-             RegSetValueExW(hKey, L"ProxyServer", 0, REG_SZ, (const BYTE*)L"", sizeof(wchar_t));
+    wchar_t proxyServerString[256] = {0};
+    wchar_t proxyBypassString[64] = L"<local>";
+    
+    // 构造代理字符串
+    if (enable) {
+        swprintf_s(proxyServerString, 256, L"127.0.0.1:%d", g_localPort);
+    }
+
+    // 分支 1: Windows 8 或更高版本 (使用注册表)
+    if (IsWindows8OrGreater()) {
+        HKEY hKey;
+        const wchar_t* REG_PATH_PROXY = L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
+        
+        // 使用 RegCreateKeyExW 确保键存在且可写
+        if (RegCreateKeyExW(HKEY_CURRENT_USER, REG_PATH_PROXY, 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) != ERROR_SUCCESS) {
+            log_msg("[Proxy] Failed to open registry key for writing.");
+            return;
         }
 
-        // [Fix] 删除可能存在的 SocksProxyServer，避免冲突
-        RegDeleteValueW(hKey, L"SocksProxyServer");
-        
+        if (enable) {
+            DWORD dwEnable = 1;
+            RegSetValueExW(hKey, L"ProxyEnable", 0, REG_DWORD, (const BYTE*)&dwEnable, sizeof(dwEnable));
+            RegSetValueExW(hKey, L"ProxyOverride", 0, REG_SZ, (const BYTE*)proxyBypassString, (wcslen(proxyBypassString) + 1) * sizeof(wchar_t));
+            RegSetValueExW(hKey, L"ProxyServer", 0, REG_SZ, (const BYTE*)proxyServerString, (wcslen(proxyServerString) + 1) * sizeof(wchar_t));
+            // 显式删除 SocksProxyServer 防止冲突
+            RegDeleteValueW(hKey, L"SocksProxyServer"); 
+        } else {
+            DWORD dwEnable = 0;
+            RegSetValueExW(hKey, L"ProxyEnable", 0, REG_DWORD, (const BYTE*)&dwEnable, sizeof(dwEnable));
+            // 关闭时显式清空 ProxyServer，防止残留
+            RegSetValueExW(hKey, L"ProxyServer", 0, REG_SZ, (const BYTE*)L"", sizeof(wchar_t));
+            RegDeleteValueW(hKey, L"SocksProxyServer");
+        }
         RegCloseKey(hKey);
+    } 
+    // 分支 2: 旧版系统 (使用 InternetSetOption)
+    else {
+        INTERNET_PER_CONN_OPTION_LISTW list;
+        INTERNET_PER_CONN_OPTIONW options[3];
+        DWORD dwBufSize = sizeof(list);
         
-        // 通知系统设置已更改，使其立即生效
-        InternetSetOptionW(NULL, INTERNET_OPTION_SETTINGS_CHANGED, NULL, 0);
-        InternetSetOptionW(NULL, INTERNET_OPTION_REFRESH, NULL, 0);
+        options[0].dwOption = INTERNET_PER_CONN_FLAGS;
+        options[1].dwOption = INTERNET_PER_CONN_PROXY_SERVER;
+        options[2].dwOption = INTERNET_PER_CONN_PROXY_BYPASS;
+        
+        if (enable) {
+            options[0].Value.dwValue = PROXY_TYPE_PROXY;
+            options[1].Value.pszValue = proxyServerString;
+            options[2].Value.pszValue = proxyBypassString;
+        } else {
+            options[0].Value.dwValue = PROXY_TYPE_DIRECT;
+            options[1].Value.pszValue = L"";
+            options[2].Value.pszValue = L"";
+        }
+        
+        list.dwSize = sizeof(list);
+        list.pszConnection = NULL;
+        list.dwOptionCount = 3;
+        list.dwOptionError = 0;
+        list.pOptions = options;
+        
+        if (!InternetSetOptionW(NULL, INTERNET_OPTION_PER_CONNECTION_OPTION, &list, dwBufSize)) {
+            log_msg("[Proxy] InternetSetOptionW (Legacy) failed.");
+        }
     }
+
+    // 无论哪个分支，最后都刷新系统设置，确保生效
+    InternetSetOptionW(NULL, INTERNET_OPTION_SETTINGS_CHANGED, NULL, 0);
+    InternetSetOptionW(NULL, INTERNET_OPTION_REFRESH, NULL, 0);
 }
 
+// [Fix] 修复 IsSystemProxyEnabled 逻辑，增加端口检查
+// 防止因端口变更或外部软件残留设置导致的开启状态误判
 BOOL IsSystemProxyEnabled() {
-    BOOL enabled = FALSE;
+    extern int g_localPort;
+    BOOL isEnabled = FALSE;
     HKEY hKey;
+    DWORD dwEnable = 0;
+    DWORD dwSize = sizeof(dwEnable);
+    wchar_t proxyServer[1024] = {0};
+    DWORD dwProxySize = sizeof(proxyServer);
+    
     if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings", 
         0, KEY_READ, &hKey) == ERROR_SUCCESS) {
         
-        DWORD dwValue = 0;
-        DWORD dwSize = sizeof(DWORD);
-        
-        if (RegQueryValueExW(hKey, L"ProxyEnable", NULL, NULL, (BYTE*)&dwValue, &dwSize) == ERROR_SUCCESS) {
-            enabled = (dwValue == 1);
+        if (RegQueryValueExW(hKey, L"ProxyEnable", NULL, NULL, (LPBYTE)&dwEnable, &dwSize) == ERROR_SUCCESS) {
+            if (dwEnable == 1) {
+                // 仅当 ProxyEnable=1 时，进一步检查端口是否匹配
+                if (RegQueryValueExW(hKey, L"ProxyServer", NULL, NULL, (LPBYTE)proxyServer, &dwProxySize) == ERROR_SUCCESS) {
+                    wchar_t expected[64];
+                    swprintf_s(expected, 64, L"127.0.0.1:%d", g_localPort);
+                    
+                    // 检查注册表中的代理字符串是否包含当前程序的代理地址
+                    // 这样可以避免误识别其他代理软件（如 Clash）的设置，解决“取消后无法开启”的问题
+                    if (wcsstr(proxyServer, expected) != NULL) {
+                        isEnabled = TRUE;
+                    }
+                }
+            }
         }
-        
         RegCloseKey(hKey);
     }
-    return enabled;
+    return isEnabled;
 }
