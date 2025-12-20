@@ -263,7 +263,7 @@ static BOOL ParseUrl(const char* url, URL_COMPONENTS_SIMPLE* out) {
     }
     return TRUE;
 }
-
+// --- 核心 HTTPS GET 實現 (支持代理與直連) ---
 static char* InternalHttpsGet(const char* url, BOOL useProxy) {
     URL_COMPONENTS_SIMPLE u;
     if (!ParseUrl(url, &u)) { log_msg("[Utils] Invalid URL or too long: %s", url); return NULL; }
@@ -330,12 +330,11 @@ static char* InternalHttpsGet(const char* url, BOOL useProxy) {
     ctx = SSL_CTX_new(TLS_client_method());
     if (!ctx) { closesocket(s); return NULL; }
     
-    // [Note] 下载订阅时暂不验证证书，防止自签证书订阅失败
+    // [Note] 下載訂閱或 DoH 時暫不驗證證書，防止自簽名或過期證書導致中斷
     SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
 
     ssl = SSL_new(ctx);
     SSL_set_fd(ssl, (int)s);
-
     SSL_set_tlsext_host_name(ssl, u.host);
 
     if (SSL_connect(ssl) != 1) {
@@ -372,21 +371,23 @@ static char* InternalHttpsGet(const char* url, BOOL useProxy) {
     }
     resp_buf[total_read] = 0;
 
-    char* body_start = strstr(resp_buf, "\r\n\r\n");
-    if (!body_start) {
-        body_start = strstr(resp_buf, "\n\n");
+    // [Fix] 健壯的 Body 查找邏輯，兼容多種換行符
+    int body_start_idx = -1;
+    for (int i = 0; i < total_read - 1; i++) {
+        if (resp_buf[i] == '\r' && i + 3 < total_read && 
+            resp_buf[i+1] == '\n' && resp_buf[i+2] == '\r' && resp_buf[i+3] == '\n') {
+            body_start_idx = i + 4; break;
+        }
+        if (resp_buf[i] == '\n' && i + 1 < total_read && resp_buf[i+1] == '\n') {
+            body_start_idx = i + 2; break;
+        }
     }
 
-    if (body_start) {
-        if (body_start[0] == '\r') body_start += 4;
-        else body_start += 2;
-
-        int header_len = (int)(body_start - resp_buf);
-        int body_len = total_read - header_len;
-        
-        if (body_len > 0) {
-            result = (char*)malloc(body_len + 1);
-            memcpy(result, body_start, body_len);
+    if (body_start_idx != -1 && body_start_idx < total_read) {
+        int body_len = total_read - body_start_idx;
+        result = (char*)malloc(body_len + 1);
+        if (result) {
+            memcpy(result, resp_buf + body_start_idx, body_len);
             result[body_len] = 0;
         }
     } else {
@@ -418,22 +419,18 @@ char* Utils_HttpGet(const char* url) {
 
 static const char base64_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-// 标准 Base64 编码 (用于 ECH 导出)
 void Base64Encode(const unsigned char* src, int len, char* dst) {
     int i = 0, j = 0;
     for (; i < len; i += 3) {
         int val = (src[i] << 16) + (i + 1 < len ? src[i+1] << 8 : 0) + (i + 2 < len ? src[i+2] : 0);
         dst[j++] = base64_chars[(val >> 18) & 0x3F];
         dst[j++] = base64_chars[(val >> 12) & 0x3F];
-        if (i + 1 < len) dst[j++] = base64_chars[(val >> 6) & 0x3F];
-        else dst[j++] = '=';
-        if (i + 2 < len) dst[j++] = base64_chars[val & 0x3F];
-        else dst[j++] = '=';
+        dst[j++] = (i + 1 < len) ? base64_chars[(val >> 6) & 0x3F] : '=';
+        dst[j++] = (i + 2 < len) ? base64_chars[val & 0x3F] : '=';
     }
     dst[j] = 0;
 }
 
-// Base64Url 编码 (用于 DoH 查询参数)
 void Base64UrlEncode(const unsigned char* src, int len, char* dst) {
     const char* tbl = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     int i = 0, j = 0;
@@ -446,77 +443,45 @@ void Base64UrlEncode(const unsigned char* src, int len, char* dst) {
         if (i + 2 < len) dst[j++] = tbl[val & 0x3F];
         else dst[j++] = '=';
     }
-    // Remove padding for Base64Url
-    while (j > 0 && dst[j-1] == '=') j--;
+    while (j > 0 && dst[j-1] == '=') j--; // 移除 Padding
     dst[j] = 0;
 }
 
 int BuildDNSQueryHTTPS(const char* domain, unsigned char* buf) {
     int pos = 0;
-    // Header
     buf[pos++] = 0; buf[pos++] = 0; // ID
     buf[pos++] = 0x01; buf[pos++] = 0x00; // RD=1
     buf[pos++] = 0; buf[pos++] = 1; // QDCOUNT
-    buf[pos++] = 0; buf[pos++] = 0; // ANCOUNT
-    buf[pos++] = 0; buf[pos++] = 0; // NSCOUNT
-    buf[pos++] = 0; buf[pos++] = 0; // ARCOUNT
+    buf[pos++] = 0; buf[pos++] = 0; buf[pos++] = 0; buf[pos++] = 0; buf[pos++] = 0; buf[pos++] = 0;
     
-    // QNAME
-    const char* p = domain;
-    const char* dot;
+    const char* p = domain; const char* dot;
     while ((dot = strchr(p, '.'))) {
-        int len = (int)(dot - p);
-        buf[pos++] = len;
-        memcpy(buf + pos, p, len);
-        pos += len;
-        p = dot + 1;
+        int len = (int)(dot - p); buf[pos++] = len;
+        memcpy(buf + pos, p, len); pos += len; p = dot + 1;
     }
-    if (*p) {
-        int len = (int)strlen(p);
-        buf[pos++] = len;
-        memcpy(buf + pos, p, len);
-        pos += len;
-    }
+    if (*p) { int len = (int)strlen(p); buf[pos++] = len; memcpy(buf + pos, p, len); pos += len; }
     buf[pos++] = 0;
-    
-    // Type 65 (HTTPS), Class 1 (IN)
-    buf[pos++] = 0; buf[pos++] = 65;
-    buf[pos++] = 0; buf[pos++] = 1;
+    buf[pos++] = 0; buf[pos++] = 65; // Type HTTPS
+    buf[pos++] = 0; buf[pos++] = 1;  // Class IN
     return pos;
 }
 
-// 支持二进制返回的 HTTP GET (二进制安全，用于 DoH)
 char* Utils_HttpBytesGet(const char* url, int* out_len) {
     if (!url) return NULL;
-    char host[256] = {0}; 
-    char path[2048] = {0}; 
-    int port = 443;
-    
-    const char* p = url;
-    if (strncmp(p, "https://", 8) == 0) p += 8;
-    else if (strncmp(p, "http://", 7) == 0) { p += 7; port = 80; } 
-    
-    const char* slash = strchr(p, '/');
-    int hostLen = slash ? (int)(slash - p) : (int)strlen(p);
-    strncpy(host, p, hostLen);
-    if (slash) strcpy(path, slash); else strcpy(path, "/");
-    
-    char* colon = strchr(host, ':');
-    if (colon) { *colon = 0; port = atoi(colon + 1); }
+    URL_COMPONENTS_SIMPLE u;
+    if (!ParseUrl(url, &u)) return NULL;
 
     SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
     if (!ctx) return NULL;
     SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
     
     SSL *ssl = SSL_new(ctx);
-    struct hostent *he = gethostbyname(host);
+    struct hostent *he = gethostbyname(u.host);
     if (!he) { SSL_free(ssl); SSL_CTX_free(ctx); return NULL; }
     
     SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
-    struct sockaddr_in addr; 
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET; 
-    addr.sin_port = htons(port);
+    struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET; addr.sin_port = htons(u.port);
     addr.sin_addr = *((struct in_addr *)he->h_addr);
     
     if (connect(s, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
@@ -524,11 +489,8 @@ char* Utils_HttpBytesGet(const char* url, int* out_len) {
     }
     
     SSL_set_fd(ssl, (int)s);
-    SSL_set_tlsext_host_name(ssl, host);
-    
-    if (SSL_connect(ssl) != 1) { 
-        closesocket(s); SSL_free(ssl); SSL_CTX_free(ctx); return NULL; 
-    }
+    SSL_set_tlsext_host_name(ssl, u.host);
+    if (SSL_connect(ssl) != 1) { closesocket(s); SSL_free(ssl); SSL_CTX_free(ctx); return NULL; }
     
     char req[4096];
     snprintf(req, sizeof(req), 
@@ -536,17 +498,12 @@ char* Utils_HttpBytesGet(const char* url, int* out_len) {
         "Host: %s\r\n"
         "User-Agent: Mandala-Client/1.0\r\n"
         "Accept: application/dns-message\r\n"
-        "Connection: close\r\n\r\n", 
-        path, host);
+        "Connection: close\r\n\r\n", u.path, u.host);
     
-    if (SSL_write(ssl, req, (int)strlen(req)) <= 0) {
-        closesocket(s); SSL_free(ssl); SSL_CTX_free(ctx); return NULL; 
-    }
+    SSL_write(ssl, req, (int)strlen(req));
     
-    int buf_size = 65536; 
+    int buf_size = 65536, total = 0;
     char* resp = (char*)malloc(buf_size); 
-    int total = 0;
-    
     while(1) {
         int r = SSL_read(ssl, resp + total, 4096);
         if (r <= 0) break;
@@ -559,38 +516,28 @@ char* Utils_HttpBytesGet(const char* url, int* out_len) {
         }
     }
     
-    if (!resp) { closesocket(s); SSL_free(ssl); SSL_CTX_free(ctx); return NULL; }
-
-    int body_start_idx = -1;
-    for(int i=0; i<total-3; i++) {
-        if (resp[i]=='\r' && resp[i+1]=='\n' && resp[i+2]=='\r' && resp[i+3]=='\n') {
-            body_start_idx = i + 4; 
-            break;
+    char* result = NULL; *out_len = 0;
+    if (resp) {
+        int body_idx = -1;
+        for(int i=0; i < total - 3; i++) {
+            if (resp[i]=='\r' && resp[i+1]=='\n' && resp[i+2]=='\r' && resp[i+3]=='\n') { body_idx = i + 4; break; }
         }
+        if (body_idx != -1) {
+            *out_len = total - body_idx;
+            result = (char*)malloc(*out_len);
+            memcpy(result, resp + body_idx, *out_len);
+        }
+        free(resp);
     }
     
-    char* result = NULL;
-    if (body_start_idx != -1 && body_start_idx < total) {
-        *out_len = total - body_start_idx;
-        result = (char*)malloc(*out_len);
-        memcpy(result, resp + body_start_idx, *out_len);
-    } else {
-        *out_len = 0;
-    }
-    
-    free(resp); 
-    SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); 
-    closesocket(s);
+    SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); closesocket(s);
     return result;
 }
 
 char* FetchECHFromDoH(const char* dohUrl, const char* sni) {
     if (!dohUrl || !sni) return NULL;
-    log_msg("[ECH] Querying DoH for: %s", sni);
-    
     unsigned char query[512];
     int qlen = BuildDNSQueryHTTPS(sni, query);
-    
     char b64query[1024];
     Base64UrlEncode(query, qlen, b64query);
     
@@ -599,140 +546,85 @@ char* FetchECHFromDoH(const char* dohUrl, const char* sni) {
     
     int resp_len = 0;
     unsigned char* resp = (unsigned char*)Utils_HttpBytesGet(fullUrl, &resp_len);
+    if (!resp || resp_len < 12) { if(resp) free(resp); return NULL; }
     
-    if (!resp || resp_len < 12) { 
-        log_msg("[ECH] DoH request failed (len=%d)", resp_len); 
-        if(resp) free(resp); 
-        return NULL; 
-    }
-    
-    int pos = 12; // Header
+    int ancount = (resp[6] << 8) | resp[7], pos = 12;
     while (pos < resp_len && resp[pos] != 0) pos += resp[pos] + 1; 
-    pos += 5; // Null byte + QTYPE + QCLASS
-    
-    if (pos >= resp_len) { free(resp); return NULL; }
-    
-    int ancount = (resp[6] << 8) | resp[7];
+    pos += 5; 
     
     for (int i=0; i<ancount; i++) {
         if (pos >= resp_len) break;
         if ((resp[pos] & 0xC0) == 0xC0) pos += 2; 
         else while(pos < resp_len && resp[pos]!=0) pos += resp[pos]+1; 
         if (pos < resp_len && resp[pos] == 0) pos++;
-        
         if (pos + 10 > resp_len) break;
-        
-        int type = (resp[pos] << 8) | resp[pos+1];
-        int rdlen = (resp[pos+8] << 8) | resp[pos+9];
+        int type = (resp[pos] << 8) | resp[pos+1], rdlen = (resp[pos+8] << 8) | resp[pos+9];
         pos += 10;
-        
-        if (pos + rdlen > resp_len) break;
-        
-        if (type == 65) { // HTTPS
-            unsigned char* rdata = resp + pos;
-            int rpos = 2; 
+        if (type == 65 && pos + rdlen <= resp_len) { 
+            unsigned char* rdata = resp + pos; int rpos = 2; 
             if (rpos < rdlen && rdata[rpos] == 0) rpos++; 
             else while(rpos < rdlen && rdata[rpos]!=0) rpos += rdata[rpos]+1;
-            
             while (rpos + 4 <= rdlen) {
-                int key = (rdata[rpos] << 8) | rdata[rpos+1];
-                int vlen = (rdata[rpos+2] << 8) | rdata[rpos+3];
+                int key = (rdata[rpos] << 8) | rdata[rpos+1], vlen = (rdata[rpos+2] << 8) | rdata[rpos+3];
                 rpos += 4;
-                if (key == 5) { // ECH Config
-                    int b64len = (vlen * 4 / 3) + 8;
-                    char* out = (char*)malloc(b64len);
-                    Base64Encode(rdata + rpos, vlen, out); 
-                    free(resp);
-                    return out;
+                if (key == 5) { 
+                    char* out = (char*)malloc((vlen * 4 / 3) + 8);
+                    Base64Encode(rdata + rpos, vlen, out); free(resp); return out;
                 }
                 rpos += vlen;
             }
         }
         pos += rdlen;
     }
-    free(resp);
-    return NULL;
+    free(resp); return NULL;
 }
 
-// --- 系统代理设置 (保持原样) ---
+// --- 系統代理設置邏輯 ---
 BOOL IsWindows8OrGreater() {
     HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
-    if (hKernel32 == NULL) return FALSE;
-    FARPROC pFunc = GetProcAddress(hKernel32, "SetProcessMitigationPolicy");
-    return (pFunc != NULL);
+    return (hKernel32 && GetProcAddress(hKernel32, "SetProcessMitigationPolicy") != NULL);
 }
 
 void SetSystemProxy(BOOL enable) {
     if (enable && g_localPort <= 0) return;
-    wchar_t proxyServerString[256] = {0};
-    wchar_t proxyBypassString[64] = {0};
-    if (enable) {
-        _snwprintf(proxyServerString, 256, L"127.0.0.1:%d", g_localPort);
-        wcsncpy(proxyBypassString, L"<local>", 63);
-    }
+    wchar_t proxyServer[256] = {0}, bypass[] = L"<local>";
+    if (enable) _snwprintf(proxyServer, 256, L"127.0.0.1:%d", g_localPort);
+
     if (IsWindows8OrGreater()) {
         HKEY hKey;
         if (RegCreateKeyExW(HKEY_CURRENT_USER, REG_PATH_PROXY, 0, NULL, REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
-            if (enable) {
-                DWORD dwEnable = 1;
-                RegSetValueExW(hKey, L"ProxyEnable", 0, REG_DWORD, (const BYTE*)&dwEnable, sizeof(dwEnable));
-                RegSetValueExW(hKey, L"ProxyOverride", 0, REG_SZ, (const BYTE*)proxyBypassString, (wcslen(proxyBypassString) + 1) * sizeof(wchar_t));
-                RegSetValueExW(hKey, L"ProxyServer", 0, REG_SZ, (const BYTE*)proxyServerString, (wcslen(proxyServerString) + 1) * sizeof(wchar_t));
-                RegDeleteValueW(hKey, L"SocksProxyServer"); 
-                RegDeleteValueW(hKey, L"AutoConfigURL"); 
-            } else {
-                DWORD dwEnable = 0;
-                RegSetValueExW(hKey, L"ProxyEnable", 0, REG_DWORD, (const BYTE*)&dwEnable, sizeof(dwEnable));
-                RegSetValueExW(hKey, L"ProxyServer", 0, REG_SZ, (const BYTE*)L"", sizeof(wchar_t));
-                RegDeleteValueW(hKey, L"SocksProxyServer");
-            }
+            DWORD dw = enable ? 1 : 0;
+            RegSetValueExW(hKey, L"ProxyEnable", 0, REG_DWORD, (BYTE*)&dw, sizeof(dw));
+            RegSetValueExW(hKey, L"ProxyServer", 0, REG_SZ, (BYTE*)proxyServer, (wcslen(proxyServer)+1)*sizeof(wchar_t));
+            if(enable) RegSetValueExW(hKey, L"ProxyOverride", 0, REG_SZ, (BYTE*)bypass, (wcslen(bypass)+1)*sizeof(wchar_t));
+            RegDeleteValueW(hKey, L"SocksProxyServer"); RegDeleteValueW(hKey, L"AutoConfigURL");
             RegCloseKey(hKey);
         }
     } else {
-        INTERNET_PER_CONN_OPTION_LISTW list;
-        INTERNET_PER_CONN_OPTIONW options[3];
-        DWORD dwBufSize = sizeof(list);
-        options[0].dwOption = INTERNET_PER_CONN_FLAGS;
-        options[1].dwOption = INTERNET_PER_CONN_PROXY_SERVER;
-        options[2].dwOption = INTERNET_PER_CONN_PROXY_BYPASS;
-        if (enable) {
-            options[0].Value.dwValue = PROXY_TYPE_PROXY;
-            options[1].Value.pszValue = proxyServerString;
-            options[2].Value.pszValue = proxyBypassString;
-        } else {
-            options[0].Value.dwValue = PROXY_TYPE_DIRECT;
-            options[1].Value.pszValue = L"";
-            options[2].Value.pszValue = L"";
-        }
-        list.dwSize = sizeof(list);
-        list.pszConnection = NULL;
-        list.dwOptionCount = 3;
-        list.dwOptionError = 0;
-        list.pOptions = options;
-        InternetSetOptionW(NULL, INTERNET_OPTION_PER_CONNECTION_OPTION, &list, dwBufSize);
+        INTERNET_PER_CONN_OPTION_LISTW list; INTERNET_PER_CONN_OPTIONW opts[3];
+        opts[0].dwOption = INTERNET_PER_CONN_FLAGS;
+        opts[1].dwOption = INTERNET_PER_CONN_PROXY_SERVER;
+        opts[2].dwOption = INTERNET_PER_CONN_PROXY_BYPASS;
+        if (enable) { opts[0].Value.dwValue = PROXY_TYPE_PROXY; opts[1].Value.pszValue = proxyServer; opts[2].Value.pszValue = bypass; }
+        else { opts[0].Value.dwValue = PROXY_TYPE_DIRECT; opts[1].Value.pszValue = L""; opts[2].Value.pszValue = L""; }
+        list.dwSize = sizeof(list); list.pszConnection = NULL; list.dwOptionCount = 3; list.pOptions = opts;
+        InternetSetOptionW(NULL, INTERNET_OPTION_PER_CONNECTION_OPTION, &list, sizeof(list));
     }
     InternetSetOptionW(NULL, INTERNET_OPTION_SETTINGS_CHANGED, NULL, 0);
     InternetSetOptionW(NULL, INTERNET_OPTION_REFRESH, NULL, 0);
 }
 
 BOOL IsSystemProxyEnabled() {
-    HKEY hKey;
-    DWORD dwEnable = 0;
-    DWORD dwSize = sizeof(dwEnable);
-    wchar_t proxyServer[1024] = {0};
-    DWORD dwProxySize = sizeof(proxyServer);
+    HKEY hKey; DWORD dwEnable = 0, dwSize = sizeof(dwEnable);
+    wchar_t server[1024] = {0}; DWORD dwProxySize = sizeof(server);
     if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_PATH_PROXY, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-        if (RegQueryValueExW(hKey, L"ProxyEnable", NULL, NULL, (LPBYTE)&dwEnable, &dwSize) == ERROR_SUCCESS) {
-            if (dwEnable == 1) {
-                if (RegQueryValueExW(hKey, L"ProxyServer", NULL, NULL, (LPBYTE)proxyServer, &dwProxySize) == ERROR_SUCCESS) {
-                    wchar_t expectedPart[64];
-                    _snwprintf(expectedPart, 64, L"127.0.0.1:%d", g_localPort);
-                    if (wcsstr(proxyServer, expectedPart) != NULL) return TRUE;
-                }
+        if (RegQueryValueExW(hKey, L"ProxyEnable", NULL, NULL, (BYTE*)&dwEnable, &dwSize) == ERROR_SUCCESS && dwEnable == 1) {
+            if (RegQueryValueExW(hKey, L"ProxyServer", NULL, NULL, (BYTE*)server, &dwProxySize) == ERROR_SUCCESS) {
+                wchar_t part[64]; _snwprintf(part, 64, L"127.0.0.1:%d", g_localPort);
+                if (wcsstr(server, part)) { RegCloseKey(hKey); return TRUE; }
             }
         }
         RegCloseKey(hKey);
     }
     return FALSE;
 }
-
