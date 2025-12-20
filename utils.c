@@ -341,11 +341,26 @@ char* FetchECHFromDoH(const char* dohUrl, const char* sni) {
     
     for (int i = 0; i < anC; i++) {
         if (p >= rLen) break;
-        if ((resp[p] & 0xC0) == 0xC0) p += 2; else { while (p < rLen && resp[p] != 0) p += resp[p] + 1; p++; }
+        // Skip Name (Handle Pointers)
+        if ((resp[p] & 0xC0) == 0xC0) p += 2; 
+        else { while (p < rLen && resp[p] != 0) p += resp[p] + 1; p++; }
+        
         if (p + 10 > rLen) break;
         int type = (resp[p] << 8) | resp[p+1]; int rdLen = (resp[p+8] << 8) | resp[p+9]; p += 10;
         
         log_msg("[Debug] RR Type: %d, Len: %d", type, rdLen);
+
+        // [Debug] Dump RDATA in Hex
+        if (type == 65) {
+            char hexDump[1024] = {0};
+            int dumpLen = (rdLen > 64) ? 64 : rdLen; // 只打印前64字节防止溢出
+            for(int k=0; k<dumpLen; k++) {
+                char tmp[4];
+                sprintf(tmp, "%02X ", resp[p+k]);
+                strcat(hexDump, tmp);
+            }
+            log_msg("[Debug] RDATA Dump: %s...", hexDump);
+        }
 
         if (p + rdLen > rLen) break;
         if (type == 65) {
@@ -353,6 +368,9 @@ char* FetchECHFromDoH(const char* dohUrl, const char* sni) {
             if (rp < rdLen && rdata[rp] == 0) rp++; else while (rp < rdLen && rdata[rp] != 0) rp += rdata[rp] + 1; rp++; 
             while (rp + 4 <= rdLen) {
                 int k = (rdata[rp] << 8) | rdata[rp+1]; int vl = (rdata[rp+2] << 8) | rdata[rp+3]; rp += 4;
+                // [Debug] 打印发现的 Key
+                log_msg("[Debug] Found Param Key: %d, Len: %d", k, vl);
+                
                 if (rp + vl > rdLen) break;
                 if (k == 5) {
                     if (vl >= 2) log_msg("[ECH] Config Found. Version ID: %02X%02X", rdata[rp], rdata[rp+1]);
