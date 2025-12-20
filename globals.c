@@ -8,6 +8,17 @@ SOCKET g_listen_sock = INVALID_SOCKET;
 SSL_CTX *g_ssl_ctx = NULL;
 HANDLE hProxyThread = NULL;
 
+// [Production Fix] 定义全局锁
+CRITICAL_SECTION g_configLock;
+
+void InitGlobalLocks() {
+    InitializeCriticalSection(&g_configLock);
+}
+
+void DeleteGlobalLocks() {
+    DeleteCriticalSection(&g_configLock);
+}
+
 // GUI 相关
 NOTIFYICONDATAW nid = {0};
 HWND hwnd = NULL;
