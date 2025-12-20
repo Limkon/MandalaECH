@@ -38,7 +38,12 @@
 // --- 宏定义 ---
 #define REG_PATH_PROXY L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings"
 #define CONFIG_FILE L"config.json"
-#define BUFFER_SIZE 8388608 
+
+// [Refactor] 内存优化：分离 IO 缓冲区和最大帧限制
+// IO_BUFFER_SIZE: 用于 TCP 接收和初始 WebSocket 缓冲区 (16KB)
+#define IO_BUFFER_SIZE 16384 
+// MAX_WS_FRAME_SIZE: WebSocket 最大允许帧大小 (8MB)，用于防止内存耗尽攻击，但允许大文件传输
+#define MAX_WS_FRAME_SIZE 8388608 
 
 // Windows Messages
 #define WM_TRAY (WM_USER + 1)
