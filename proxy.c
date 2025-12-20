@@ -8,9 +8,11 @@
 static volatile LONG g_active_connections = 0;
 
 // [Concurrency Fix] 客户端线程上下文，保存配置副本
+// 生产级修正：将所有可能在运行时变更的全局配置都进行快照
 typedef struct {
     SOCKET clientSock;
-    ProxyConfig config; // 完整的配置副本，避免读取全局变量导致的竞争条件
+    ProxyConfig config; // 完整的节点配置副本
+    char userAgent[512]; // [Fix] 独立的 UA 副本，避免多线程读写竞争
 } ClientContext;
 
 // --- 辅助函数：解析 UUID (支持带横杠或不带) ---
@@ -42,12 +44,54 @@ void trojan_password_hash(const char* password, char* out_hex) {
 }
 
 // 接收超时辅助函数 (使用 select 避免阻塞)
+// 返回值: >0 接收字节数, 0 连接关闭, -1 错误, -2 超时
 int recv_timeout(SOCKET s, char *buf, int len, int timeout_sec) {
     fd_set fds; FD_ZERO(&fds); FD_SET(s, &fds);
     struct timeval tv = { timeout_sec, 0 };
     int n = select(0, &fds, NULL, NULL, &tv);
-    if (n == 0) return -2; if (n < 0) return -1;  
+    if (n == 0) return -2; // Timeout
+    if (n < 0) return -1;  // Error
     return recv(s, buf, len, 0);
+}
+
+// [Robustness Fix] 健壮的头部读取函数
+// 循环读取直到发现完整的 HTTP 头或 SOCKS 握手包
+int read_header_robust(SOCKET s, char* buf, int max_len, int timeout_sec) {
+    int total_read = 0;
+    int remaining_time = timeout_sec;
+    
+    // 简单的超时控制，每次循环扣除估算时间（生产环境建议使用高精度计时器）
+    // 这里为了保持依赖简单，采用分次 select 策略
+    
+    while (total_read < max_len - 1 && remaining_time > 0) {
+        // 每次最多等待 1 秒，检查是否有数据
+        int n = recv_timeout(s, buf + total_read, max_len - 1 - total_read, 1);
+        
+        if (n == -2) { // 单次 select 超时
+            remaining_time--;
+            continue;
+        }
+        if (n <= 0) return -1; // 连接关闭或错误
+        
+        total_read += n;
+        buf[total_read] = 0; // 确保字符串安全结尾
+
+        // 1. 协议探测：SOCKS5
+        // SOCKS5 初始握手通常很短 (VER NMETHODS METHODS)，如 05 01 00
+        // 只要开头是 0x05 且长度足够，我们就可以认为读取到了关键信息
+        if (buf[0] == 0x05) {
+            if (total_read >= 2) return total_read; 
+        }
+        // 2. 协议探测：HTTP
+        // 检查是否包含双换行，标志 HTTP Header 结束
+        else {
+            if (strstr(buf, "\r\n\r\n")) return total_read;
+        }
+
+        // 如果读取了太多数据仍未找到边界，可能是非标协议或攻击，强制中断
+        if (total_read > 8192) break; 
+    }
+    return total_read > 0 ? total_read : -1;
 }
 
 // [Refactor] 发送全部数据辅助函数 (移除 Busy Wait)
@@ -107,7 +151,6 @@ DWORD WINAPI client_handler(LPVOID p) {
     // [Safety] 连接数 +1
     InterlockedIncrement(&g_active_connections);
 
-    // [Concurrency Fix] 接收上下文并复制配置到本地，随即释放上下文
     ClientContext* ctx = (ClientContext*)p;
     if (!ctx) {
         InterlockedDecrement(&g_active_connections);
@@ -115,8 +158,14 @@ DWORD WINAPI client_handler(LPVOID p) {
     }
 
     SOCKET c = ctx->clientSock;
-    ProxyConfig localConfig = ctx->config; // 线程本地副本
-    free(ctx); // 立即释放堆内存
+    ProxyConfig localConfig = ctx->config; // 线程本地配置副本
+    
+    // [Concurrency Fix] 获取线程本地 UA 副本
+    char localUserAgent[512];
+    strncpy(localUserAgent, ctx->userAgent, sizeof(localUserAgent)-1);
+    localUserAgent[sizeof(localUserAgent)-1] = 0;
+
+    free(ctx); // 上下文数据已提取，立即释放
 
     TLSContext tls; 
     SOCKET r = INVALID_SOCKET;      
@@ -179,20 +228,25 @@ DWORD WINAPI client_handler(LPVOID p) {
     if (!c_buf || !ws_read_buf || !ws_send_buf) goto cl_end; 
     setsockopt(c, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
     
-    // 1. 读取浏览器首包 (使用 IO_BUFFER_SIZE)
-    browser_len = recv_timeout(c, c_buf, IO_BUFFER_SIZE, 10);
+    // 1. [Robustness Fix] 读取浏览器首包 (使用循环读取确保完整性)
+    browser_len = read_header_robust(c, c_buf, IO_BUFFER_SIZE, 10);
     if (browser_len <= 0) goto cl_end; 
     c_buf[browser_len] = 0;
     
     // 协议判断
     if (c_buf[0] == 0x05) { 
-        send(c, "\x05\x00", 2, 0); 
+        // Socks5 处理逻辑
+        send(c, "\x05\x00", 2, 0); // 无需认证
         is_socks5 = 1;
+        
+        // 读取后续请求 (CMD)
+        // 注意：Socks5 的后续请求包也非常小，通常一次 recv 即可，但为了一致性继续使用 recv_timeout 配合简单检查
         int n = recv_timeout(c, c_buf, IO_BUFFER_SIZE, 10);
         if (n <= 0) goto cl_end;
         browser_len = n;
+        
         if (c_buf[1] == 0x01) { // CONNECT
-             if (c_buf[3] == 0x01) {
+             if (c_buf[3] == 0x01) { // IPv4
                  struct in_addr* addr_ptr = (struct in_addr*)&c_buf[4];
                  port = ntohs(*(unsigned short*)&c_buf[8]);
                  inet_ntop(AF_INET, addr_ptr, host, sizeof(host));
@@ -201,6 +255,9 @@ DWORD WINAPI client_handler(LPVOID p) {
                  memcpy(host, &c_buf[5], dlen);
                  host[dlen] = 0;
                  port = ntohs(*(unsigned short*)&c_buf[5+dlen]);
+             } else {
+                 // IPv6 暂略或不支持
+                 goto cl_end;
              }
              strcpy(method, "SOCKS5");
         } else {
@@ -208,6 +265,7 @@ DWORD WINAPI client_handler(LPVOID p) {
         }
     } 
     else {
+        // HTTP/HTTPS 处理逻辑
         if (sscanf(c_buf, "%15s %255s", method, host) == 2) {
             char *p = strchr(host, ':');
             if (p) { *p = 0; port = atoi(p+1); }
@@ -219,7 +277,8 @@ DWORD WINAPI client_handler(LPVOID p) {
             if (header_end) {
                 header_len = (int)(header_end - c_buf) + 4;
             } else {
-                header_len = browser_len;
+                // 如果 read_header_robust 正常工作，理论上这里一定有 header_end
+                header_len = browser_len; 
             }
         } else { goto cl_end; }
     }
@@ -286,7 +345,7 @@ DWORD WINAPI client_handler(LPVOID p) {
     for(int i=0; i<16; i++) rnd_key[i] = rand() % 256;
     base64_encode_key(rnd_key, ws_key_str);
 
-    // [Refactor] 使用 IO_BUFFER_SIZE
+    // [Fix] 使用线程本地的 localUserAgent，避免访问全局变量
     offset = snprintf(ws_send_buf, IO_BUFFER_SIZE, 
         "GET %s HTTP/1.1\r\n"
         "Host: %s\r\n"
@@ -295,7 +354,7 @@ DWORD WINAPI client_handler(LPVOID p) {
         "Connection: Upgrade\r\n"
         "Sec-WebSocket-Key: %s\r\n"
         "Sec-WebSocket-Version: 13\r\n\r\n", 
-        req_path, sni_val, g_userAgentStr, ws_key_str);
+        req_path, sni_val, localUserAgent, ws_key_str);
 
     tls_write(&tls, ws_send_buf, offset);
 
@@ -612,6 +671,11 @@ DWORD WINAPI server_thread(LPVOID p) {
             if (ctx) {
                 ctx->clientSock = c;
                 ctx->config = g_proxyConfig; // 线程安全的配置快照
+                
+                // [Safety] 安全复制全局字符串，避免工作线程访问全局变量
+                strncpy(ctx->userAgent, g_userAgentStr, sizeof(ctx->userAgent)-1);
+                ctx->userAgent[sizeof(ctx->userAgent)-1] = 0;
+
                 HANDLE hClient = CreateThread(NULL, 0, client_handler, (LPVOID)ctx, 0, NULL);
                 if (hClient) CloseHandle(hClient); 
                 else { 
