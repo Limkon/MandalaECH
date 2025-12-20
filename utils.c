@@ -173,7 +173,8 @@ void UrlDecode(char* dst, const char* src) {
     *dst++ = '\0';
 }
 
-// 简单的查询参数获取 (key=value)
+// [Fix] 修复后的查询参数获取函数
+// 增加对 # (fragment) 的检测，防止读取越界到备注信息中
 char* GetQueryParam(const char* query, const char* key) {
     if (!query || !key) return NULL;
     
@@ -189,9 +190,22 @@ char* GetQueryParam(const char* query, const char* key) {
     }
     
     p += strlen(search);
-    const char* end = strchr(p, '&');
+    
+    // 查找值的结束位置：& 或 # 或 字符串结尾
+    const char* end_amp = strchr(p, '&');
+    const char* end_hash = strchr(p, '#');
+    const char* end = NULL;
+
+    // 取最早出现的结束符
+    if (end_amp && end_hash) end = (end_amp < end_hash) ? end_amp : end_hash;
+    else if (end_amp) end = end_amp;
+    else if (end_hash) end = end_hash;
+    
     int len = end ? (int)(end - p) : (int)strlen(p);
     
+    // 防止 len < 0 或为 0
+    if (len <= 0) return NULL;
+
     char* val = (char*)malloc(len + 1);
     if (!val) return NULL;
     
