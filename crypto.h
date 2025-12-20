@@ -1,32 +1,38 @@
-#ifndef UTILS_H
-#define UTILS_H
+#ifndef CRYPTO_H
+#define CRYPTO_H
 
-#include <windows.h>
+#include <winsock2.h>
+#include <openssl/ssl.h>
 
-// 日志
+// 防止日志消息 ID 重复定义
+#ifndef WM_LOG_UPDATE
 #define WM_LOG_UPDATE (WM_USER + 1)
-void log_msg(const char *format, ...);
-void log_wsa_error(const char* context);
+#endif
 
-// 网络与 HTTP
-char* Utils_HttpGet(const char* url);
-char* Utils_HttpBytesGet(const char* url, int* out_len);
-char* FetchECHFromDoH(const char* dohUrl, const char* sni);
+// [修复] 完整的上下文结构定义
+// 之前这里缺失导致 crypto.c 无法识别 ctx 成员
+typedef struct {
+    SOCKET sock;
+    SSL_CTX *ctx;
+    SSL *ssl;
+} TLSContext;
 
-// 编码解码
-unsigned char* Base64Decode(const char* src, size_t* out_len);
-void Base64Encode(const unsigned char* src, int len, char* dst);
-void Base64UrlEncode(const unsigned char* src, int len, char* dst);
+// 全局初始化与清理 (供 gui.c 调用)
+void init_openssl_global();
+void FreeGlobalSSLContext();
+void tls_cleanup_global();
 
-// 其他工具
-BOOL ReadFileToBuffer(const wchar_t* filename, char** buffer, long* fileSize);
-BOOL WriteBufferToFile(const wchar_t* filename, const char* buffer);
-char* GetClipboardText();
-void TrimString(char* str);
-char* GetQueryParam(const char* query, const char* key);
+// 核心连接函数
+int tls_init_connect(TLSContext *ctx, const char *sni, const char *host, const char *ech_config_b64);
+void tls_close(TLSContext *ctx);
 
-// 系统代理
-void SetSystemProxy(BOOL enable);
-BOOL IsSystemProxyEnabled();
+// 读写函数
+int tls_read(TLSContext *ctx, char *buf, int len);
+int tls_write(TLSContext *ctx, const char *buf, int len);
 
-#endif // UTILS_H
+// WebSocket 协议辅助
+int build_ws_frame(const char *payload, int len, char *out_frame);
+long long check_ws_frame(unsigned char *buf, int len, int *header_len, int *payload_len);
+int ws_read_payload_exact(TLSContext *tls, char *buf, int exact_len);
+
+#endif // CRYPTO_H
