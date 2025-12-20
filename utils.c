@@ -616,9 +616,13 @@ char* FetchECHFromDoH(const char* dohUrl, const char* sni) {
     
     for (int i=0; i<ancount; i++) {
         if (pos >= resp_len) break;
-        if ((resp[pos] & 0xC0) == 0xC0) pos += 2; 
-        else while(pos < resp_len && resp[pos]!=0) pos += resp[pos]+1; 
-        if (pos < resp_len && resp[pos] == 0) pos++;
+        
+        // [Fix] 更健壮的名称跳过逻辑 (处理混合压缩)
+        while (pos < resp_len) {
+            if (resp[pos] == 0) { pos++; break; } // End of labels
+            if ((resp[pos] & 0xC0) == 0xC0) { pos += 2; break; } // Pointer
+            pos += resp[pos] + 1; // Skip label
+        }
         
         if (pos + 10 > resp_len) break;
         
@@ -630,15 +634,22 @@ char* FetchECHFromDoH(const char* dohUrl, const char* sni) {
         
         if (type == 65) { // HTTPS
             unsigned char* rdata = resp + pos;
-            int rpos = 2; 
-            if (rpos < rdlen && rdata[rpos] == 0) rpos++; 
-            else while(rpos < rdlen && rdata[rpos]!=0) rpos += rdata[rpos]+1;
+            int rpos = 2; // 跳过 Priority
             
+            // [Fix] 正确解析 TargetName，跳过结束符 0
+            while(rpos < rdlen && rdata[rpos] != 0) {
+                 int label_len = rdata[rpos];
+                 if (rpos + label_len + 1 > rdlen) break; // 防止越界
+                 rpos += label_len + 1;
+            }
+            if (rpos < rdlen) rpos++; // 跳过最后的 0 (Root terminator)
+
             while (rpos + 4 <= rdlen) {
                 int key = (rdata[rpos] << 8) | rdata[rpos+1];
                 int vlen = (rdata[rpos+2] << 8) | rdata[rpos+3];
                 rpos += 4;
                 if (key == 5) { // ECH Config
+                    if (rpos + vlen > rdlen) break; // 防止越界
                     int b64len = (vlen * 4 / 3) + 8;
                     char* out = (char*)malloc(b64len);
                     Base64Encode(rdata + rpos, vlen, out); 
@@ -735,4 +746,3 @@ BOOL IsSystemProxyEnabled() {
     }
     return FALSE;
 }
-
