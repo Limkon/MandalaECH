@@ -1,6 +1,6 @@
 #include "proxy.h"
 #include "crypto.h"
-#include "utils.h" // [新增] 包含此头文件以引用 FetchECHFromDoH
+#include "utils.h" // [Fix] 包含此头文件以引用 FetchECHFromDoH
 #include <ws2tcpip.h>
 #include <openssl/sha.h>
 
@@ -9,9 +9,6 @@ typedef struct {
     SOCKET clientSock;
     ProxyConfig config; // 完整的配置副本，避免读取全局变量导致的竞争条件
 } ClientContext;
-
-// [删除] 不需要手动声明 extern，已在 utils.h 中声明
-// extern char* FetchECHFromDoH(const char* dohUrl, const char* sni);
 
 extern char g_dohUrl[512];
 
@@ -110,10 +107,9 @@ DWORD WINAPI client_handler(LPVOID p) {
             }
         }
         
-        // [Fix] 不要覆盖 localConfig.sni！
-        // localConfig.sni 必须保持为 Inner SNI (真实目标域名)，以便被 ECH 加密。
-        // Outer SNI (Public Name) 会自动从 ECH 配置中提取。
-        // 删除此行: snprintf(localConfig.sni, sizeof(localConfig.sni), "%s", localConfig.outer_sni);
+        // [Fix] 关键修正：删除了覆盖 localConfig.sni 的代码。
+        // localConfig.sni 必须保持为 Inner SNI (真实目标)，以便被 ECH 加密。
+        // 外部连接时的 SNI (Public Name) 会由 OpenSSL 根据 ECH Config 自动处理。
     }
 
     TLSContext tls; 
@@ -215,9 +211,7 @@ DWORD WINAPI client_handler(LPVOID p) {
     }
     
     // 连接到代理服务器
-    // [ECH DNS Logic]
-    // 理想情况下应该解析 Outer SNI 对应的 IP，以避免通过 IP 泄露真实目标。
-    // 如果配置了 Outer SNI，优先解析 Outer SNI。
+    // [ECH DNS Logic] 优先解析 Outer SNI (伪装 IP)，以隐藏真实目标
     const char* connect_host = localConfig.host;
     if (strlen(localConfig.outer_sni) > 0) {
         connect_host = localConfig.outer_sni;
@@ -244,7 +238,7 @@ DWORD WINAPI client_handler(LPVOID p) {
         
         if (connect(r, (struct sockaddr*)&a, sizeof(a)) == 0) {
             tls.sock = r;
-            // [ECH] 传递 localConfig.sni (必须是 Inner SNI)
+            // [ECH] 传递 localConfig.sni (保持为 Inner SNI)
             if (tls_init_connect(&tls, localConfig.sni, localConfig.host, localConfig.ech) == 0) break;
             else tls_close(&tls);
         }
