@@ -1,3 +1,6 @@
+#include <stdio.h>  // [修复] 必需的头文件
+#include <stdlib.h>
+#include <string.h>
 #include "proxy.h"
 #include "crypto.h"
 #include "utils.h" 
@@ -67,17 +70,12 @@ DWORD WINAPI client_handler(LPVOID p) {
     ProxyConfig localConfig = ctx->config; 
     free(ctx); 
 
-    // [ECH 准备阶段]
-    // 检查是否需要动态获取 ECH 密钥
-    if (strlen(localConfig.outer_sni) > 0) {
-        // 如果没有配置静态 ECH 字符串，尝试从 DoH 获取
-        if (strlen(localConfig.ech) == 0) {
-            char* dynEch = FetchECHFromDoH(g_dohUrl, localConfig.outer_sni);
-            if (dynEch) {
-                // 成功获取，更新当前线程的配置副本
-                snprintf(localConfig.ech, sizeof(localConfig.ech), "%s", dynEch);
-                free(dynEch);
-            }
+    // [ECH 自动获取]
+    if (strlen(localConfig.outer_sni) > 0 && strlen(localConfig.ech) == 0) {
+        char* dynEch = FetchECHFromDoH(g_dohUrl, localConfig.outer_sni);
+        if (dynEch) {
+            snprintf(localConfig.ech, sizeof(localConfig.ech), "%s", dynEch);
+            free(dynEch);
         }
     }
 
@@ -96,7 +94,7 @@ DWORD WINAPI client_handler(LPVOID p) {
     if (browser_len <= 0) goto cl_end; 
     c_buf[browser_len] = 0;
     
-    // 简单的协议判断
+    // 协议判断
     char method[16], host[256]; int port = 80; 
     int is_socks5 = 0; int is_connect_method = 0;
     int header_len = 0;
@@ -105,7 +103,7 @@ DWORD WINAPI client_handler(LPVOID p) {
         send(c, "\x05\x00", 2, 0); is_socks5 = 1;
         int n = recv_timeout(c, c_buf, BUFFER_SIZE, 10);
         if (n <= 0) goto cl_end; browser_len = n;
-        if (c_buf[1] == 0x01) { // CONNECT
+        if (c_buf[1] == 0x01) { 
              if (c_buf[3] == 0x01) {
                  struct in_addr* addr_ptr = (struct in_addr*)&c_buf[4];
                  port = ntohs(*(unsigned short*)&c_buf[8]);
@@ -126,8 +124,7 @@ DWORD WINAPI client_handler(LPVOID p) {
         } else { goto cl_end; }
     }
     
-    // [Connection Logic]
-    // 1. 物理连接目标：优先连接 Outer SNI 的 IP (Cloudflare)，否则连接 Host IP
+    // [连接逻辑]
     const char* connect_host = (strlen(localConfig.outer_sni) > 0) ? localConfig.outer_sni : localConfig.host;
     struct hostent *h = gethostbyname(connect_host);
     if(!h) { h = gethostbyname(localConfig.host); if (!h) goto cl_end; }
@@ -149,11 +146,9 @@ DWORD WINAPI client_handler(LPVOID p) {
         if (connect(r, (struct sockaddr*)&a, sizeof(a)) == 0) {
             tls.sock = r;
             
-            // [CRITICAL FIX] 
-            // 握手 SNI (Inner SNI) 必须是真实的 Worker 域名 (localConfig.sni)
-            // OpenSSL 会根据 ECH Config 自动填充 Outer SNI (cloudflare-ech.com)
+            // [修复] ECH 握手：传入 Inner SNI
             const char* handshake_sni = localConfig.sni;
-            if (strlen(handshake_sni) == 0) handshake_sni = localConfig.host; // fallback
+            if (strlen(handshake_sni) == 0) handshake_sni = localConfig.host;
 
             if (tls_init_connect(&tls, handshake_sni, localConfig.host, localConfig.ech) == 0) break;
             else tls_close(&tls);
@@ -189,7 +184,7 @@ DWORD WINAPI client_handler(LPVOID p) {
         if (rem > 0) { memmove(ws_read_buf, body_start, rem); ws_buf_len = rem; } else ws_buf_len = 0;
     } else ws_buf_len = 0;
     
-    // 发送代理协议头 (VLESS/Trojan/Shadowsocks)
+    // 发送代理协议头
     unsigned char proto_buf[2048]; int proto_len = 0;
     struct in_addr ip4; struct in6_addr ip6;
     int is_vless = (_stricmp(localConfig.type, "vless") == 0);
