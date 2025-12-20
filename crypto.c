@@ -154,7 +154,6 @@ void init_openssl_global() {
         log_msg("[Security] Standard OpenSSL Cipher Suites");
     }
 
-    // [Security Fix] 生产环境要求：必须强制验证证书，移除回退逻辑
     HRSRC hRes = FindResourceW(NULL, MAKEINTRESOURCEW(2), RT_RCDATA);
     if (hRes) {
         HGLOBAL hData = LoadResource(NULL, hRes);
@@ -175,24 +174,19 @@ void init_openssl_global() {
                     SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_PEER, NULL);
                     log_msg("[Security] Embedded CA loaded (%d certs). Strict mode.", count);
                 } else {
-                    // SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, NULL); // [禁用]
                     log_msg("[Fatal] Embedded CA data invalid. Secure connection cannot be established.");
                 }
             } else {
-                // SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, NULL); // [禁用]
                 log_msg("[Fatal] Failed to create BIO for CA.");
             }
         } else {
-            // SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, NULL); // [禁用]
             log_msg("[Fatal] Empty CA resource. Secure connection cannot be established.");
         }
     } else {
-        // SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, NULL); // [禁用]
         log_msg("[Fatal] cacert.pem resource not found in exe. Secure connection cannot be established.");
     }
 }
 
-// [Fix] 更新实现，接收 SNI 和 Host，不依赖全局变量
 int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target_host) {
     if (!g_ssl_ctx) init_openssl_global();
     ctx->ssl = SSL_new(g_ssl_ctx);
@@ -217,7 +211,6 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
     }
     SSL_set_bio(ctx->ssl, bio, bio);
     
-    // [Fix] 使用传入的 SNI，而非全局配置
     const char *sni_name = (target_sni && strlen(target_sni)) ? target_sni : target_host;
     SSL_set_tlsext_host_name(ctx->ssl, sni_name);
     
@@ -242,6 +235,7 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
     }
 }
 
+// [Refactor] 移除 Sleep，使用 select 等待 Socket 可写
 int tls_write(TLSContext *ctx, const char *data, int len) {
     if (!ctx || !ctx->ssl) return -1;
     int written = 0;
@@ -250,7 +244,18 @@ int tls_write(TLSContext *ctx, const char *data, int len) {
         if (ret > 0) { written += ret; } 
         else {
             int err = SSL_get_error(ctx->ssl, ret);
-            if (err == SSL_ERROR_WANT_WRITE || err == SSL_ERROR_WANT_READ) { Sleep(1); continue; }
+            if (err == SSL_ERROR_WANT_WRITE || err == SSL_ERROR_WANT_READ) { 
+                int sock = SSL_get_fd(ctx->ssl);
+                fd_set fds; 
+                FD_ZERO(&fds); 
+                FD_SET(sock, &fds);
+                struct timeval tv = { 1, 0 };
+                
+                // WANT_WRITE: 等待可写; WANT_READ: 等待可读 (SSL 握手/重协商可能触发)
+                if (err == SSL_ERROR_WANT_WRITE) select(0, NULL, &fds, NULL, &tv);
+                else select(0, &fds, NULL, NULL, &tv);
+                continue; 
+            }
             log_msg("[Error] SSL_write failed. Error: %d", err);
             return -1; 
         }
@@ -270,12 +275,26 @@ int tls_read(TLSContext *ctx, char *out, int max) {
     return ret;
 }
 
+// [Refactor] 移除 Sleep，使用 select 等待 IO 事件
 int tls_read_exact(TLSContext *ctx, char *buf, int len) {
     int total = 0;
     while (total < len) {
         int ret = tls_read(ctx, buf + total, len - total);
         if (ret < 0) return 0; 
-        if (ret == 0) { Sleep(1); continue; } 
+        if (ret == 0) { 
+            // ret == 0 意味着 WANT_READ 或 WANT_WRITE
+            int sock = SSL_get_fd(ctx->ssl);
+            fd_set rfds, wfds;
+            FD_ZERO(&rfds); FD_ZERO(&wfds);
+            
+            // 检查 OpenSSL 内部状态来决定等待读还是写
+            if (SSL_want_read(ctx->ssl)) FD_SET(sock, &rfds);
+            if (SSL_want_write(ctx->ssl)) FD_SET(sock, &wfds);
+            
+            struct timeval tv = { 1, 0 };
+            select(0, &rfds, &wfds, NULL, &tv);
+            continue; 
+        } 
         total += ret;
     }
     return 1;
