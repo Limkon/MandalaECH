@@ -168,7 +168,6 @@ static BOOL ParseUrl(const char* url, URL_COMP* out) {
     if (sl) strcpy(out->path, sl); else strcpy(out->path, "/"); return TRUE;
 }
 
-// Chunked 数据解码器
 static char* DechunkBody(const char* raw_body, int raw_len, int* out_len) {
     if (!raw_body || raw_len <= 0) return NULL;
     char* new_buf = (char*)malloc(raw_len + 1); if (!new_buf) return NULL;
@@ -185,22 +184,49 @@ static char* DechunkBody(const char* raw_body, int raw_len, int* out_len) {
     return new_buf;
 }
 
+// [Fix] 支持多 IP 轮询连接 (Happy Eyeballs 简化版)
 static char* InternalHttpsGet(const char* url, BOOL useProxy, int* out_len) {
     URL_COMP u; if (!ParseUrl(url, &u)) { log_msg("[Utils] Invalid URL: %s", url); return NULL; }
     if (out_len) *out_len = 0;
     
-    BOOL isDoH = (out_len != NULL); // 如果需要 binary output，我们假定是 DoH 请求
-    int max_retries = isDoH ? 2 : 1; // DoH 允许重试一次以补全头，普通请求只试一次
+    BOOL isDoH = (out_len != NULL); 
+    int max_retries = isDoH ? 2 : 1; 
+
+    static int ini = 0; if (!ini) { SSL_library_init(); OpenSSL_add_all_algorithms(); SSL_load_error_strings(); ini = 1; }
+
+    const char* tHost = useProxy ? "127.0.0.1" : u.host; int tPort = useProxy ? g_localPort : u.port;
+    struct hostent *he = gethostbyname(tHost); 
+    if (!he || !he->h_addr_list[0]) { log_msg("[Utils] DNS resolution failed for %s", tHost); return NULL; }
 
     for (int attempt = 0; attempt < max_retries; attempt++) {
-        static int ini = 0; if (!ini) { SSL_library_init(); OpenSSL_add_all_algorithms(); SSL_load_error_strings(); ini = 1; }
+        SOCKET s = INVALID_SOCKET;
+        // [Fix] 轮询 IP 地址
+        for (int i = 0; he->h_addr_list[i] != NULL; i++) {
+            s = socket(AF_INET, SOCK_STREAM, 0);
+            if (s == INVALID_SOCKET) continue;
 
-        const char* tHost = useProxy ? "127.0.0.1" : u.host; int tPort = useProxy ? g_localPort : u.port;
-        struct hostent *he = gethostbyname(tHost); if (!he) return NULL;
+            struct sockaddr_in a; memset(&a,0,sizeof(a)); 
+            a.sin_family = AF_INET; a.sin_port = htons(tPort); 
+            a.sin_addr = *((struct in_addr*)he->h_addr_list[i]);
+            
+            DWORD tv = 5000; // 5s timeout
+            setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char*)&tv, 4); 
+            setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (char*)&tv, 4);
 
-        SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
-        struct sockaddr_in a; memset(&a,0,sizeof(a)); a.sin_family=AF_INET; a.sin_port=htons(tPort); a.sin_addr=*((struct in_addr*)he->h_addr);
-        if (connect(s, (struct sockaddr*)&a, sizeof(a))) { closesocket(s); return NULL; }
+            if (connect(s, (struct sockaddr*)&a, sizeof(a)) == 0) {
+                // Connected
+                break;
+            } else {
+                // Connect failed, try next IP
+                closesocket(s);
+                s = INVALID_SOCKET;
+            }
+        }
+
+        if (s == INVALID_SOCKET) {
+            log_msg("[Utils] Connect failed (all IPs tried). Url: %s", url);
+            return NULL; 
+        }
 
         if (useProxy) {
             char req[512], buf[1024]; snprintf(req, 512, "CONNECT %s:%d HTTP/1.1\r\nHost: %s:%d\r\n\r\n", u.host, u.port, u.host, u.port);
@@ -209,22 +235,26 @@ static char* InternalHttpsGet(const char* url, BOOL useProxy, int* out_len) {
 
         SSL_CTX *ctx = SSL_CTX_new(TLS_client_method()); SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
         SSL *ssl = SSL_new(ctx); SSL_set_fd(ssl, (int)s); SSL_set_tlsext_host_name(ssl, u.host);
-        if (SSL_connect(ssl) != 1) { SSL_free(ssl); SSL_CTX_free(ctx); closesocket(s); return NULL; }
+        
+        if (SSL_connect(ssl) != 1) { 
+            log_msg("[Utils] SSL Handshake Failed"); 
+            SSL_free(ssl); SSL_CTX_free(ctx); closesocket(s); return NULL; 
+        }
 
-        // [智能重试策略]
-        // 尝试 0: 标准 HTTP GET (无 Content-Type)
-        // 尝试 1: 补充 Content-Type (兼容阿里 DNS 等)
         char req[4096];
+        // [Fix] User-Agent 伪装成 Go 客户端，防止 WAF 拦截
+        const char* ua = isDoH ? "Go-http-client/1.1" : "Mandala/1.0";
+        
         if (isDoH && attempt == 1) {
             log_msg("[Utils] Retry with Content-Type header...");
             snprintf(req, 4096, 
-                "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mandala/1.0\r\nAccept: application/dns-message\r\nContent-Type: application/dns-message\r\nConnection: close\r\n\r\n", 
-                u.path, u.host);
+                "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nAccept: application/dns-message\r\nContent-Type: application/dns-message\r\nConnection: close\r\n\r\n", 
+                u.path, u.host, ua);
         } else {
             const char* acc = isDoH ? "application/dns-message" : "*/*";
             snprintf(req, 4096, 
-                "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mandala/1.0\r\nAccept: %s\r\nConnection: close\r\n\r\n", 
-                u.path, u.host, acc);
+                "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nAccept: %s\r\nConnection: close\r\n\r\n", 
+                u.path, u.host, ua, acc);
         }
         
         SSL_write(ssl, req, strlen(req));
@@ -236,9 +266,7 @@ static char* InternalHttpsGet(const char* url, BOOL useProxy, int* out_len) {
         }
         resp[tRead] = 0;
 
-        // 检查 200 OK
         if (strstr(resp, " 200 OK")) {
-            // 成功！处理数据
             BOOL isChunked = (strstr(resp, "Transfer-Encoding: chunked") != NULL) || (strstr(resp, "transfer-encoding: chunked") != NULL);
             char* body = strstr(resp, "\r\n\r\n"); if (!body) body = strstr(resp, "\n\n");
             char* final_res = NULL;
@@ -257,14 +285,12 @@ static char* InternalHttpsGet(const char* url, BOOL useProxy, int* out_len) {
                 }
             }
             free(resp); SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); closesocket(s);
-            return final_res; // 成功返回
+            return final_res; 
         }
 
-        // 失败，记录并清理
-        log_msg("[Utils] Attempt %d failed. Response: %.50s", attempt + 1, resp);
+        log_msg("[Utils] HTTP Failed (Retry %d). Response: %.50s", attempt, resp);
         free(resp); SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); closesocket(s);
         
-        // 如果是最后一次尝试，返回 NULL
         if (attempt == max_retries - 1) return NULL;
     }
     return NULL;
