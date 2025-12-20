@@ -24,8 +24,9 @@ static SSL_CTX* g_utils_ctx = NULL;
 
 // --------------------------------------------------------------------------
 // 辅助函数：系统版本判断 (新增，参考 sing.c)
+// [Fix] 去掉 static，与 utils.h 中的声明保持一致
 // --------------------------------------------------------------------------
-static BOOL IsWindows8OrGreater() {
+BOOL IsWindows8OrGreater() {
     HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
     if (hKernel32 == NULL) {
         return FALSE;
@@ -557,9 +558,10 @@ void SetSystemProxy(BOOL enable) {
     // 分支 1: Windows 8 或更高版本 (使用注册表)
     if (IsWindows8OrGreater()) {
         HKEY hKey;
-        const wchar_t* REG_PATH_PROXY = L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
+        // [Fix] 删除已被宏定义的变量声明 REG_PATH_PROXY
+        // const wchar_t* REG_PATH_PROXY = L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
         
-        // 使用 RegCreateKeyExW 确保键存在且可写
+        // 使用 RegCreateKeyExW 确保键存在且可写 (直接使用 common.h 中的 REG_PATH_PROXY 宏)
         if (RegCreateKeyExW(HKEY_CURRENT_USER, REG_PATH_PROXY, 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) != ERROR_SUCCESS) {
             log_msg("[Proxy] Failed to open registry key for writing.");
             return;
@@ -628,7 +630,8 @@ BOOL IsSystemProxyEnabled() {
     wchar_t proxyServer[1024] = {0};
     DWORD dwProxySize = sizeof(proxyServer);
     
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings", 
+    // [Fix] 使用 common.h 中定义的 REG_PATH_PROXY 宏，保持统一
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_PATH_PROXY, 
         0, KEY_READ, &hKey) == ERROR_SUCCESS) {
         
         if (RegQueryValueExW(hKey, L"ProxyEnable", NULL, NULL, (LPBYTE)&dwEnable, &dwSize) == ERROR_SUCCESS) {
