@@ -1,3 +1,4 @@
+#include "common.h"
 #include "crypto.h"
 #include "utils.h"
 #include <openssl/rand.h>
@@ -122,13 +123,14 @@ static long frag_ctrl(BIO *b, int cmd, long num, void *ptr) {
 // ---------------------- End BIO Implementation ----------------------
 
 extern SSL_CTX *g_ssl_ctx; 
+static INIT_ONCE g_ssl_init_once = INIT_ONCE_STATIC_INIT; // [Safety] 初始化守卫
 
 void FreeGlobalSSLContext() {
     if (g_ssl_ctx) { SSL_CTX_free(g_ssl_ctx); g_ssl_ctx = NULL; }
 }
 
-void init_openssl_global() {
-    if (g_ssl_ctx) return;
+// [Safety] 真正的初始化逻辑，仅执行一次
+BOOL CALLBACK InitOpenSSLCallback(PINIT_ONCE InitOnce, PVOID Parameter, PVOID *Context) {
     SSL_library_init(); 
     OpenSSL_add_all_algorithms(); 
     SSL_load_error_strings();
@@ -136,7 +138,7 @@ void init_openssl_global() {
     g_ssl_ctx = SSL_CTX_new(TLS_client_method());
     if (!g_ssl_ctx) {
         log_msg("[Fatal] SSL_CTX_new failed");
-        return;
+        return FALSE;
     }
 
     SSL_CTX_set_min_proto_version(g_ssl_ctx, TLS1_2_VERSION);
@@ -154,6 +156,7 @@ void init_openssl_global() {
         log_msg("[Security] Standard OpenSSL Cipher Suites");
     }
 
+    // 加载 CA 证书逻辑
     HRSRC hRes = FindResourceW(NULL, MAKEINTRESOURCEW(2), RT_RCDATA);
     if (hRes) {
         HGLOBAL hData = LoadResource(NULL, hRes);
@@ -185,10 +188,19 @@ void init_openssl_global() {
     } else {
         log_msg("[Fatal] cacert.pem resource not found in exe. Secure connection cannot be established.");
     }
+    return TRUE;
+}
+
+// [Safety] 线程安全的初始化入口
+void init_openssl_global() {
+    InitOnceExecuteOnce(&g_ssl_init_once, InitOpenSSLCallback, NULL, NULL);
 }
 
 int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target_host) {
-    if (!g_ssl_ctx) init_openssl_global();
+    // [Safety] 确保线程安全初始化
+    init_openssl_global();
+    if (!g_ssl_ctx) return -1;
+
     ctx->ssl = SSL_new(g_ssl_ctx);
     if (!ctx->ssl) {
         log_msg("[Err] SSL_new failed");
@@ -211,6 +223,7 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
     }
     SSL_set_bio(ctx->ssl, bio, bio);
     
+    // [Fix] 使用传入的 SNI，而非全局配置
     const char *sni_name = (target_sni && strlen(target_sni)) ? target_sni : target_host;
     SSL_set_tlsext_host_name(ctx->ssl, sni_name);
     
