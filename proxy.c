@@ -1,7 +1,11 @@
 #include "proxy.h"
 #include "crypto.h"
 #include "utils.h"
+#include "common.h"
 #include <openssl/sha.h>
+
+// [Safety] 全局活跃连接计数器，防止线程爆炸
+static volatile LONG g_active_connections = 0;
 
 // [Concurrency Fix] 客户端线程上下文，保存配置副本
 typedef struct {
@@ -32,12 +36,12 @@ void trojan_password_hash(const char* password, char* out_hex) {
     unsigned char digest[SHA224_DIGEST_LENGTH];
     SHA224((unsigned char*)password, strlen(password), digest);
     for(int i = 0; i < SHA224_DIGEST_LENGTH; i++) {
-        snprintf(out_hex + (i * 2), 3, "%02x", digest[i]); // 使用安全的 snprintf
+        snprintf(out_hex + (i * 2), 3, "%02x", digest[i]); 
     }
     out_hex[SHA224_DIGEST_LENGTH * 2] = 0;
 }
 
-// 接收超时辅助函数
+// 接收超时辅助函数 (使用 select 避免阻塞)
 int recv_timeout(SOCKET s, char *buf, int len, int timeout_sec) {
     fd_set fds; FD_ZERO(&fds); FD_SET(s, &fds);
     struct timeval tv = { timeout_sec, 0 };
@@ -100,9 +104,15 @@ void base64_encode_key(const unsigned char* src, char* dst) {
 
 // --- 客户端处理线程 (核心逻辑) ---
 DWORD WINAPI client_handler(LPVOID p) {
+    // [Safety] 连接数 +1
+    InterlockedIncrement(&g_active_connections);
+
     // [Concurrency Fix] 接收上下文并复制配置到本地，随即释放上下文
     ClientContext* ctx = (ClientContext*)p;
-    if (!ctx) return 0;
+    if (!ctx) {
+        InterlockedDecrement(&g_active_connections);
+        return 0;
+    }
 
     SOCKET c = ctx->clientSock;
     ProxyConfig localConfig = ctx->config; // 线程本地副本
@@ -161,7 +171,7 @@ DWORD WINAPI client_handler(LPVOID p) {
     // 初始化
     memset(&tls, 0, sizeof(tls));
     
-    // [Refactor] 使用小缓冲区初始化
+    // [Refactor] 使用小缓冲区初始化，避免内存爆炸
     c_buf = (char*)malloc(IO_BUFFER_SIZE); 
     ws_read_buf = (char*)malloc(ws_read_buf_cap); 
     ws_send_buf = (char*)malloc(IO_BUFFER_SIZE + 4096); 
@@ -169,7 +179,7 @@ DWORD WINAPI client_handler(LPVOID p) {
     if (!c_buf || !ws_read_buf || !ws_send_buf) goto cl_end; 
     setsockopt(c, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
     
-    // 1. 读取浏览器首包
+    // 1. 读取浏览器首包 (使用 IO_BUFFER_SIZE)
     browser_len = recv_timeout(c, c_buf, IO_BUFFER_SIZE, 10);
     if (browser_len <= 0) goto cl_end; 
     c_buf[browser_len] = 0;
@@ -214,7 +224,7 @@ DWORD WINAPI client_handler(LPVOID p) {
         } else { goto cl_end; }
     }
     
-    // [Refactor] 使用 getaddrinfo 实现 DNS 解析 (Step 3)
+    // [Refactor] 使用 getaddrinfo 实现 DNS 解析 (IPv4/IPv6 Happy Eyeballs)
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC; // 支持 IPv4 和 IPv6
     hints.ai_socktype = SOCK_STREAM;
@@ -229,7 +239,7 @@ DWORD WINAPI client_handler(LPVOID p) {
 
     // 连接重试循环
     for (retry_count = 0; retry_count < 3; retry_count++) {
-        // 遍历 DNS 返回的所有地址 (Happy Eyeballs 简化版)
+        // 遍历 DNS 返回的所有地址
         for (ptr = res; ptr != NULL; ptr = ptr->ai_next) {
             r = socket(ptr->ai_family, ptr->ai_socktype, ptr->ai_protocol);
             if (r == INVALID_SOCKET) continue;
@@ -265,12 +275,6 @@ DWORD WINAPI client_handler(LPVOID p) {
         Sleep(200); // 重试间隔
     }
     
-    // 释放地址信息结构
-    if (res) {
-        freeaddrinfo(res);
-        res = NULL;
-    }
-
     if (r == INVALID_SOCKET || tls.ssl == NULL) goto cl_end;
     
     // 3. WebSocket 握手
@@ -495,6 +499,7 @@ DWORD WINAPI client_handler(LPVOID p) {
         
         if (FD_ISSET(r, &fds) || pending > 0) {
             // [Refactor] 动态扩容逻辑
+            // 检查剩余空间是否足够，如果空间快满了，则扩容
             if (ws_buf_len >= ws_read_buf_cap - 1024) { 
                 if (ws_read_buf_cap < MAX_WS_FRAME_SIZE) {
                     int new_cap = ws_read_buf_cap * 2;
@@ -510,6 +515,7 @@ DWORD WINAPI client_handler(LPVOID p) {
                         ws_read_buf_cap = new_cap;
                     }
                 } else {
+                    // 如果已经达到最大限制且缓冲区满了，说明帧太大或者处理不及时
                     if (ws_buf_len >= MAX_WS_FRAME_SIZE) goto cl_end;
                 }
             }
@@ -554,7 +560,7 @@ DWORD WINAPI client_handler(LPVOID p) {
                 }
                 ws_buf_len -= (int)frame_total;
             } else { 
-                // [Refactor] 如果缓冲区已满但仍未解析出完整帧
+                // [Refactor] 如果缓冲区已满但仍未解析出完整帧（说明帧大小 > 当前容量）
                 if (ws_buf_len >= ws_read_buf_cap) {
                      if (ws_read_buf_cap >= MAX_WS_FRAME_SIZE) goto cl_end;
                 }
@@ -564,13 +570,16 @@ DWORD WINAPI client_handler(LPVOID p) {
     }
 
 cl_end:
-    if (res) freeaddrinfo(res); // 确保在异常退出时释放资源
+    if (res) freeaddrinfo(res);
     if (c_buf) free(c_buf); 
     if (ws_read_buf) free(ws_read_buf); 
     if (ws_send_buf) free(ws_send_buf); 
     tls_close(&tls);
     if (r != INVALID_SOCKET) closesocket(r); 
     if (c != INVALID_SOCKET) closesocket(c);
+    
+    // [Safety] 连接数 -1
+    InterlockedDecrement(&g_active_connections);
     return 0;
 }
 
@@ -586,9 +595,18 @@ DWORD WINAPI server_thread(LPVOID p) {
     }
     listen(g_listen_sock, 100);
     log_msg("Proxy Started: 127.0.0.1:%d", g_localPort);
+    
     while(g_proxyRunning) {
         SOCKET c = accept(g_listen_sock, NULL, NULL);
         if (c != INVALID_SOCKET) {
+            // [Safety] 检查是否超过最大连接数
+            if (g_active_connections >= MAX_CONNECTIONS) {
+                log_msg("[Warn] Max connections (%d) reached. Dropping request.", MAX_CONNECTIONS);
+                closesocket(c);
+                Sleep(10); // 稍微退避，防止 CPU 空转
+                continue;
+            }
+
             // [Concurrency Fix] 分配上下文并复制配置
             ClientContext* ctx = (ClientContext*)malloc(sizeof(ClientContext));
             if (ctx) {
@@ -596,9 +614,14 @@ DWORD WINAPI server_thread(LPVOID p) {
                 ctx->config = g_proxyConfig; // 线程安全的配置快照
                 HANDLE hClient = CreateThread(NULL, 0, client_handler, (LPVOID)ctx, 0, NULL);
                 if (hClient) CloseHandle(hClient); 
-                else { free(ctx); closesocket(c); }
+                else { 
+                    free(ctx); 
+                    closesocket(c); 
+                    log_msg("[Err] CreateThread failed");
+                }
             } else {
                 closesocket(c);
+                log_msg("[Err] OOM creating context");
             }
         } else break;
     }
