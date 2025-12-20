@@ -86,26 +86,48 @@ static void ParseSSPlugin(cJSON* outbound, const char* pluginParam) {
 // --- 配置文件基础操作 ---
 
 void LoadSettings() {
-    g_hotkeyModifiers = GetPrivateProfileIntW(L"Settings", L"Modifiers", MOD_CONTROL | MOD_ALT, g_iniFilePath);
-    g_hotkeyVk = GetPrivateProfileIntW(L"Settings", L"VK", 'H', g_iniFilePath);
-    g_localPort = GetPrivateProfileIntW(L"Settings", L"LocalPort", 10809, g_iniFilePath);
-    g_hideTrayStart = GetPrivateProfileIntW(L"Settings", L"HideTray", 0, g_iniFilePath);
+    // 预读取到局部变量，减少锁占用时间
+    UINT modifiers = GetPrivateProfileIntW(L"Settings", L"Modifiers", MOD_CONTROL | MOD_ALT, g_iniFilePath);
+    UINT vk = GetPrivateProfileIntW(L"Settings", L"VK", 'H', g_iniFilePath);
+    int port = GetPrivateProfileIntW(L"Settings", L"LocalPort", 10809, g_iniFilePath);
+    int hideTray = GetPrivateProfileIntW(L"Settings", L"HideTray", 0, g_iniFilePath);
     
-    g_enableChromeCiphers = GetPrivateProfileIntW(L"Settings", L"ChromeCiphers", 1, g_iniFilePath);
-    g_enableALPN = GetPrivateProfileIntW(L"Settings", L"EnableALPN", 1, g_iniFilePath);
-    g_enableFragment = GetPrivateProfileIntW(L"Settings", L"EnableFragment", 0, g_iniFilePath);
-    g_fragSizeMin = GetPrivateProfileIntW(L"Settings", L"FragMin", 5, g_iniFilePath);
-    g_fragSizeMax = GetPrivateProfileIntW(L"Settings", L"FragMax", 20, g_iniFilePath);
-    g_fragDelayMs = GetPrivateProfileIntW(L"Settings", L"FragDelay", 2, g_iniFilePath);
-    g_enablePadding = GetPrivateProfileIntW(L"Settings", L"EnablePadding", 0, g_iniFilePath);
-    g_padSizeMin = GetPrivateProfileIntW(L"Settings", L"PadMin", 100, g_iniFilePath);
-    g_padSizeMax = GetPrivateProfileIntW(L"Settings", L"PadMax", 500, g_iniFilePath);
+    int enableChrome = GetPrivateProfileIntW(L"Settings", L"ChromeCiphers", 1, g_iniFilePath);
+    int enableALPN = GetPrivateProfileIntW(L"Settings", L"EnableALPN", 1, g_iniFilePath);
+    int enableFrag = GetPrivateProfileIntW(L"Settings", L"EnableFragment", 0, g_iniFilePath);
+    int fragMin = GetPrivateProfileIntW(L"Settings", L"FragMin", 5, g_iniFilePath);
+    int fragMax = GetPrivateProfileIntW(L"Settings", L"FragMax", 20, g_iniFilePath);
+    int fragDly = GetPrivateProfileIntW(L"Settings", L"FragDelay", 2, g_iniFilePath);
+    int enablePad = GetPrivateProfileIntW(L"Settings", L"EnablePadding", 0, g_iniFilePath);
+    int padMin = GetPrivateProfileIntW(L"Settings", L"PadMin", 100, g_iniFilePath);
+    int padMax = GetPrivateProfileIntW(L"Settings", L"PadMax", 500, g_iniFilePath);
+    int uaIdx = GetPrivateProfileIntW(L"Settings", L"UAPlatform", 0, g_iniFilePath);
+
+    // [Lock] 开始写入全局配置
+    EnterCriticalSection(&g_configLock);
+
+    g_hotkeyModifiers = modifiers;
+    g_hotkeyVk = vk;
+    g_localPort = port;
+    g_hideTrayStart = hideTray;
+    
+    g_enableChromeCiphers = enableChrome;
+    g_enableALPN = enableALPN;
+    g_enableFragment = enableFrag;
+    g_fragSizeMin = fragMin;
+    g_fragSizeMax = fragMax;
+    g_fragDelayMs = fragDly;
+    g_enablePadding = enablePad;
+    g_padSizeMin = padMin;
+    g_padSizeMax = padMax;
 
     if (g_fragSizeMin < 1) g_fragSizeMin = 1; if (g_fragSizeMax < g_fragSizeMin) g_fragSizeMax = g_fragSizeMin;
     if (g_fragDelayMs < 0) g_fragDelayMs = 0; if (g_padSizeMin < 0) g_padSizeMin = 0; if (g_padSizeMax < g_padSizeMin) g_padSizeMax = g_padSizeMin;
 
-    g_uaPlatformIndex = GetPrivateProfileIntW(L"Settings", L"UAPlatform", 0, g_iniFilePath);
-    wchar_t wUABuf[512] = {0}; GetPrivateProfileStringW(L"Settings", L"UserAgent", L"", wUABuf, 512, g_iniFilePath);
+    g_uaPlatformIndex = uaIdx;
+    
+    wchar_t wUABuf[512] = {0}; 
+    GetPrivateProfileStringW(L"Settings", L"UserAgent", L"", wUABuf, 512, g_iniFilePath);
     if (wcslen(wUABuf) > 5) WideCharToMultiByte(CP_UTF8, 0, wUABuf, -1, g_userAgentStr, sizeof(g_userAgentStr), NULL, NULL);
     else SafeStrCpy(g_userAgentStr, sizeof(g_userAgentStr), UA_TEMPLATES[0]);
 
@@ -121,9 +143,14 @@ void LoadSettings() {
         GetPrivateProfileStringW(L"Subscriptions", wKeyUrl, L"", wUrl, 512, g_iniFilePath);
         WideCharToMultiByte(CP_UTF8, 0, wUrl, -1, g_subs[i].url, 512, NULL, NULL);
     }
+
+    LeaveCriticalSection(&g_configLock);
 }
 
 void SaveSettings() {
+    // [Lock] 读取全局变量需要加锁，防止写入时发生部分更新
+    EnterCriticalSection(&g_configLock);
+
     wchar_t buffer[16];
     _snwprintf(buffer, 16, L"%u", g_hotkeyModifiers); WritePrivateProfileStringW(L"Settings", L"Modifiers", buffer, g_iniFilePath);
     _snwprintf(buffer, 16, L"%u", g_hotkeyVk); WritePrivateProfileStringW(L"Settings", L"VK", buffer, g_iniFilePath);
@@ -139,7 +166,9 @@ void SaveSettings() {
     _snwprintf(buffer, 16, L"%d", g_padSizeMin); WritePrivateProfileStringW(L"Settings", L"PadMin", buffer, g_iniFilePath);
     _snwprintf(buffer, 16, L"%d", g_padSizeMax); WritePrivateProfileStringW(L"Settings", L"PadMax", buffer, g_iniFilePath);
     _snwprintf(buffer, 16, L"%d", g_uaPlatformIndex); WritePrivateProfileStringW(L"Settings", L"UAPlatform", buffer, g_iniFilePath);
-    wchar_t wUABuf[512] = {0}; MultiByteToWideChar(CP_UTF8, 0, g_userAgentStr, -1, wUABuf, 512);
+    
+    wchar_t wUABuf[512] = {0}; 
+    MultiByteToWideChar(CP_UTF8, 0, g_userAgentStr, -1, wUABuf, 512);
     WritePrivateProfileStringW(L"Settings", L"UserAgent", wUABuf, g_iniFilePath);
 
     WritePrivateProfileStringW(L"Settings", L"LastNode", currentNode, g_iniFilePath);
@@ -155,6 +184,8 @@ void SaveSettings() {
         MultiByteToWideChar(CP_UTF8, 0, g_subs[i].url, -1, wUrl, 512); 
         WritePrivateProfileStringW(L"Subscriptions", wKeyUrl, wUrl, g_iniFilePath);
     }
+
+    LeaveCriticalSection(&g_configLock);
 }
 
 void SetAutorun(BOOL enable) {
@@ -178,12 +209,23 @@ BOOL IsAutorun() {
 }
 
 void ParseTags() {
+    // [Lock] 保护 nodeTags 数组的更新
+    EnterCriticalSection(&g_configLock);
+
     if (nodeTags) { for(int i=0; i<nodeCount; i++) free(nodeTags[i]); free(nodeTags); }
     nodeCount = 0; nodeTags = NULL;
     char* buffer = NULL; long size = 0;
-    if (!ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) return;
+    if (!ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) {
+        LeaveCriticalSection(&g_configLock);
+        return;
+    }
+
     cJSON* root = cJSON_Parse(buffer); free(buffer);
-    if (!root) return;
+    if (!root) {
+        LeaveCriticalSection(&g_configLock);
+        return;
+    }
+
     cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
     cJSON* node;
     cJSON_ArrayForEach(node, outbounds) {
@@ -197,6 +239,8 @@ void ParseTags() {
         }
     }
     cJSON_Delete(root);
+    
+    LeaveCriticalSection(&g_configLock);
 }
 
 char* GetUniqueTagName(cJSON* outbounds, const char* type, const char* base_name) {
@@ -222,6 +266,10 @@ char* GetUniqueTagName(cJSON* outbounds, const char* type, const char* base_name
 
 void ParseNodeConfigToGlobal(cJSON *node) {
     if (!node) return;
+    
+    // [Lock] 锁定全局代理配置，防止 Worker 线程读取到正在修改的数据
+    EnterCriticalSection(&g_configLock);
+
     memset(&g_proxyConfig, 0, sizeof(ProxyConfig));
     // [Security Fix] 使用 SafeStrCpy 防止配置溢出
     SafeStrCpy(g_proxyConfig.path, sizeof(g_proxyConfig.path), "/"); 
@@ -266,16 +314,23 @@ void ParseNodeConfigToGlobal(cJSON *node) {
         SafeStrCpy(g_proxyConfig.type, sizeof(g_proxyConfig.type), "socks");
     }
 
+    LeaveCriticalSection(&g_configLock);
+
     log_msg("Node Config Loaded: %s:%d (Type: %s, SNI: %s)", 
         g_proxyConfig.host, g_proxyConfig.port, g_proxyConfig.type, g_proxyConfig.sni);
 }
 
 void SwitchNode(const wchar_t* tag) {
+    // 1. 更新当前节点名称 (加锁)
+    EnterCriticalSection(&g_configLock);
     wcsncpy(currentNode, tag, 63);
+    LeaveCriticalSection(&g_configLock);
+
     char* buffer = NULL; long size = 0;
     if (!ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) return;
     cJSON* root = cJSON_Parse(buffer); free(buffer);
     if (!root) return;
+    
     cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
     cJSON* targetNode = NULL;
     char tagUtf8[256]; WideCharToMultiByte(CP_UTF8, 0, tag, -1, tagUtf8, 256, NULL, NULL);
@@ -284,11 +339,12 @@ void SwitchNode(const wchar_t* tag) {
         cJSON* t = cJSON_GetObjectItem(node, "tag");
         if (t && strcmp(t->valuestring, tagUtf8) == 0) { targetNode = node; break; }
     }
+    
     if (targetNode) {
         StopProxyCore(); 
-        ParseNodeConfigToGlobal(targetNode); 
+        ParseNodeConfigToGlobal(targetNode); // 内部已加锁
         StartProxyCore();
-        SaveSettings(); 
+        SaveSettings(); // 内部已加锁
         
         wchar_t tip[128]; 
         _snwprintf(tip, 128, L"已切换: %s", tag);
@@ -312,7 +368,7 @@ void DeleteNode(const wchar_t* tag) {
         idx++;
     }
     char* out = cJSON_Print(root); WriteBufferToFile(CONFIG_FILE, out); free(out); cJSON_Delete(root);
-    ParseTags(); 
+    ParseTags(); // 内部已加锁
 }
 
 BOOL AddNodeToConfig(cJSON* newNode) {
@@ -399,37 +455,67 @@ int ImportFromClipboard() {
 
 int UpdateAllSubscriptions(BOOL forceMsg) {
     int activeSubs = 0;
+    // [Lock] 保护 g_subs 访问
+    EnterCriticalSection(&g_configLock);
     for(int i=0; i<g_subCount; i++) if(g_subs[i].enabled && strlen(g_subs[i].url) > 4) activeSubs++;
+    LeaveCriticalSection(&g_configLock);
+
     if (activeSubs == 0) { if (forceMsg) log_msg("[Sub] No active subscriptions found."); return 0; }
     log_msg("[Sub] Starting update for %d subscriptions...", activeSubs);
     char* rawData[MAX_SUBS] = {0}; int downloadSuccess = 0;
+    
+    // 拷贝订阅信息以避免下载过程中长时间持有锁
+    char subUrls[MAX_SUBS][512];
+    int subIndices[MAX_SUBS];
+    int count = 0;
+
+    EnterCriticalSection(&g_configLock);
     for (int i = 0; i < g_subCount; i++) {
         if (g_subs[i].enabled && strlen(g_subs[i].url) > 4) {
-            log_msg("[Sub] Downloading (%d/%d): %s", i+1, g_subCount, g_subs[i].url);
-            char* data = Utils_HttpGet(g_subs[i].url);
-            if (data) { rawData[i] = data; downloadSuccess++; } else log_msg("[Sub] Download failed: %s", g_subs[i].url);
+            strncpy(subUrls[count], g_subs[i].url, 512);
+            subIndices[count] = i;
+            count++;
         }
     }
+    LeaveCriticalSection(&g_configLock);
+
+    for (int i = 0; i < count; i++) {
+        log_msg("[Sub] Downloading (%d/%d): %s", i+1, count, subUrls[i]);
+        char* data = Utils_HttpGet(subUrls[i]);
+        if (data) { rawData[i] = data; downloadSuccess++; } else log_msg("[Sub] Download failed: %s", subUrls[i]);
+    }
+
     if (downloadSuccess == 0) { log_msg("[Error] All downloads failed. Config not updated."); return 0; }
+    
     char* buffer = NULL; long size = 0; cJSON* root = NULL;
     if (ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) { root = cJSON_Parse(buffer); free(buffer); }
     if (!root) { root = cJSON_CreateObject(); }
     if (cJSON_HasObjectItem(root, "outbounds")) cJSON_DeleteItemFromObject(root, "outbounds");
     cJSON* outbounds = cJSON_CreateArray(); cJSON_AddItemToObject(root, "outbounds", outbounds);
     int totalNewNodes = 0;
-    for (int i = 0; i < g_subCount; i++) {
-        if (rawData[i]) { int count = Internal_BatchAddNodesFromText(rawData[i], outbounds); totalNewNodes += count; free(rawData[i]); }
+    
+    for (int i = 0; i < count; i++) {
+        if (rawData[i]) { 
+            int c = Internal_BatchAddNodesFromText(rawData[i], outbounds); 
+            totalNewNodes += c; 
+            free(rawData[i]); 
+        }
     }
     log_msg("[Sub] Total nodes parsed: %d. Saving config...", totalNewNodes);
     char* out = cJSON_Print(root); WriteBufferToFile(CONFIG_FILE, out); free(out); cJSON_Delete(root);
-    ParseTags(); log_msg("[Sub] Update complete.");
+    ParseTags(); // 内部已加锁
+    log_msg("[Sub] Update complete.");
     return totalNewNodes;
 }
 
 void ToggleTrayIcon() {
+    // 简单锁保护 UI 状态标志
+    EnterCriticalSection(&g_configLock);
     if (g_isIconVisible) { Shell_NotifyIconW(NIM_DELETE, &nid); g_isIconVisible = FALSE; g_hideTrayStart = 1; }
     else { nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP; Shell_NotifyIconW(NIM_ADD, &nid); g_isIconVisible = TRUE; g_hideTrayStart = 0; }
-    SaveSettings();
+    LeaveCriticalSection(&g_configLock);
+    
+    SaveSettings(); // 内部已加锁
 }
 
 // --- 协议解析函数 ---
