@@ -3,9 +3,10 @@
 #include "proxy.h"
 #include "utils.h"
 #include "crypto.h"
+#include "common.h" // [Fix] 引入全局锁定义
 #include <commctrl.h>
 #include <stdio.h>
-#include <wchar.h> // for swprintf_s
+#include <wchar.h> 
 
 // 链接 comctl32 库以支持高级控件
 #pragma comment(lib, "comctl32.lib")
@@ -37,8 +38,9 @@ DWORD WINAPI AutoUpdateThread(LPVOID lpParam) {
     Sleep(3000); 
     
     // 如果有启用的订阅，执行更新 (FALSE = 不弹窗，只写日志)
+    // g_subCount 的读取虽理论上需加锁，但原子整数读取风险极低，此处从略以避免长锁
     if (g_subCount > 0) {
-        int count = UpdateAllSubscriptions(FALSE);
+        int count = UpdateAllSubscriptions(FALSE); // 内部已加锁
         
         // 如果更新到了节点，仅通知界面刷新，不进行危险的 SwitchNode 操作
         if (count > 0) {
@@ -55,7 +57,7 @@ DWORD WINAPI AutoUpdateThread(LPVOID lpParam) {
 DWORD WINAPI ManualUpdateThread(LPVOID param) {
     HWND hWnd = (HWND)param;
     // 执行更新 (TRUE = 强制记录日志)
-    int count = UpdateAllSubscriptions(TRUE);
+    int count = UpdateAllSubscriptions(TRUE); // 内部已加锁
     // 发送自定义消息通知 UI 线程更新完成
     PostMessage(hWnd, WM_UPDATE_FINISH, (WPARAM)count, 0);
     return 0;
@@ -266,19 +268,37 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
     static HWND hHotkey, hPortEdit;
     switch(msg) {
         case WM_CREATE: {
+            // [Lock] 保护读取，确保 UI 显示的是一致的全局配置
+            EnterCriticalSection(&g_configLock);
+            int localPort = g_localPort;
+            int modifiers = g_hotkeyModifiers;
+            int vk = g_hotkeyVk;
+            BOOL chrome = g_enableChromeCiphers;
+            BOOL alpn = g_enableALPN;
+            BOOL frag = g_enableFragment;
+            BOOL pad = g_enablePadding;
+            int fMin = g_fragSizeMin;
+            int fMax = g_fragSizeMax;
+            int fDly = g_fragDelayMs;
+            int pMin = g_padSizeMin;
+            int pMax = g_padSizeMax;
+            int uaIdx = g_uaPlatformIndex;
+            char uaStr[512]; strcpy(uaStr, g_userAgentStr);
+            LeaveCriticalSection(&g_configLock);
+
             int y = 25;
             // 基础设置区域
             CreateWindowW(L"STATIC", L"全局快捷键:", WS_CHILD|WS_VISIBLE, 25, y, 140, 20, hWnd, NULL,NULL,NULL);
             hHotkey = CreateWindowExW(0, HOTKEY_CLASSW, NULL, WS_CHILD|WS_VISIBLE|WS_BORDER, 160, y-3, 270, 25, hWnd, (HMENU)ID_HOTKEY_CTRL, NULL,NULL);
-            UINT hkMod = 0; if (g_hotkeyModifiers & MOD_SHIFT) hkMod |= HOTKEYF_SHIFT;
-            if (g_hotkeyModifiers & MOD_CONTROL) hkMod |= HOTKEYF_CONTROL;
-            if (g_hotkeyModifiers & MOD_ALT) hkMod |= HOTKEYF_ALT;
-            SendMessage(hHotkey, HKM_SETHOTKEY, MAKEWORD(g_hotkeyVk, hkMod), 0);
+            UINT hkMod = 0; if (modifiers & MOD_SHIFT) hkMod |= HOTKEYF_SHIFT;
+            if (modifiers & MOD_CONTROL) hkMod |= HOTKEYF_CONTROL;
+            if (modifiers & MOD_ALT) hkMod |= HOTKEYF_ALT;
+            SendMessage(hHotkey, HKM_SETHOTKEY, MAKEWORD(vk, hkMod), 0);
             
             y += 40;
             CreateWindowW(L"STATIC", L"本地代理端口:", WS_CHILD|WS_VISIBLE, 25, y, 140, 20, hWnd, NULL,NULL,NULL);
             hPortEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", NULL, WS_CHILD|WS_VISIBLE|ES_NUMBER, 160, y-3, 100, 25, hWnd, (HMENU)ID_PORT_EDIT, NULL,NULL);
-            SetDlgItemInt(hWnd, ID_PORT_EDIT, g_localPort, FALSE);
+            SetDlgItemInt(hWnd, ID_PORT_EDIT, localPort, FALSE);
 
             // 抗封锁设置 GroupBox
             y += 50;
@@ -325,21 +345,21 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             CreateWindowW(L"BUTTON", L"确定", WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON, 110, y, 100, 32, hWnd, (HMENU)IDOK, NULL,NULL);
             CreateWindowW(L"BUTTON", L"取消", WS_CHILD|WS_VISIBLE, 250, y, 100, 32, hWnd, (HMENU)IDCANCEL, NULL,NULL);
 
-            SendMessage(hChk1, BM_SETCHECK, g_enableChromeCiphers ? BST_CHECKED : BST_UNCHECKED, 0);
-            SendMessage(hChk2, BM_SETCHECK, g_enableALPN ? BST_CHECKED : BST_UNCHECKED, 0);
-            SendMessage(hChk3, BM_SETCHECK, g_enableFragment ? BST_CHECKED : BST_UNCHECKED, 0);
-            SendMessage(hChkPad, BM_SETCHECK, g_enablePadding ? BST_CHECKED : BST_UNCHECKED, 0);
+            SendMessage(hChk1, BM_SETCHECK, chrome ? BST_CHECKED : BST_UNCHECKED, 0);
+            SendMessage(hChk2, BM_SETCHECK, alpn ? BST_CHECKED : BST_UNCHECKED, 0);
+            SendMessage(hChk3, BM_SETCHECK, frag ? BST_CHECKED : BST_UNCHECKED, 0);
+            SendMessage(hChkPad, BM_SETCHECK, pad ? BST_CHECKED : BST_UNCHECKED, 0);
 
-            SetDlgItemInt(hWnd, ID_EDIT_FRAG_MIN, g_fragSizeMin, FALSE);
-            SetDlgItemInt(hWnd, ID_EDIT_FRAG_MAX, g_fragSizeMax, FALSE);
-            SetDlgItemInt(hWnd, ID_EDIT_FRAG_DLY, g_fragDelayMs, FALSE);
+            SetDlgItemInt(hWnd, ID_EDIT_FRAG_MIN, fMin, FALSE);
+            SetDlgItemInt(hWnd, ID_EDIT_FRAG_MAX, fMax, FALSE);
+            SetDlgItemInt(hWnd, ID_EDIT_FRAG_DLY, fDly, FALSE);
             
-            SetDlgItemInt(hWnd, ID_EDIT_PAD_MIN, g_padSizeMin, FALSE);
-            SetDlgItemInt(hWnd, ID_EDIT_PAD_MAX, g_padSizeMax, FALSE);
+            SetDlgItemInt(hWnd, ID_EDIT_PAD_MIN, pMin, FALSE);
+            SetDlgItemInt(hWnd, ID_EDIT_PAD_MAX, pMax, FALSE);
 
             for(int i=0; i<5; i++) SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)UA_PLATFORMS[i]);
-            SendMessage(hCombo, CB_SETCURSEL, g_uaPlatformIndex, 0);
-            SetDlgItemTextA(hWnd, ID_EDIT_UA_STR, g_userAgentStr);
+            SendMessage(hCombo, CB_SETCURSEL, uaIdx, 0);
+            SetDlgItemTextA(hWnd, ID_EDIT_UA_STR, uaStr);
             
             EnumChildWindows(hWnd, EnumSetFont, (LPARAM)hAppFont);
             SendMessage(hWnd, WM_SETFONT, (WPARAM)hAppFont, TRUE);
@@ -351,7 +371,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
                 if (idx >= 0 && idx < 5) SetDlgItemTextA(hWnd, ID_EDIT_UA_STR, UA_TEMPLATES[idx]);
             }
             if (LOWORD(wParam) == IDOK) {
-                // 保存逻辑
+                // 读取 UI 状态
                 int fMin = GetDlgItemInt(hWnd, ID_EDIT_FRAG_MIN, NULL, FALSE);
                 int fMax = GetDlgItemInt(hWnd, ID_EDIT_FRAG_MAX, NULL, FALSE);
                 int fDly = GetDlgItemInt(hWnd, ID_EDIT_FRAG_DLY, NULL, FALSE);
@@ -360,6 +380,17 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
                 
                 if (fMin < 1) fMin = 1; if (fMax < fMin) fMax = fMin;
                 if (pMin < 0) pMin = 0; if (pMax < pMin) pMax = pMin;
+
+                LRESULT res = SendMessage(hHotkey, HKM_GETHOTKEY, 0, 0);
+                UINT vk = LOBYTE(res); UINT mod = HIBYTE(res);
+                UINT newMod = 0; if (mod & HOTKEYF_SHIFT) newMod |= MOD_SHIFT;
+                if (mod & HOTKEYF_CONTROL) newMod |= MOD_CONTROL;
+                if (mod & HOTKEYF_ALT) newMod |= MOD_ALT;
+                
+                int port = GetDlgItemInt(hWnd, ID_PORT_EDIT, NULL, FALSE);
+
+                // [Lock] 保护写入，确保全局配置的一致性
+                EnterCriticalSection(&g_configLock);
 
                 g_fragSizeMin = fMin; g_fragSizeMax = fMax; g_fragDelayMs = fDly;
                 g_padSizeMin = pMin; g_padSizeMax = pMax;
@@ -372,20 +403,16 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
                 g_uaPlatformIndex = SendMessage(GetDlgItem(hWnd, ID_COMBO_PLATFORM), CB_GETCURSEL, 0, 0);
                 GetDlgItemTextA(hWnd, ID_EDIT_UA_STR, g_userAgentStr, 511);
 
-                LRESULT res = SendMessage(hHotkey, HKM_GETHOTKEY, 0, 0);
-                UINT vk = LOBYTE(res); UINT mod = HIBYTE(res);
-                UINT newMod = 0; if (mod & HOTKEYF_SHIFT) newMod |= MOD_SHIFT;
-                if (mod & HOTKEYF_CONTROL) newMod |= MOD_CONTROL;
-                if (mod & HOTKEYF_ALT) newMod |= MOD_ALT;
                 if (vk != 0 && newMod != 0) {
                     UnregisterHotKey(hwnd, ID_GLOBAL_HOTKEY);
                     if (RegisterHotKey(hwnd, ID_GLOBAL_HOTKEY, newMod, vk)) { g_hotkeyVk = vk; g_hotkeyModifiers = newMod; }
                 }
 
-                int port = GetDlgItemInt(hWnd, ID_PORT_EDIT, NULL, FALSE);
                 if (port > 0 && port < 65535) g_localPort = port;
 
-                SaveSettings();
+                LeaveCriticalSection(&g_configLock);
+
+                SaveSettings(); // 内部已加锁
                 if (g_proxyRunning) { StopProxyCore(); StartProxyCore(); }
                 DestroyWindow(hWnd);
             } else if (LOWORD(wParam) == IDCANCEL) DestroyWindow(hWnd);
@@ -415,6 +442,9 @@ static HWND hSubList;
 void RefreshSubList() {
     if (!hSubList) return;
     ListView_DeleteAllItems(hSubList);
+    
+    // [Lock] 保护 g_subs 遍历，防止后台更新线程同时修改
+    EnterCriticalSection(&g_configLock);
     for (int i = 0; i < g_subCount; i++) {
         LVITEMW li = {0};
         li.mask = LVIF_TEXT;
@@ -426,6 +456,7 @@ void RefreshSubList() {
         ListView_InsertItem(hSubList, &li);
         ListView_SetCheckState(hSubList, i, g_subs[i].enabled);
     }
+    LeaveCriticalSection(&g_configLock);
 }
 
 LRESULT CALLBACK SubWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -454,28 +485,46 @@ LRESULT CALLBACK SubWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_COMMAND: {
             int id = LOWORD(wParam);
             if (id == ID_SUB_ADD_BTN) {
-                if (g_subCount >= MAX_SUBS) { MessageBoxW(hWnd, L"已达最大订阅数限制(20个)", L"提示", MB_OK); break; }
+                EnterCriticalSection(&g_configLock); // [Lock]
+                if (g_subCount >= MAX_SUBS) { 
+                    LeaveCriticalSection(&g_configLock);
+                    MessageBoxW(hWnd, L"已达最大订阅数限制(20个)", L"提示", MB_OK); 
+                    break; 
+                }
                 char newUrl[512]; GetDlgItemTextA(hWnd, ID_SUB_URL_EDIT, newUrl, 512);
                 TrimString(newUrl);
-                if (strlen(newUrl) < 4) { MessageBoxW(hWnd, L"请输入有效的订阅地址", L"错误", MB_OK); break; }
-                // [Safety] 限制复制
+                if (strlen(newUrl) < 4) { 
+                    LeaveCriticalSection(&g_configLock);
+                    MessageBoxW(hWnd, L"请输入有效的订阅地址", L"错误", MB_OK); 
+                    break; 
+                }
                 strncpy(g_subs[g_subCount].url, newUrl, 511); g_subs[g_subCount].url[511] = 0;
                 g_subs[g_subCount].enabled = TRUE; g_subCount++;
+                LeaveCriticalSection(&g_configLock); // [Unlock]
+                
                 RefreshSubList(); SetDlgItemTextA(hWnd, ID_SUB_URL_EDIT, "");
             }
             else if (id == ID_SUB_DEL_BTN) {
                 int sel = ListView_GetNextItem(hSubList, -1, LVNI_SELECTED);
                 if (sel != -1) {
+                    EnterCriticalSection(&g_configLock); // [Lock]
                     for (int i = sel; i < g_subCount - 1; i++) g_subs[i] = g_subs[i+1];
-                    g_subCount--; RefreshSubList();
+                    g_subCount--; 
+                    LeaveCriticalSection(&g_configLock); // [Unlock]
+                    RefreshSubList();
                 } else MessageBoxW(hWnd, L"请先在列表中选中一项", L"提示", MB_OK);
             }
             else if (id == ID_SUB_SAVE_BTN) {
+                EnterCriticalSection(&g_configLock); // [Lock]
                 for(int i=0; i<g_subCount; i++) g_subs[i].enabled = ListView_GetCheckState(hSubList, i);
-                SaveSettings(); MessageBoxW(hWnd, L"订阅设置已保存", L"成功", MB_OK);
+                LeaveCriticalSection(&g_configLock); // [Unlock]
+                SaveSettings(); 
+                MessageBoxW(hWnd, L"订阅设置已保存", L"成功", MB_OK);
             }
             else if (id == ID_SUB_UPD_BTN) { 
+                EnterCriticalSection(&g_configLock); // [Lock]
                 for(int i=0; i<g_subCount; i++) g_subs[i].enabled = ListView_GetCheckState(hSubList, i);
+                LeaveCriticalSection(&g_configLock); // [Unlock]
                 SaveSettings(); 
                 SetWindowTextW(hWnd, L"正在更新 (后台进行中)...");
                 EnableWindow(GetDlgItem(hWnd, ID_SUB_UPD_BTN), FALSE); 
@@ -534,8 +583,17 @@ LRESULT CALLBACK NodeMgrWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             break;
         case WM_REFRESH_NODELIST:
             SendMessage(hList, LB_RESETCONTENT, 0, 0);
-            ParseTags();
-            for(int i = 0; i < nodeCount; i++) SendMessageW(hList, LB_ADDSTRING, 0, (LPARAM)nodeTags[i]);
+            
+            // [Lock] 保护节点列表更新和遍历
+            // ParseTags 内部虽然有锁，但我们需要确保 ParseTags 之后到遍历结束期间 nodeTags 不被释放
+            EnterCriticalSection(&g_configLock); 
+            
+            ParseTags(); // 内部有锁，递归锁是安全的
+            for(int i = 0; i < nodeCount; i++) {
+                SendMessageW(hList, LB_ADDSTRING, 0, (LPARAM)nodeTags[i]);
+            }
+            
+            LeaveCriticalSection(&g_configLock); 
             break;
         case WM_COMMAND:
             if (LOWORD(wParam) == ID_NODEMGR_SUB) OpenSubWindow();
@@ -556,7 +614,6 @@ LRESULT CALLBACK NodeMgrWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                 int selCount = SendMessage(hList, LB_GETSELCOUNT, 0, 0);
                 if (selCount <= 0) { MessageBoxW(hWnd, L"请先选择至少一个节点", L"提示", MB_OK); break; }
                 wchar_t confirmMsg[64]; 
-                // [Safety] 替换 wsprintfW
                 swprintf_s(confirmMsg, 64, L"确定要删除选中的 %d 个节点吗？", selCount);
                 if (MessageBoxW(hWnd, confirmMsg, L"确认删除", MB_YESNO | MB_ICONQUESTION) != IDYES) break;
                 int* selIndices = (int*)malloc(selCount * sizeof(int));
@@ -724,7 +781,11 @@ void OpenLogViewer(BOOL bShow) {
 LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == WM_TRAY && LOWORD(lParam) == WM_RBUTTONUP) {
         POINT pt; GetCursorPos(&pt); SetForegroundWindow(hWnd);
-        ParseTags();
+        
+        // [Lock] 保护 Tray 菜单的生成，防止 nodeTags 变动
+        EnterCriticalSection(&g_configLock);
+        ParseTags(); 
+        
         if (hMenu) DestroyMenu(hMenu); hMenu = CreatePopupMenu(); hNodeSubMenu = CreatePopupMenu();
         if (nodeCount == 0) AppendMenuW(hNodeSubMenu, MF_STRING|MF_GRAYED, 0, L"(无节点)");
         else {
@@ -733,6 +794,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 AppendMenuW(hNodeSubMenu, f, ID_TRAY_NODE_BASE+i, nodeTags[i]);
             }
         }
+        LeaveCriticalSection(&g_configLock);
+
         AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hNodeSubMenu, L"切换节点");
         AppendMenuW(hMenu, MF_STRING, ID_TRAY_MANAGE_NODES, L"节点管理");
         AppendMenuW(hMenu, MF_STRING, ID_TRAY_IMPORT_CLIPBOARD, L"节点导入");
@@ -765,15 +828,36 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 HWND hMgr = FindWindowW(L"NodeMgr", L"节点管理 (支持 Ctrl+A 全选/多选)");
                 if (hMgr && IsWindow(hMgr)) SendMessage(hMgr, WM_REFRESH_NODELIST, 0, 0);
                 wchar_t msgBuf[128]; 
-                // [Safety] 替换 wsprintfW
                 swprintf_s(msgBuf, 128, L"成功导入 %d 个节点！", count);
                 MessageBoxW(hWnd, msgBuf, L"导入成功", MB_OK|MB_ICONINFORMATION);
-                if (wcslen(currentNode) == 0 && nodeCount > 0) SwitchNode(nodeTags[0]);
+                
+                EnterCriticalSection(&g_configLock);
+                if (wcslen(currentNode) == 0 && nodeCount > 0) {
+                    LeaveCriticalSection(&g_configLock);
+                    SwitchNode(nodeTags[0]); // SwitchNode 内部会加锁
+                } else {
+                    LeaveCriticalSection(&g_configLock);
+                }
             } else MessageBoxW(hWnd, L"剪贴板中未发现支持的链接 (vmess/vless/ss/trojan)", L"导入失败", MB_OK|MB_ICONWARNING);
         }
         else if (id >= ID_TRAY_NODE_BASE && id < ID_TRAY_NODE_BASE + 1000) {
             int idx = id - ID_TRAY_NODE_BASE;
-            if (idx >= 0 && idx < nodeCount) SwitchNode(nodeTags[idx]);
+            
+            // [Lock] 保护 nodeTags 访问
+            EnterCriticalSection(&g_configLock);
+            if (idx >= 0 && idx < nodeCount) {
+                // 复制 tag，避免 SwitchNode 内部锁与外部锁冲突（SwitchNode 是高层逻辑）
+                // 更好的做法是 Copy tag -> Unlock -> SwitchNode
+                int len = wcslen(nodeTags[idx]);
+                wchar_t* tagCopy = (wchar_t*)malloc((len + 1) * sizeof(wchar_t));
+                wcscpy(tagCopy, nodeTags[idx]);
+                LeaveCriticalSection(&g_configLock);
+                
+                SwitchNode(tagCopy);
+                free(tagCopy);
+            } else {
+                LeaveCriticalSection(&g_configLock);
+            }
         }
     }
     else if (msg == WM_HOTKEY && wParam == ID_GLOBAL_HOTKEY) ToggleTrayIcon();
@@ -782,6 +866,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nShow) {
     srand((unsigned)time(NULL));
+
+    // [Fix] 初始化全局锁 (最早调用)
+    InitGlobalLocks();
 
     wchar_t exePath[MAX_PATH]; GetModuleFileNameW(NULL, exePath, MAX_PATH);
     wchar_t* pDir = wcsrchr(exePath, L'\\'); if (pDir) { *pDir = 0; SetCurrentDirectoryW(exePath); }
@@ -815,20 +902,27 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nSho
     nid.uCallbackMessage = WM_TRAY; nid.hIcon = wc.hIcon; wcscpy(nid.szTip, L"Mandala Client");
     if (g_hideTrayStart == 1) { g_isIconVisible = FALSE; } else { Shell_NotifyIconW(NIM_ADD, &nid); g_isIconVisible = TRUE; }
     
-    ParseTags();
+    ParseTags(); // 内部已加锁
 
     // [修复] 启动时优先使用上次保存的节点
     if (wcslen(currentNode) > 0) {
         SwitchNode(currentNode);
     }
     else if (nodeCount > 0) {
-        SwitchNode(nodeTags[0]);
+        // [Lock] 保护 nodeTags 访问
+        EnterCriticalSection(&g_configLock);
+        wchar_t* firstNode = _wcsdup(nodeTags[0]); // 复制一份出来
+        LeaveCriticalSection(&g_configLock);
+        
+        SwitchNode(firstNode);
+        free(firstNode);
     }
     
     MSG msg; while(GetMessage(&msg, NULL, 0, 0)) { TranslateMessage(&msg); DispatchMessage(&msg); }
     
     // 程序退出前清理
     FreeGlobalSSLContext();
+    DeleteGlobalLocks(); // [Fix] 销毁锁
     
     return 0;
 }
