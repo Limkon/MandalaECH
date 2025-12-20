@@ -157,5 +157,10 @@ extern const char* UA_TEMPLATES[];
 
 extern BOOL g_enableLog;
 
+extern CRITICAL_SECTION g_configLock; 
+void InitGlobalLocks();
+void DeleteGlobalLocks();
+
 #endif // COMMON_H
+
 
