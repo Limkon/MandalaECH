@@ -1,18 +1,18 @@
 #include "proxy.h"
 #include "crypto.h"
-#include "utils.h" // [Fix] 包含此头文件以引用 FetchECHFromDoH
+#include "utils.h" // 包含此头文件以引用 FetchECHFromDoH
 #include <ws2tcpip.h>
 #include <openssl/sha.h>
 
-// [Concurrency Fix] 客户端线程上下文，保存配置副本
+// [Concurrency Fix] 客户端线程上下文
 typedef struct {
     SOCKET clientSock;
-    ProxyConfig config; // 完整的配置副本，避免读取全局变量导致的竞争条件
+    ProxyConfig config;
 } ClientContext;
 
 extern char g_dohUrl[512];
 
-// --- 辅助函数：解析 UUID (支持带横杠或不带) ---
+// --- 辅助函数：解析 UUID ---
 void parse_uuid(const char* uuid_str, unsigned char* out) {
     const char* p = uuid_str;
     int i = 0;
@@ -30,7 +30,7 @@ void parse_uuid(const char* uuid_str, unsigned char* out) {
     }
 }
 
-// --- 辅助函数：Trojan 密码哈希 (SHA224) ---
+// --- 辅助函数：Trojan 密码哈希 ---
 void trojan_password_hash(const char* password, char* out_hex) {
     unsigned char digest[SHA224_DIGEST_LENGTH];
     SHA224((unsigned char*)password, strlen(password), digest);
@@ -81,7 +81,6 @@ void base64_encode_key(const unsigned char* src, char* dst) {
 
 // --- 客户端处理线程 (核心逻辑) ---
 DWORD WINAPI client_handler(LPVOID p) {
-    // [Concurrency Fix] 接收上下文并复制配置到本地，随即释放上下文
     ClientContext* ctx = (ClientContext*)p;
     if (!ctx) return 0;
 
@@ -90,26 +89,26 @@ DWORD WINAPI client_handler(LPVOID p) {
     free(ctx); 
 
     // [ECH Logic] 自动获取 ECH
-    // 如果配置了伪装域名 (Outer SNI)，则启用 ECH 流程
+    // 如果配置了伪装域名 (Outer SNI)，说明用户希望使用 ECH 相关的抗封锁功能
     if (strlen(localConfig.outer_sni) > 0) {
-        log_msg("[ECH] Processing Outer SNI: %s", localConfig.outer_sni);
         
         // 1. 如果没有配置静态 ECH，尝试从 DoH 获取
+        // [Critical Fix] 必须查询“真实目标域名”(localConfig.sni) 的 keys，而不是伪装域名的 keys
         if (strlen(localConfig.ech) == 0) {
-            char* dynEch = FetchECHFromDoH(g_dohUrl, localConfig.outer_sni);
+            // 如果 SNI 为空，则使用 Host
+            const char* target_domain = (strlen(localConfig.sni) > 0) ? localConfig.sni : localConfig.host;
+            
+            log_msg("[ECH] Fetching keys for target: %s", target_domain);
+            char* dynEch = FetchECHFromDoH(g_dohUrl, target_domain);
+            
             if (dynEch) {
-                log_msg("[ECH] Auto-fetched ECH config from DoH");
-                // 更新本地副本的 ECH
+                log_msg("[ECH] Success. Got ECH config for %s", target_domain);
                 snprintf(localConfig.ech, sizeof(localConfig.ech), "%s", dynEch);
                 free(dynEch);
             } else {
-                log_msg("[ECH] Warning: Failed to fetch ECH from DoH, connection may fail.");
+                log_msg("[ECH] Failed to fetch ECH for %s. Connection may fail or fallback to plain SNI.", target_domain);
             }
         }
-        
-        // [Fix] 关键修正：删除了覆盖 localConfig.sni 的代码。
-        // localConfig.sni 必须保持为 Inner SNI (真实目标)，以便被 ECH 加密。
-        // 外部连接时的 SNI (Public Name) 会由 OpenSSL 根据 ECH Config 自动处理。
     }
 
     TLSContext tls; 
@@ -211,7 +210,10 @@ DWORD WINAPI client_handler(LPVOID p) {
     }
     
     // 连接到代理服务器
-    // [ECH DNS Logic] 优先解析 Outer SNI (伪装 IP)，以隐藏真实目标
+    // [Connection Strategy] 
+    // 1. 如果配置了 Outer SNI (伪装域名)，则连接到该伪装域名的 IP (通常是 CDN 节点)。
+    // 2. 否则，连接到真实 Host 的 IP。
+    // 这允许我们在不知道真实目标 IP (或被污染) 的情况下，通过连接到 CDN 边缘节点来访问目标。
     const char* connect_host = localConfig.host;
     if (strlen(localConfig.outer_sni) > 0) {
         connect_host = localConfig.outer_sni;
@@ -219,7 +221,6 @@ DWORD WINAPI client_handler(LPVOID p) {
     
     h = gethostbyname(connect_host);
     if(!h) { 
-        // Fallback: 如果 Outer SNI 解析失败，尝试解析 Host
         h = gethostbyname(localConfig.host);
         if (!h) { log_msg("[Err] DNS Fail: %s", connect_host); goto cl_end; }
     }
@@ -238,7 +239,7 @@ DWORD WINAPI client_handler(LPVOID p) {
         
         if (connect(r, (struct sockaddr*)&a, sizeof(a)) == 0) {
             tls.sock = r;
-            // [ECH] 传递 localConfig.sni (保持为 Inner SNI)
+            // [ECH] 传递 Inner SNI (真实目标) 和 对应的 ECH 配置
             if (tls_init_connect(&tls, localConfig.sni, localConfig.host, localConfig.ech) == 0) break;
             else tls_close(&tls);
         }
