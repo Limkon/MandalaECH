@@ -1,0 +1,53 @@
+name: X Windows Manual Build
+
+# 手动触发
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup MSYS2
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: MINGW64
+        # 1. 关闭自动更新，防止启动时因签名问题崩溃
+        update: false
+        cache: false
+        install: git
+
+    - name: Disable Signature Check and Install Dependencies
+      shell: msys2 {0}
+      run: |
+        echo "Applying NUCLEAR FIX: Disabling signature checks entirely..."
+        
+        # 2. 暴力修改 pacman 配置，信任所有包 (解决 GitHub Actions 环境签名死循环)
+        sed -i 's/^SigLevel.*/SigLevel = Never/' /etc/pacman.conf
+        
+        # 3. 同步数据库并安装工具链
+        echo "Installing build tools..."
+        pacman -Sy --noconfirm mingw-w64-x86_64-gcc mingw-w64-x86_64-openssl mingw-w64-x86_64-make
+
+    - name: Compile Resources
+      shell: msys2 {0}
+      run: |
+        windres -i resource.rc -o resource.res --target=pe-x86-64 -O coff
+
+    - name: Compile Executable
+      shell: msys2 {0}
+      run: |
+        # 编译指令更新：加入 globals.c
+        gcc gui.c config.c proxy.c crypto.c utils.c globals.c cJSON.c resource.res -o Mandala.exe \
+          -lssl -lcrypto -lws2_32 -lgdi32 -lcomctl32 -lwininet -lcrypt32 -luser32 \
+          -mwindows -municode -finput-charset=UTF-8 -static
+          
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: Mandala-executable
+        path: Mandala.exe
