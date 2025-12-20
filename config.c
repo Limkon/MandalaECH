@@ -390,12 +390,31 @@ BOOL AddNodeToConfig(cJSON* newNode) {
     return ret;
 }
 
-// [Fix] 重构：弃用 strtok，完全使用手动指针遍历，解决嵌套调用 strtok 导致的解析中断问题
+// [Fix] 重构：修复导入逻辑，优先检测是否为明文链接（包含 "://"）
+// 解决 vmess:// 等明文链接被误进行 Base64 解析导致的数据损坏
 int Internal_BatchAddNodesFromText(const char* text, cJSON* outbounds) {
     if (!text || !outbounds) return 0;
-    int count = 0; size_t decLen = 0; unsigned char* decoded = Base64Decode(text, &decLen);
+    int count = 0; 
     char* sourceText = NULL;
-    if (decoded && decLen > 0) sourceText = (char*)decoded; else { sourceText = strdup(text); if (decoded) free(decoded); }
+    unsigned char* decoded = NULL;
+    size_t decLen = 0;
+
+    // 1. 优先检测是否包含协议头 "://"
+    // 如果包含，说明是明文链接（单行或多行），直接使用原文本
+    if (strstr(text, "://")) {
+        sourceText = strdup(text);
+    } else {
+        // 2. 如果不包含协议头，尝试 Base64 解码 (订阅内容通常是 Base64)
+        decoded = Base64Decode(text, &decLen);
+        if (decoded && decLen > 0) {
+            sourceText = (char*)decoded;
+        } else {
+            // 解码失败或为空，回退到原文本尝试解析
+            sourceText = strdup(text);
+            if (decoded) free(decoded);
+        }
+    }
+    
     if (!sourceText) return 0;
     
     char* p = sourceText;
@@ -438,7 +457,14 @@ int Internal_BatchAddNodesFromText(const char* text, cJSON* outbounds) {
             p += len;
         }
     }
-    free(sourceText); return count;
+    
+    // 如果 sourceText 是我们 duplicated 的，需要释放
+    // 如果 sourceText 指向 decoded，也需要释放 decoded
+    // 为简化，直接释放 sourceText (如果它指向 malloc 的内存)
+    // 注意：如果是 decoded，sourceText = decoded，free(sourceText) 等同于 free(decoded)
+    free(sourceText); 
+    
+    return count;
 }
 
 int ImportFromClipboard() {
@@ -820,3 +846,4 @@ cJSON* ParseMandala(const char* link) {
     free(uuid); free(host); free(tag); 
     return outbound;
 }
+
