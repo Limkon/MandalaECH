@@ -184,7 +184,7 @@ static char* DechunkBody(const char* raw_body, int raw_len, int* out_len) {
     return new_buf;
 }
 
-// [Fix] 支持多 IP 轮询连接 (Happy Eyeballs 简化版)
+// [Fix] 增加详细的 IP 连接日志
 static char* InternalHttpsGet(const char* url, BOOL useProxy, int* out_len) {
     URL_COMP u; if (!ParseUrl(url, &u)) { log_msg("[Utils] Invalid URL: %s", url); return NULL; }
     if (out_len) *out_len = 0;
@@ -195,58 +195,66 @@ static char* InternalHttpsGet(const char* url, BOOL useProxy, int* out_len) {
     static int ini = 0; if (!ini) { SSL_library_init(); OpenSSL_add_all_algorithms(); SSL_load_error_strings(); ini = 1; }
 
     const char* tHost = useProxy ? "127.0.0.1" : u.host; int tPort = useProxy ? g_localPort : u.port;
+    
+    log_msg("[Utils] Resolving host: %s", tHost);
     struct hostent *he = gethostbyname(tHost); 
     if (!he || !he->h_addr_list[0]) { log_msg("[Utils] DNS resolution failed for %s", tHost); return NULL; }
 
     for (int attempt = 0; attempt < max_retries; attempt++) {
         SOCKET s = INVALID_SOCKET;
-        // [Fix] 轮询 IP 地址
+        // 轮询 IP 地址并记录
         for (int i = 0; he->h_addr_list[i] != NULL; i++) {
+            struct in_addr ip_addr = *((struct in_addr*)he->h_addr_list[i]);
+            // log_msg("[Utils] Trying IP: %s", inet_ntoa(ip_addr));
+
             s = socket(AF_INET, SOCK_STREAM, 0);
             if (s == INVALID_SOCKET) continue;
 
             struct sockaddr_in a; memset(&a,0,sizeof(a)); 
             a.sin_family = AF_INET; a.sin_port = htons(tPort); 
-            a.sin_addr = *((struct in_addr*)he->h_addr_list[i]);
+            a.sin_addr = ip_addr;
             
-            DWORD tv = 5000; // 5s timeout
+            DWORD tv = 5000; 
             setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char*)&tv, 4); 
             setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (char*)&tv, 4);
 
             if (connect(s, (struct sockaddr*)&a, sizeof(a)) == 0) {
-                // Connected
+                // log_msg("[Utils] Connected to %s", inet_ntoa(ip_addr));
                 break;
             } else {
-                // Connect failed, try next IP
+                log_msg("[Utils] Connect failed to %s. Error: %d", inet_ntoa(ip_addr), WSAGetLastError());
                 closesocket(s);
                 s = INVALID_SOCKET;
             }
         }
 
         if (s == INVALID_SOCKET) {
-            log_msg("[Utils] Connect failed (all IPs tried). Url: %s", url);
+            log_msg("[Utils] All connection attempts failed for URL: %s", url);
             return NULL; 
         }
 
         if (useProxy) {
             char req[512], buf[1024]; snprintf(req, 512, "CONNECT %s:%d HTTP/1.1\r\nHost: %s:%d\r\n\r\n", u.host, u.port, u.host, u.port);
-            send(s, req, strlen(req), 0); if (recv(s, buf, 1023, 0) <= 0 || !strstr(buf, "200 Connection")) { closesocket(s); return NULL; }
+            send(s, req, strlen(req), 0); 
+            if (recv(s, buf, 1023, 0) <= 0 || !strstr(buf, "200 Connection")) { 
+                log_msg("[Utils] Proxy handshake failed.");
+                closesocket(s); return NULL; 
+            }
         }
 
         SSL_CTX *ctx = SSL_CTX_new(TLS_client_method()); SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
         SSL *ssl = SSL_new(ctx); SSL_set_fd(ssl, (int)s); SSL_set_tlsext_host_name(ssl, u.host);
         
         if (SSL_connect(ssl) != 1) { 
-            log_msg("[Utils] SSL Handshake Failed"); 
+            log_msg("[Utils] SSL Handshake Failed for %s", u.host); 
             SSL_free(ssl); SSL_CTX_free(ctx); closesocket(s); return NULL; 
         }
 
         char req[4096];
-        // [Fix] User-Agent 伪装成 Go 客户端，防止 WAF 拦截
         const char* ua = isDoH ? "Go-http-client/1.1" : "Mandala/1.0";
         
         if (isDoH && attempt == 1) {
-            log_msg("[Utils] Retry with Content-Type header...");
+            log_msg("[Utils] DoH Retry: Adding Content-Type header...");
             snprintf(req, 4096, 
                 "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nAccept: application/dns-message\r\nContent-Type: application/dns-message\r\nConnection: close\r\n\r\n", 
                 u.path, u.host, ua);
@@ -288,7 +296,11 @@ static char* InternalHttpsGet(const char* url, BOOL useProxy, int* out_len) {
             return final_res; 
         }
 
-        log_msg("[Utils] HTTP Failed (Retry %d). Response: %.50s", attempt, resp);
+        // 打印非 200 响应的头信息
+        char* endHeader = strstr(resp, "\r\n\r\n");
+        if (endHeader) *endHeader = 0;
+        log_msg("[Utils] HTTP Error (Retry %d). Header: \n%s", attempt, resp);
+        
         free(resp); SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); closesocket(s);
         
         if (attempt == max_retries - 1) return NULL;
