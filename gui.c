@@ -876,7 +876,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nSho
     WSADATA wsa; WSAStartup(MAKEWORD(2,2), &wsa);
     
     // 必须在主线程最开始初始化 OpenSSL 全局表
-    init_openssl_global(); 
+    init_crypto_global(); 
 
     INITCOMMONCONTROLSEX ic = {sizeof(INITCOMMONCONTROLSEX), ICC_HOTKEY_CLASS}; InitCommonControlsEx(&ic);
     NONCLIENTMETRICSW ncm = { sizeof(NONCLIENTMETRICSW) };
@@ -921,7 +921,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nSho
     MSG msg; while(GetMessage(&msg, NULL, 0, 0)) { TranslateMessage(&msg); DispatchMessage(&msg); }
     
     // 程序退出前清理
-    FreeGlobalSSLContext();
+    cleanup_crypto_global();
     DeleteGlobalLocks(); // [Fix] 销毁锁
     
     return 0;
