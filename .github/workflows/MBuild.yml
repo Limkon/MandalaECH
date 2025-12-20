@@ -1,58 +1,69 @@
 name: X Windows Manual Build
 
-# 手动触发
 on:
   workflow_dispatch:
 
 jobs:
-  build-chain:
-    name: Build Mandala Executable
+  # Job 1: 准备环境与依赖 (填充缓存)
+  prepare-deps:
+    name: Prepare Dependencies
     runs-on: windows-latest
-    
     steps:
-      # ----------------------------------------------------------------
-      # 第一阶段：环境准备与依赖安装 (Dependency Phase)
-      # ----------------------------------------------------------------
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup MSYS2 & Enable Cache
+      - name: Setup MSYS2 & Cache
         uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
-          # 1. 开启缓存：自动缓存 Pacman 下载包，加速后续构建
-          cache: true
-          # 2. 关闭自动更新：防止启动崩溃
+          cache: true  # 开启缓存写入
           update: false
           install: git
 
-      - name: Configure Pacman & Install Dependencies
+      - name: Download & Cache Libraries
         shell: msys2 {0}
         run: |
-          echo "--- [Phase 1] Configuring Environment ---"
-          echo "Applying NUCLEAR FIX: Disabling signature checks entirely..."
-          
-          # 3. 暴力修改配置，信任所有包
+          echo "Applying NUCLEAR FIX..."
+          # 必须修改配置以允许下载
           sed -i 's/^SigLevel.*/SigLevel = Never/' /etc/pacman.conf
           
-          echo "Syncing database and installing toolchain..."
-          # 这里的下载内容将被 setup-msys2 自动缓存
+          echo "Downloading dependencies to cache..."
+          # 这里执行安装，会将包文件下载到 pacman 缓存目录，action 会自动保存这些缓存
           pacman -Sy --noconfirm mingw-w64-x86_64-gcc mingw-w64-x86_64-openssl mingw-w64-x86_64-make
 
-      # ----------------------------------------------------------------
-      # 第二阶段：构建可执行文件 (Build Phase)
-      # ----------------------------------------------------------------
+  # Job 2: 构建可执行文件 (使用缓存)
+  build-exe:
+    name: Build Executable
+    needs: prepare-deps # 必须等待 Job 1 完成
+    runs-on: windows-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Restore MSYS2 & Cache
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          cache: true   # 读取 Job 1 生成的缓存
+          update: false
+          install: git
+
+      - name: Install Dependencies from Cache
+        shell: msys2 {0}
+        run: |
+          echo "Restoring dependencies..."
+          # 新虚拟机必须重新配置 Pacman
+          sed -i 's/^SigLevel.*/SigLevel = Never/' /etc/pacman.conf
+          
+          # 再次执行安装指令。由于缓存存在，Pacman 会直接从本地缓存安装，速度极快，不消耗网络
+          pacman -Sy --noconfirm mingw-w64-x86_64-gcc mingw-w64-x86_64-openssl mingw-w64-x86_64-make
+
       - name: Compile Resources
         shell: msys2 {0}
         run: |
-          echo "--- [Phase 2] Building Resources ---"
           windres -i resource.rc -o resource.res --target=pe-x86-64 -O coff
 
       - name: Compile Executable
         shell: msys2 {0}
         run: |
-          echo "--- [Phase 2] Compiling Binary ---"
-          # 编译指令保持不变，包含 globals.c
           gcc gui.c config.c proxy.c crypto.c utils.c globals.c cJSON.c resource.res -o Mandala.exe \
             -lssl -lcrypto -lws2_32 -lgdi32 -lcomctl32 -lwininet -lcrypt32 -luser32 \
             -mwindows -municode -finput-charset=UTF-8 -static
