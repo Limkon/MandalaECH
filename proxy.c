@@ -11,8 +11,8 @@ static volatile LONG g_active_connections = 0;
 // 生产级修正：将所有可能在运行时变更的全局配置都进行快照
 typedef struct {
     SOCKET clientSock;
-    ProxyConfig config; // 完整的节点配置副本
-    char userAgent[512]; // [Fix] 独立的 UA 副本，避免多线程读写竞争
+    ProxyConfig config;  // 完整的节点配置副本
+    char userAgent[512]; // 独立的 UA 副本
 } ClientContext;
 
 // --- 辅助函数：解析 UUID (支持带横杠或不带) ---
@@ -60,9 +60,7 @@ int read_header_robust(SOCKET s, char* buf, int max_len, int timeout_sec) {
     int total_read = 0;
     int remaining_time = timeout_sec;
     
-    // 简单的超时控制，每次循环扣除估算时间（生产环境建议使用高精度计时器）
-    // 这里为了保持依赖简单，采用分次 select 策略
-    
+    // 简单的超时控制，每次循环扣除估算时间
     while (total_read < max_len - 1 && remaining_time > 0) {
         // 每次最多等待 1 秒，检查是否有数据
         int n = recv_timeout(s, buf + total_read, max_len - 1 - total_read, 1);
@@ -102,7 +100,7 @@ int send_all(SOCKET s, const char *buf, int len) {
         if (n == -1) {
             int err = WSAGetLastError();
             if (err == WSAEWOULDBLOCK) { 
-                // [Optimization] 使用 select 等待 Socket 可写，替代 Sleep(1)
+                // [Optimization] 使用 select 等待 Socket 可写
                 fd_set wfd; 
                 FD_ZERO(&wfd); 
                 FD_SET(s, &wfd);
@@ -158,10 +156,11 @@ DWORD WINAPI client_handler(LPVOID p) {
     }
 
     SOCKET c = ctx->clientSock;
-    ProxyConfig localConfig = ctx->config; // 线程本地配置副本
     
-    // [Concurrency Fix] 获取线程本地 UA 副本
+    // [Thread Safety] 完全使用线程局部的配置副本，不访问全局变量
+    ProxyConfig localConfig = ctx->config; 
     char localUserAgent[512];
+    // 使用 strncpy 确保安全
     strncpy(localUserAgent, ctx->userAgent, sizeof(localUserAgent)-1);
     localUserAgent[sizeof(localUserAgent)-1] = 0;
 
@@ -240,7 +239,7 @@ DWORD WINAPI client_handler(LPVOID p) {
         is_socks5 = 1;
         
         // 读取后续请求 (CMD)
-        // 注意：Socks5 的后续请求包也非常小，通常一次 recv 即可，但为了一致性继续使用 recv_timeout 配合简单检查
+        // 注意：Socks5 的后续请求包也非常小，通常一次 recv 即可
         int n = recv_timeout(c, c_buf, IO_BUFFER_SIZE, 10);
         if (n <= 0) goto cl_end;
         browser_len = n;
@@ -277,13 +276,12 @@ DWORD WINAPI client_handler(LPVOID p) {
             if (header_end) {
                 header_len = (int)(header_end - c_buf) + 4;
             } else {
-                // 如果 read_header_robust 正常工作，理论上这里一定有 header_end
                 header_len = browser_len; 
             }
         } else { goto cl_end; }
     }
     
-    // [Refactor] 使用 getaddrinfo 实现 DNS 解析 (IPv4/IPv6 Happy Eyeballs)
+    // [Refactor] 使用 getaddrinfo 实现 DNS 解析
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC; // 支持 IPv4 和 IPv6
     hints.ai_socktype = SOCK_STREAM;
@@ -313,24 +311,19 @@ DWORD WINAPI client_handler(LPVOID p) {
                 tls.sock = r;
                 // [Security] 传递本地配置的 SNI 和 Host
                 if (tls_init_connect(&tls, localConfig.sni, localConfig.host) == 0) {
-                    // 连接成功且 SSL 握手成功
                     break;
                 } else {
-                    // SSL 握手失败
                     tls_close(&tls);
                     closesocket(r);
                     r = INVALID_SOCKET;
                 }
             } else {
-                // TCP 连接失败
                 closesocket(r);
                 r = INVALID_SOCKET;
             }
         }
         
-        // 如果成功建立连接，跳出重试循环
         if (r != INVALID_SOCKET && tls.ssl != NULL) break;
-        
         Sleep(200); // 重试间隔
     }
     
@@ -345,7 +338,7 @@ DWORD WINAPI client_handler(LPVOID p) {
     for(int i=0; i<16; i++) rnd_key[i] = rand() % 256;
     base64_encode_key(rnd_key, ws_key_str);
 
-    // [Fix] 使用线程本地的 localUserAgent，避免访问全局变量
+    // [Fix] 使用线程本地的 localUserAgent
     offset = snprintf(ws_send_buf, IO_BUFFER_SIZE, 
         "GET %s HTTP/1.1\r\n"
         "Host: %s\r\n"
@@ -662,19 +655,21 @@ DWORD WINAPI server_thread(LPVOID p) {
             if (g_active_connections >= MAX_CONNECTIONS) {
                 log_msg("[Warn] Max connections (%d) reached. Dropping request.", MAX_CONNECTIONS);
                 closesocket(c);
-                Sleep(10); // 稍微退避，防止 CPU 空转
+                Sleep(10); // 稍微退避
                 continue;
             }
 
-            // [Concurrency Fix] 分配上下文并复制配置
+            // [Concurrency Fix] 分配上下文并安全复制配置
             ClientContext* ctx = (ClientContext*)malloc(sizeof(ClientContext));
             if (ctx) {
                 ctx->clientSock = c;
-                ctx->config = g_proxyConfig; // 线程安全的配置快照
                 
-                // [Safety] 安全复制全局字符串，避免工作线程访问全局变量
+                // [Lock] 锁住全局变量，确保复制的原子性
+                EnterCriticalSection(&g_configLock);
+                ctx->config = g_proxyConfig; 
                 strncpy(ctx->userAgent, g_userAgentStr, sizeof(ctx->userAgent)-1);
                 ctx->userAgent[sizeof(ctx->userAgent)-1] = 0;
+                LeaveCriticalSection(&g_configLock);
 
                 HANDLE hClient = CreateThread(NULL, 0, client_handler, (LPVOID)ctx, 0, NULL);
                 if (hClient) CloseHandle(hClient); 
