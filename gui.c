@@ -1,6 +1,7 @@
 #include "gui.h"
 #include "config.h"
 #include "proxy.h"
+#include <time.h>
 #include "utils.h"
 #include "crypto.h"
 #include "resource.h"
@@ -874,6 +875,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nSho
     
     return 0;
 }
+
 
 
 
