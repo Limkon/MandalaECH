@@ -18,9 +18,15 @@
 extern int g_localPort; 
 extern BOOL g_enableLog; 
 
-// 日志函数 (保持不变)
+// --------------------------------------------------------------------------
+// 日志函数 (默认静默模式)
+// --------------------------------------------------------------------------
 void log_msg(const char *format, ...) {
-    if (!g_enableLog && strstr(format, "[Fatal]") == NULL && strstr(format, "[Error]") == NULL && strstr(format, "[Debug]") == NULL && strstr(format, "[ECH]") == NULL) return;
+    // 如果日志开关关闭，且消息不是 Fatal 或 Error，则直接忽略
+    if (!g_enableLog) {
+        if (strstr(format, "[Fatal]") == NULL && strstr(format, "[Error]") == NULL) return;
+    }
+
     char buf[2048]; char time_buf[64]; SYSTEMTIME st; GetLocalTime(&st);
     snprintf(time_buf, sizeof(time_buf), "[%02d:%02d:%02d] ", st.wHour, st.wMinute, st.wSecond);
     va_list args; va_start(args, format); vsnprintf(buf, sizeof(buf)-64, format, args); va_end(args);
@@ -33,9 +39,12 @@ void log_msg(const char *format, ...) {
         if (wBuf) { MultiByteToWideChar(CP_UTF8, 0, final_msg, -1, wBuf, wLen); wBuf[wLen] = 0; PostMessageW(h, WM_LOG_UPDATE, 0, (LPARAM)wBuf); }
     }
 }
+
 void log_wsa_error(const char* context) { log_msg("[Error] %s Failed. Code: %d", context, WSAGetLastError()); }
 
-// 文件操作 (保持不变)
+// --------------------------------------------------------------------------
+// 文件操作
+// --------------------------------------------------------------------------
 BOOL ReadFileToBuffer(const wchar_t* filename, char** buffer, long* fileSize) {
     FILE* f = _wfopen(filename, L"rb"); if (!f) { *fileSize = 0; return FALSE; }
     fseek(f, 0, SEEK_END); *fileSize = ftell(f); fseek(f, 0, SEEK_SET);
@@ -43,17 +52,21 @@ BOOL ReadFileToBuffer(const wchar_t* filename, char** buffer, long* fileSize) {
     if (*buffer) { fread(*buffer, 1, *fileSize, f); (*buffer)[*fileSize] = 0; }
     fclose(f); return (*buffer != NULL);
 }
+
 BOOL WriteBufferToFile(const wchar_t* filename, const char* buffer) {
     FILE* f = _wfopen(filename, L"wb"); if (!f) return FALSE;
     fwrite(buffer, 1, strlen(buffer), f); fclose(f); return TRUE;
 }
 
-// 字符串/剪贴板 (保持不变)
+// --------------------------------------------------------------------------
+// 字符串/剪贴板
+// --------------------------------------------------------------------------
 void TrimString(char* str) {
     if (!str) return; char* p = str; while (isspace((unsigned char)*p)) p++;
     if (p != str) memmove(str, p, strlen(p) + 1);
     size_t len = strlen(str); while (len > 0 && isspace((unsigned char)str[len - 1])) str[--len] = 0;
 }
+
 void UrlDecode(char* dst, const char* src) {
     char a, b; while (*src) {
         if ((*src == '%') && ((a = src[1]) && (b = src[2])) && (isxdigit(a) && isxdigit(b))) {
@@ -63,6 +76,7 @@ void UrlDecode(char* dst, const char* src) {
         } else if (*src == '+') { *dst++ = ' '; src++; } else { *dst++ = *src++; }
     } *dst = '\0';
 }
+
 char* GetQueryParam(const char* query, const char* key) {
     if (!query || !key) return NULL; char keyEq[128]; snprintf(keyEq, sizeof(keyEq), "%s=", key);
     size_t keyEqLen = strlen(keyEq); const char* p = query;
@@ -76,6 +90,7 @@ char* GetQueryParam(const char* query, const char* key) {
         } p++;
     } return NULL;
 }
+
 char* GetClipboardText() {
     if (!OpenClipboard(NULL)) return NULL;
     HANDLE hData = GetClipboardData(CF_UNICODETEXT);
@@ -96,12 +111,15 @@ char* GetClipboardText() {
     CloseClipboard(); return NULL;
 }
 
-// Base64 (保持不变)
+// --------------------------------------------------------------------------
+// Base64
+// --------------------------------------------------------------------------
 static const char base64_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 static int GetBase64Val(char c) {
     if (c >= 'A' && c <= 'Z') return c - 'A'; if (c >= 'a' && c <= 'z') return c - 'a' + 26;
     if (c >= '0' && c <= '9') return c - '0' + 52; if (c == '+' || c == '-') return 62; if (c == '/' || c == '_') return 63; return -1;
 }
+
 unsigned char* Base64Decode(const char* src, size_t* out_len) {
     if (!src) return NULL; size_t len = strlen(src);
     while (len > 0 && strchr("\r\n =", src[len - 1])) len--;
@@ -121,6 +139,7 @@ unsigned char* Base64Decode(const char* src, size_t* out_len) {
         }
     } out[j] = 0; *out_len = j; return out;
 }
+
 void Base64Encode(const unsigned char* src, int len, char* dst) {
     int i = 0, j = 0;
     for (; i < len; i += 3) {
@@ -129,6 +148,7 @@ void Base64Encode(const unsigned char* src, int len, char* dst) {
         dst[j++] = (i + 1 < len) ? base64_chars[(v >> 6) & 0x3F] : '='; dst[j++] = (i + 2 < len) ? base64_chars[v & 0x3F] : '=';
     } dst[j] = 0;
 }
+
 void Base64UrlEncode(const unsigned char* src, int len, char* dst) {
     const char* tbl = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     int i = 0, j = 0;
@@ -139,8 +159,11 @@ void Base64UrlEncode(const unsigned char* src, int len, char* dst) {
     } while (j > 0 && dst[j - 1] == '=') j--; dst[j] = 0;
 }
 
-// HTTP Helper & Chunked Decoder (保持不变)
+// --------------------------------------------------------------------------
+// HTTP Helper
+// --------------------------------------------------------------------------
 typedef struct { char host[256]; char path[2048]; int port; } URL_COMP;
+
 static BOOL ParseUrl(const char* url, URL_COMP* out) {
     memset(out, 0, sizeof(URL_COMP)); const char* p = url;
     if (!strncmp(p, "https://", 8)) { out->port = 443; p += 8; } else if (!strncmp(p, "http://", 7)) { out->port = 80; p += 7; } else return FALSE;
@@ -148,6 +171,7 @@ static BOOL ParseUrl(const char* url, URL_COMP* out) {
     strncpy(out->host, p, hLen); char* col = strchr(out->host, ':'); if (col) { *col = 0; out->port = atoi(col + 1); }
     if (sl) strcpy(out->path, sl); else strcpy(out->path, "/"); return TRUE;
 }
+
 static char* DechunkBody(const char* raw_body, int raw_len, int* out_len) {
     if (!raw_body || raw_len <= 0) return NULL;
     char* new_buf = (char*)malloc(raw_len + 1); if (!new_buf) return NULL;
@@ -160,13 +184,19 @@ static char* DechunkBody(const char* raw_body, int raw_len, int* out_len) {
         memcpy(new_buf + write_pos, p, chunk_size); write_pos += chunk_size; p += chunk_size + 2; 
     } new_buf[write_pos] = 0; *out_len = write_pos; return new_buf;
 }
+
 static char* InternalHttpsGet(const char* url, BOOL useProxy, int* out_len) {
     URL_COMP u; if (!ParseUrl(url, &u)) { log_msg("[Error] Invalid URL: %s", url); return NULL; }
-    if (out_len) *out_len = 0; BOOL isDoH = (out_len != NULL); 
+    if (out_len) *out_len = 0;
+    
+    BOOL isDoH = (out_len != NULL); 
     static int ini = 0; if (!ini) { SSL_library_init(); OpenSSL_add_all_algorithms(); SSL_load_error_strings(); ini = 1; }
+
     const char* tHost = useProxy ? "127.0.0.1" : u.host; int tPort = useProxy ? g_localPort : u.port;
     struct hostent *he = gethostbyname(tHost); if (!he || !he->h_addr_list[0]) return NULL;
+
     SOCKET s = INVALID_SOCKET;
+    // 轮询 IP (Happy Eyeballs Simplified)
     for (int i = 0; he->h_addr_list[i] != NULL; i++) {
         s = socket(AF_INET, SOCK_STREAM, 0); if (s == INVALID_SOCKET) continue;
         struct sockaddr_in a; memset(&a,0,sizeof(a)); a.sin_family = AF_INET; a.sin_port = htons(tPort); a.sin_addr = *((struct in_addr*)he->h_addr_list[i]);
@@ -175,36 +205,56 @@ static char* InternalHttpsGet(const char* url, BOOL useProxy, int* out_len) {
         closesocket(s); s = INVALID_SOCKET;
     }
     if (s == INVALID_SOCKET) return NULL;
+
     if (useProxy) {
         char req[512], buf[1024]; snprintf(req, 512, "CONNECT %s:%d HTTP/1.1\r\nHost: %s:%d\r\n\r\n", u.host, u.port, u.host, u.port);
         send(s, req, strlen(req), 0); if (recv(s, buf, 1023, 0) <= 0 || !strstr(buf, "200 Connection")) { closesocket(s); return NULL; }
     }
+
     SSL_CTX *ctx = SSL_CTX_new(TLS_client_method()); SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
     SSL *ssl = SSL_new(ctx); SSL_set_fd(ssl, (int)s); SSL_set_tlsext_host_name(ssl, u.host);
     if (SSL_connect(ssl) != 1) { SSL_free(ssl); SSL_CTX_free(ctx); closesocket(s); return NULL; }
+
     char req[4096]; const char* ua = isDoH ? "Go-http-client/1.1" : "Mandala/1.0";
     const char* acc = isDoH ? "application/dns-message" : "*/*";
     const char* ctype = isDoH ? "Content-Type: application/dns-message\r\n" : "";
-    snprintf(req, 4096, "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nAccept: %s\r\n%sConnection: close\r\n\r\n", u.path, u.host, ua, acc, ctype);
+    
+    snprintf(req, 4096, 
+        "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nAccept: %s\r\n%sConnection: close\r\n\r\n", 
+        u.path, u.host, ua, acc, ctype);
+    
     if (SSL_write(ssl, req, strlen(req)) <= 0) { SSL_free(ssl); SSL_CTX_free(ctx); closesocket(s); return NULL; }
+
     int bSize = 65536, tRead = 0; char* resp = (char*)malloc(bSize);
     while (1) {
         if (tRead + 4096 >= bSize) { bSize *= 2; resp = realloc(resp, bSize); }
         int r = SSL_read(ssl, resp + tRead, 4096); if (r <= 0) break; tRead += r;
-    } resp[tRead] = 0;
-    if (!strstr(resp, " 200 OK")) { free(resp); SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); closesocket(s); return NULL; }
+    }
+    resp[tRead] = 0;
+
+    if (!strstr(resp, " 200 OK")) { 
+        log_msg("[Error] HTTP Failed. Header:\n%.100s", resp); // Show partial header on error
+        free(resp); SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); closesocket(s); return NULL; 
+    }
+
     BOOL isChunked = (strstr(resp, "Transfer-Encoding: chunked") != NULL) || (strstr(resp, "transfer-encoding: chunked") != NULL);
     char* body = strstr(resp, "\r\n\r\n"); if (!body) body = strstr(resp, "\n\n");
     char* final_res = NULL;
+
     if (body) {
         body += (body[0] == '\r' ? 4 : 2); int raw_len = tRead - (int)(body - resp);
         if (raw_len > 0) {
-            if (isChunked) { int dechunked_len = 0; final_res = DechunkBody(body, raw_len, &dechunked_len); if (out_len) *out_len = dechunked_len; }
-            else { final_res = (char*)malloc(raw_len + 1); memcpy(final_res, body, raw_len); final_res[raw_len] = 0; if (out_len) *out_len = raw_len; }
+            if (isChunked) {
+                int dechunked_len = 0; final_res = DechunkBody(body, raw_len, &dechunked_len); if (out_len) *out_len = dechunked_len;
+            } else {
+                final_res = (char*)malloc(raw_len + 1); memcpy(final_res, body, raw_len); final_res[raw_len] = 0; if (out_len) *out_len = raw_len;
+            }
         }
     }
-    free(resp); SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); closesocket(s); return final_res; 
+    free(resp); SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); closesocket(s);
+    return final_res; 
 }
+
 char* Utils_HttpGet(const char* url) { if (g_localPort > 0) { char* r = InternalHttpsGet(url, TRUE, NULL); if (r) return r; } return InternalHttpsGet(url, FALSE, NULL); }
 char* Utils_HttpBytesGet(const char* url, int* out_len) { return InternalHttpsGet(url, FALSE, out_len); }
 
@@ -217,25 +267,28 @@ int BuildDNSQueryHTTPS(const char* domain, unsigned char* buf) {
     buf[p++] = 0; buf[p++] = 0; buf[p++] = 65; buf[p++] = 0; buf[p++] = 1; return p;
 }
 
-// [Fix] Scan Mode: Brute-force search for ECH Config
+// [Fix] 暴力扫描模式：直接在二进制中搜索 Key 5
 char* FetchECHFromDoH(const char* dohUrl, const char* sni) {
     if (!dohUrl || !sni) return NULL;
+    // Log info only if enabled
     log_msg("[ECH] Querying DoH for: %s", sni);
+    
     unsigned char q[512]; int ql = BuildDNSQueryHTTPS(sni, q);
     char b64[1024]; Base64UrlEncode(q, ql, b64);
     char url[2048]; snprintf(url, 2048, "%s?dns=%s", dohUrl, b64);
 
-    int rLen = 0; unsigned char* resp = (unsigned char*)Utils_HttpBytesGet(url, &rLen);
+    int rLen = 0; 
+    // 使用 unsigned char* 防止有符号数移位问题
+    unsigned char* resp = (unsigned char*)Utils_HttpBytesGet(url, &rLen);
     if (!resp || rLen < 12) { if (resp) free(resp); return NULL; }
 
-    // Scan the entire response for sequence 00 05 (Key 5) followed by reasonable length
+    // 暴力扫描：搜索 00 05 (Key 5)
+    // 这种方法不依赖 DNS 结构解析，完全规避指针/偏移量计算错误
     for (int i = 12; i < rLen - 4; i++) {
         if (resp[i] == 0x00 && resp[i+1] == 0x05) {
             int vl = (resp[i+2] << 8) | resp[i+3];
-            // Basic sanity check: Length must be reasonable and fit in buffer
+            // 简单的长度合法性校验
             if (vl > 0 && vl < 2048 && (i + 4 + vl <= rLen)) {
-                // Heuristic: ECH Config usually starts with version (e.g. 00 45 or FE 0D)
-                // This is Key 5.
                 log_msg("[ECH] Found Key 5 at offset %d, Len %d", i, vl);
                 char* out = (char*)malloc(vl * 2); 
                 Base64Encode(resp + i + 4, vl, out); 
@@ -243,11 +296,12 @@ char* FetchECHFromDoH(const char* dohUrl, const char* sni) {
             }
         }
     }
+    
     log_msg("[Error] ECH Key 5 not found by scan.");
     free(resp); return NULL;
 }
 
-// System Proxy (保持不变)
+// --- System Proxy ---
 BOOL IsWindows8OrGreater() { return GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetProcessMitigationPolicy") != NULL; }
 void SetSystemProxy(BOOL enable) {
     if (enable && g_localPort <= 0) return;
