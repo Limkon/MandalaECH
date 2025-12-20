@@ -531,8 +531,9 @@ char* GetClipboardText() {
 
 void SetSystemProxy(BOOL enable) {
     HKEY hKey;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings", 
-        0, KEY_WRITE, &hKey) == ERROR_SUCCESS) {
+    // [Fix] 使用 RegCreateKeyExW 替代 RegOpenKeyExW，参考 sing.c 确保权限和键存在
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings", 
+        0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
         
         DWORD dwEnable = enable ? 1 : 0;
         RegSetValueExW(hKey, L"ProxyEnable", 0, REG_DWORD, (BYTE*)&dwEnable, sizeof(DWORD));
@@ -543,13 +544,23 @@ void SetSystemProxy(BOOL enable) {
             wchar_t server[64];
             swprintf_s(server, 64, L"127.0.0.1:%d", g_localPort);
             RegSetValueExW(hKey, L"ProxyServer", 0, REG_SZ, (BYTE*)server, (wcslen(server)+1)*sizeof(wchar_t));
+
+            // [Fix] 增加 ProxyOverride 设置，跳过本地地址，参考 sing.c
+            const wchar_t* override = L"<local>";
+            RegSetValueExW(hKey, L"ProxyOverride", 0, REG_SZ, (BYTE*)override, (wcslen(override)+1)*sizeof(wchar_t));
+        } else {
+             // [Fix] 禁用时显式清空 ProxyServer，防止残留导致的显示错误
+             RegSetValueExW(hKey, L"ProxyServer", 0, REG_SZ, (const BYTE*)L"", sizeof(wchar_t));
         }
+
+        // [Fix] 删除可能存在的 SocksProxyServer，避免冲突
+        RegDeleteValueW(hKey, L"SocksProxyServer");
         
         RegCloseKey(hKey);
         
         // 通知系统设置已更改，使其立即生效
-        InternetSetOption(NULL, INTERNET_OPTION_SETTINGS_CHANGED, NULL, 0);
-        InternetSetOption(NULL, INTERNET_OPTION_REFRESH, NULL, 0);
+        InternetSetOptionW(NULL, INTERNET_OPTION_SETTINGS_CHANGED, NULL, 0);
+        InternetSetOptionW(NULL, INTERNET_OPTION_REFRESH, NULL, 0);
     }
 }
 
