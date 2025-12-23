@@ -31,26 +31,23 @@ static cJSON* GetOrCreateObj(cJSON* parent, const char* name) {
     return item;
 }
 
-// --- SS Plugin 解析辅助函数 (修复：弃用 strtok) ---
+// --- SS Plugin 解析辅助函数 ---
 static void ParseSSPlugin(cJSON* outbound, const char* pluginParam) {
     if (!pluginParam || !outbound) return;
-    char* pluginCopy = strdup(pluginParam);
+    char* pluginCopy = _strdup(pluginParam);
     if (!pluginCopy) return;
 
     char host[256] = {0}; char path[256] = {0}; char sni[256] = {0}; char mode[64] = {0};
     BOOL isTls = FALSE;
     BOOL isV2ray = (strstr(pluginCopy, "v2ray-plugin") != NULL);
     
-    // [Fix] 使用指针遍历替代 strtok，避免破坏外部解析循环
     char* start = pluginCopy;
     char* end = NULL;
     
     while (start && *start) {
-        // 查找分号分隔符
         end = strchr(start, ';');
-        if (end) *end = '\0'; // 临时截断
+        if (end) *end = '\0'; 
         
-        // 解析当前段
         if (strncmp(start, "host=", 5) == 0) SafeStrCpy(host, sizeof(host), start+5);
         else if (strncmp(start, "obfs-host=", 10) == 0) SafeStrCpy(host, sizeof(host), start+10);
         else if (strncmp(start, "path=", 5) == 0) SafeStrCpy(path, sizeof(path), start+5);
@@ -59,7 +56,6 @@ static void ParseSSPlugin(cJSON* outbound, const char* pluginParam) {
         else if (strcmp(start, "tls") == 0) isTls = TRUE;
         else if (strncmp(start, "obfs=", 5) == 0) { if (strcmp(start+5, "tls") == 0) isTls = TRUE; }
 
-        // 移动到下一个段
         if (end) start = end + 1;
         else start = NULL;
     }
@@ -86,7 +82,6 @@ static void ParseSSPlugin(cJSON* outbound, const char* pluginParam) {
 // --- 配置文件基础操作 ---
 
 void LoadSettings() {
-    // 预读取到局部变量，减少锁占用时间
     UINT modifiers = GetPrivateProfileIntW(L"Settings", L"Modifiers", MOD_CONTROL | MOD_ALT, g_iniFilePath);
     UINT vk = GetPrivateProfileIntW(L"Settings", L"VK", 'H', g_iniFilePath);
     int port = GetPrivateProfileIntW(L"Settings", L"LocalPort", 10809, g_iniFilePath);
@@ -103,7 +98,6 @@ void LoadSettings() {
     int padMax = GetPrivateProfileIntW(L"Settings", L"PadMax", 500, g_iniFilePath);
     int uaIdx = GetPrivateProfileIntW(L"Settings", L"UAPlatform", 0, g_iniFilePath);
 
-    // [Lock] 开始写入全局配置
     EnterCriticalSection(&g_configLock);
 
     g_hotkeyModifiers = modifiers;
@@ -148,7 +142,6 @@ void LoadSettings() {
 }
 
 void SaveSettings() {
-    // [Lock] 读取全局变量需要加锁，防止写入时发生部分更新
     EnterCriticalSection(&g_configLock);
 
     wchar_t buffer[16];
@@ -209,7 +202,6 @@ BOOL IsAutorun() {
 }
 
 void ParseTags() {
-    // [Lock] 保护 nodeTags 数组的更新
     EnterCriticalSection(&g_configLock);
 
     if (nodeTags) { for(int i=0; i<nodeCount; i++) free(nodeTags[i]); free(nodeTags); }
@@ -267,11 +259,9 @@ char* GetUniqueTagName(cJSON* outbounds, const char* type, const char* base_name
 void ParseNodeConfigToGlobal(cJSON *node) {
     if (!node) return;
     
-    // [Lock] 锁定全局代理配置，防止 Worker 线程读取到正在修改的数据
     EnterCriticalSection(&g_configLock);
 
     memset(&g_proxyConfig, 0, sizeof(ProxyConfig));
-    // [Security Fix] 使用 SafeStrCpy 防止配置溢出
     SafeStrCpy(g_proxyConfig.path, sizeof(g_proxyConfig.path), "/"); 
 
     cJSON *server = cJSON_GetObjectItem(node, "server");
@@ -306,7 +296,6 @@ void ParseNodeConfigToGlobal(cJSON *node) {
     
     if (strlen(g_proxyConfig.sni) == 0) SafeStrCpy(g_proxyConfig.sni, sizeof(g_proxyConfig.sni), g_proxyConfig.host);
 
-    // 解析并保存协议类型
     cJSON *type = cJSON_GetObjectItem(node, "type");
     if (type && type->valuestring) {
         SafeStrCpy(g_proxyConfig.type, sizeof(g_proxyConfig.type), type->valuestring);
@@ -320,8 +309,8 @@ void ParseNodeConfigToGlobal(cJSON *node) {
         g_proxyConfig.host, g_proxyConfig.port, g_proxyConfig.type, g_proxyConfig.sni);
 }
 
+// [核心修复] 实现节点热切换，移除冗余的 Stop/Start 逻辑
 void SwitchNode(const wchar_t* tag) {
-    // 1. 更新当前节点名称 (加锁)
     EnterCriticalSection(&g_configLock);
     wcsncpy(currentNode, tag, 63);
     LeaveCriticalSection(&g_configLock);
@@ -341,10 +330,13 @@ void SwitchNode(const wchar_t* tag) {
     }
     
     if (targetNode) {
-        StopProxyCore(); 
-        ParseNodeConfigToGlobal(targetNode); // 内部已加锁
-        StartProxyCore();
-        SaveSettings(); // 内部已加锁
+        /* [修复点] 移除 StopProxyCore()。
+           监听线程 (server_thread) 会在每个新连接进入时拷贝全局配置。
+           直接更新全局配置即可实现“热更新”，无需重启监听套接字。 */
+        
+        ParseNodeConfigToGlobal(targetNode); // 原子更新全局变量
+        StartProxyCore(); // 确保代理处于运行状态
+        SaveSettings();   // 保存持久化设置
         
         wchar_t tip[128]; 
         _snwprintf(tip, 128, L"已切换: %s", tag);
@@ -368,7 +360,7 @@ void DeleteNode(const wchar_t* tag) {
         idx++;
     }
     char* out = cJSON_Print(root); WriteBufferToFile(CONFIG_FILE, out); free(out); cJSON_Delete(root);
-    ParseTags(); // 内部已加锁
+    ParseTags(); 
 }
 
 BOOL AddNodeToConfig(cJSON* newNode) {
@@ -390,8 +382,6 @@ BOOL AddNodeToConfig(cJSON* newNode) {
     return ret;
 }
 
-// [Fix] 重构：修复导入逻辑，优先检测是否为明文链接（包含 "://"）
-// 解决 vmess:// 等明文链接被误进行 Base64 解析导致的数据损坏
 int Internal_BatchAddNodesFromText(const char* text, cJSON* outbounds) {
     if (!text || !outbounds) return 0;
     int count = 0; 
@@ -399,18 +389,14 @@ int Internal_BatchAddNodesFromText(const char* text, cJSON* outbounds) {
     unsigned char* decoded = NULL;
     size_t decLen = 0;
 
-    // 1. 优先检测是否包含协议头 "://"
-    // 如果包含，说明是明文链接（单行或多行），直接使用原文本
     if (strstr(text, "://")) {
-        sourceText = strdup(text);
+        sourceText = _strdup(text);
     } else {
-        // 2. 如果不包含协议头，尝试 Base64 解码 (订阅内容通常是 Base64)
         decoded = Base64Decode(text, &decLen);
         if (decoded && decLen > 0) {
             sourceText = (char*)decoded;
         } else {
-            // 解码失败或为空，回退到原文本尝试解析
-            sourceText = strdup(text);
+            sourceText = _strdup(text);
             if (decoded) free(decoded);
         }
     }
@@ -419,15 +405,12 @@ int Internal_BatchAddNodesFromText(const char* text, cJSON* outbounds) {
     
     char* p = sourceText;
     while (*p) {
-        // 跳过前导分隔符
         size_t span = strspn(p, "\r\n ,");
         p += span;
         if (!*p) break;
         
-        // 查找当前行的结束位置
         size_t len = strcspn(p, "\r\n ,");
         if (len > 0) {
-            // 提取当前行
             char* line = (char*)malloc(len + 1);
             strncpy(line, p, len);
             line[len] = '\0';
@@ -458,9 +441,7 @@ int Internal_BatchAddNodesFromText(const char* text, cJSON* outbounds) {
         }
     }
     
-    // 如果 sourceText 是我们 duplicated 的，需要释放
     free(sourceText); 
-    
     return count;
 }
 
@@ -478,7 +459,6 @@ int ImportFromClipboard() {
 
 int UpdateAllSubscriptions(BOOL forceMsg) {
     int activeSubs = 0;
-    // [Lock] 保护 g_subs 访问
     EnterCriticalSection(&g_configLock);
     for(int i=0; i<g_subCount; i++) if(g_subs[i].enabled && strlen(g_subs[i].url) > 4) activeSubs++;
     LeaveCriticalSection(&g_configLock);
@@ -487,7 +467,6 @@ int UpdateAllSubscriptions(BOOL forceMsg) {
     log_msg("[Sub] Starting update for %d subscriptions...", activeSubs);
     char* rawData[MAX_SUBS] = {0}; int downloadSuccess = 0;
     
-    // 拷贝订阅信息以避免下载过程中长时间持有锁
     char subUrls[MAX_SUBS][512];
     int subIndices[MAX_SUBS];
     int count = 0;
@@ -526,19 +505,18 @@ int UpdateAllSubscriptions(BOOL forceMsg) {
     }
     log_msg("[Sub] Total nodes parsed: %d. Saving config...", totalNewNodes);
     char* out = cJSON_Print(root); WriteBufferToFile(CONFIG_FILE, out); free(out); cJSON_Delete(root);
-    ParseTags(); // 内部已加锁
+    ParseTags(); 
     log_msg("[Sub] Update complete.");
     return totalNewNodes;
 }
 
 void ToggleTrayIcon() {
-    // 简单锁保护 UI 状态标志
     EnterCriticalSection(&g_configLock);
     if (g_isIconVisible) { Shell_NotifyIconW(NIM_DELETE, &nid); g_isIconVisible = FALSE; g_hideTrayStart = 1; }
     else { nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP; Shell_NotifyIconW(NIM_ADD, &nid); g_isIconVisible = TRUE; g_hideTrayStart = 0; }
     LeaveCriticalSection(&g_configLock);
     
-    SaveSettings(); // 内部已加锁
+    SaveSettings(); 
 }
 
 // --- 协议解析函数 ---
@@ -550,7 +528,6 @@ cJSON* ParseSocks(const char* link) {
     char* user = (char*)decoded; char* pass = strchr(user, ':'); if (pass) { *pass = 0; pass++; } else pass = "";
     
     p = at + 1; const char* colon = strchr(p, ':'); const char* qMark = strchr(p, '?'); const char* hash = strchr(p, '#');
-    // [Fix] 优化 hostEnd 计算，确保在没有 # 的情况下也能正确截取
     const char* hostEnd = colon;
     if (!hostEnd || (qMark && qMark < hostEnd)) hostEnd = qMark;
     if (!hostEnd || (hash && hash < hostEnd)) hostEnd = hash;
@@ -561,14 +538,13 @@ cJSON* ParseSocks(const char* link) {
 
     int hostLen = (int)(hostEnd - p); char* host = (char*)malloc(hostLen + 1); strncpy(host, p, hostLen); host[hostLen] = 0;
     
-    char* tag = hash ? (char*)malloc(strlen(hash+1)+1) : strdup("Socks-Import"); if(hash) UrlDecode(tag, hash+1);
+    char* tag = hash ? (char*)malloc(strlen(hash+1)+1) : _strdup("Socks-Import"); if(hash) UrlDecode(tag, hash+1);
     const char* query = qMark ? qMark + 1 : NULL;
     char* sni = GetQueryParam(query, "sni"); if (!sni) sni = GetQueryParam(query, "peer");
     
-    // [Fix] UrlDecode path (防止 %2F 导致 WS 400)
     char* path = GetQueryParam(query, "path");
     if (path) {
-        char* decodedPath = strdup(path);
+        char* decodedPath = _strdup(path);
         if (decodedPath) {
              UrlDecode(decodedPath, path);
              free(path); path = decodedPath;
@@ -601,7 +577,7 @@ cJSON* ParseSocks(const char* link) {
 cJSON* ParseShadowsocks(const char* link) {
     if (strncmp(link, "ss://", 5) != 0) return NULL;
     const char* p = link + 5; 
-    const char* hash = strchr(p, '#'); char* tag = hash ? (char*)malloc(strlen(hash+1)+1) : strdup("SS");
+    const char* hash = strchr(p, '#'); char* tag = hash ? (char*)malloc(strlen(hash+1)+1) : _strdup("SS");
     if(hash) UrlDecode(tag, hash+1); else strcpy(tag, "SS");
     const char* qMark = strchr(p, '?');
     const char* endOfMain = qMark ? qMark : (hash ? hash : p + strlen(p));
@@ -721,7 +697,6 @@ cJSON* ParseVlessOrTrojan(const char* link) {
     const char* p = link + strlen(protocol) + 3; const char* at = strchr(p, '@'); if (!at) return NULL;
     int uuidLen = (int)(at - p); char* uuid = (char*)malloc(uuidLen + 1); strncpy(uuid, p, uuidLen); uuid[uuidLen] = 0;
     p = at + 1; const char* colon = strchr(p, ':'); const char* qMark = strchr(p, '?'); const char* hash = strchr(p, '#');
-    // [Fix] 统一的 hostEnd 计算逻辑
     const char* hostEnd = colon;
     if (!hostEnd || (qMark && qMark < hostEnd)) hostEnd = qMark;
     if (!hostEnd || (hash && hash < hostEnd)) hostEnd = hash;
@@ -732,7 +707,7 @@ cJSON* ParseVlessOrTrojan(const char* link) {
     int hostLen = (int)(hostEnd - p); char* host = (char*)malloc(hostLen + 1); strncpy(host, p, hostLen); host[hostLen] = 0;
     int portNum = portStart ? atoi(portStart) : 443;
     
-    char* tag = hash ? (char*)malloc(strlen(hash+1)+1) : strdup(protocol);
+    char* tag = hash ? (char*)malloc(strlen(hash+1)+1) : _strdup(protocol);
     if(hash) UrlDecode(tag, hash+1);
     
     cJSON* outbound = cJSON_CreateObject();
@@ -745,10 +720,9 @@ cJSON* ParseVlessOrTrojan(const char* link) {
     if (type && strcmp(type, "ws") == 0) {
         cJSON* t = cJSON_CreateObject(); cJSON_AddStringToObject(t, "type", "ws");
         
-        // [Fix] UrlDecode path
         char* path = GetQueryParam(query, "path");
         if (path) { 
-            char* decodedPath = strdup(path); 
+            char* decodedPath = _strdup(path); 
             if(decodedPath) {
                 UrlDecode(decodedPath, path);
                 cJSON_AddStringToObject(t, "path", decodedPath);
@@ -777,28 +751,23 @@ cJSON* ParseVlessOrTrojan(const char* link) {
     free(uuid); free(host); free(tag); return outbound;
 }
 
-// [新增] Mandala 链接解析函数
 cJSON* ParseMandala(const char* link) {
     if (strncmp(link, "mandala://", 10) != 0) return NULL;
     
-    // 格式: mandala://uuid@host:port?params#remark
     const char* p = link + 10; 
     const char* at = strchr(p, '@'); 
     if (!at) return NULL;
 
-    // 1. 提取 UUID (作为密码)
     int uuidLen = (int)(at - p); 
     char* uuid = (char*)malloc(uuidLen + 1); 
     strncpy(uuid, p, uuidLen); 
     uuid[uuidLen] = 0;
 
-    // 2. 提取 Host 和 Port
     p = at + 1; 
     const char* colon = strchr(p, ':'); 
     const char* qMark = strchr(p, '?'); 
     const char* hash = strchr(p, '#');
     
-    // [Fix] 统一的 hostEnd 计算逻辑
     const char* hostEnd = colon;
     if (!hostEnd || (qMark && qMark < hostEnd)) hostEnd = qMark;
     if (!hostEnd || (hash && hash < hostEnd)) hostEnd = hash;
@@ -813,31 +782,26 @@ cJSON* ParseMandala(const char* link) {
     
     int portNum = portStart ? atoi(portStart) : 443;
 
-    // 3. 提取 Tag (备注)
-    char* tag = hash ? (char*)malloc(strlen(hash+1)+1) : strdup("Mandala");
+    char* tag = hash ? (char*)malloc(strlen(hash+1)+1) : _strdup("Mandala");
     if(hash) UrlDecode(tag, hash+1);
 
-    // 4. 构建 JSON
     cJSON* outbound = cJSON_CreateObject();
-    cJSON_AddStringToObject(outbound, "type", "mandala"); // 类型标记为 mandala
+    cJSON_AddStringToObject(outbound, "type", "mandala"); 
     cJSON_AddStringToObject(outbound, "tag", tag);
     cJSON_AddStringToObject(outbound, "server", host); 
     cJSON_AddNumberToObject(outbound, "server_port", portNum);
-    cJSON_AddStringToObject(outbound, "password", uuid); // Mandala 使用 password 字段存储 ID
+    cJSON_AddStringToObject(outbound, "password", uuid); 
 
-    // 5. 解析参数
     const char* query = qMark ? qMark + 1 : NULL;
     
-    // 解析 WebSocket
     char* type = GetQueryParam(query, "type");
     if (type && strcmp(type, "ws") == 0) {
         cJSON* t = cJSON_CreateObject(); 
         cJSON_AddStringToObject(t, "type", "ws");
         
-        // [Fix] UrlDecode path (防止 %2F 导致 400 错误)
         char* path = GetQueryParam(query, "path");
         if (path) { 
-            char* decodedPath = strdup(path); 
+            char* decodedPath = _strdup(path); 
             if (decodedPath) {
                 UrlDecode(decodedPath, path);
                 cJSON_AddStringToObject(t, "path", decodedPath); 
@@ -857,7 +821,6 @@ cJSON* ParseMandala(const char* link) {
     }
     if (type) free(type);
 
-    // 解析 TLS
     char* security = GetQueryParam(query, "security");
     if (security && strcmp(security, "tls") == 0) {
         cJSON* tlsObj = cJSON_CreateObject(); 
