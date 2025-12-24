@@ -28,7 +28,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: boringssl_dist
-          key: boringssl-${{ runner.os }}-v3 # 升级 Key 版本 (v3) 以强制重新构建
+          # [关键] 更新 Cache Key 版本 (v3 -> v4)，确保不使用旧的错误构建缓存
+          key: boringssl-${{ runner.os }}-v4
 
       - name: Build BoringSSL
         if: steps.cache-boringssl.outputs.cache-hit != 'true'
@@ -46,15 +47,16 @@ jobs:
           mkdir build
           cd build
           
-          # [修复 2] 配置 CMake
+          # [修复 2] 配置 CMake (强化版)
           # 1. -GNinja: 使用 Ninja 构建系统
-          # 2. -DOPENSSL_NO_ASM=1: 禁用汇编优化 (关键修复)，解决 MinGW 下 fiat_p256_adx_mul 链接错误
+          # 2. -DOPENSSL_NO_ASM=1: 设置 CMake 变量
           # 3. 指定 gcc/g++ 编译器
-          # 4. -Wno-error: 防止编译器警告导致构建中断
+          # 4. [关键修改] 将 -DOPENSSL_NO_ASM 直接加入 CFLAGS/CXXFLAGS，强制生效
           cmake -GNinja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
             -DOPENSSL_NO_ASM=1 \
             -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ \
-            -DCMAKE_C_FLAGS="-Wno-error" -DCMAKE_CXX_FLAGS="-Wno-error" ..
+            -DCMAKE_C_FLAGS="-Wno-error -DOPENSSL_NO_ASM" \
+            -DCMAKE_CXX_FLAGS="-Wno-error -DOPENSSL_NO_ASM" ..
           
           ninja
           
@@ -100,7 +102,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: boringssl_dist
-          key: boringssl-${{ runner.os }}-v3 # 必须与任务 1 的 Key 一致
+          key: boringssl-${{ runner.os }}-v4 # 必须与任务 1 的 Key 一致
 
       - name: Compile Resources
         shell: msys2 {0}
