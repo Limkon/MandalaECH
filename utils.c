@@ -7,24 +7,27 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <wininet.h>
+#include <ctype.h> 
+
+// [BoringSSL] 引入 SSL 头文件
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+
 #include "crypto.h"
 #include "common.h"
-#include "gui.h" // 引用 GUI 头文件以获取日志窗口句柄
+#include "gui.h" 
+#include "cJSON.h" // 必须引用 cJSON 以解析 DoH 响应
 
 // 链接必要的系统库
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "crypt32.lib")
-#pragma comment(lib, "wininet.lib") // [Fix] 确保链接 wininet
+#pragma comment(lib, "wininet.lib")
 
 // [优化] 全局复用 SSL_CTX，避免每次请求都初始化，显著降低 CPU 占用
-// 这是一个生产级优化，避免频繁分配和释放 SSL 上下文
 static SSL_CTX* g_utils_ctx = NULL;
 
 // --------------------------------------------------------------------------
-// 辅助函数：系统版本判断 (新增，参考 sing.c)
-// [Fix] 去掉 static，与 utils.h 中的声明保持一致
+// 辅助函数：系统版本判断
 // --------------------------------------------------------------------------
 BOOL IsWindows8OrGreater() {
     HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
@@ -69,7 +72,6 @@ void log_msg(const char *format, ...) {
     OutputDebugStringA(final_msg);
     
     // 输出到 GUI 日志窗口 (异步发送消息，防止界面卡顿)
-    // 需要获取 gui.c 中定义的全局窗口句柄
     extern HWND hLogViewerWnd; 
     
     if (hLogViewerWnd && IsWindow(hLogViewerWnd)) {
@@ -187,8 +189,6 @@ void UrlDecode(char* dst, const char* src) {
     *dst++ = '\0';
 }
 
-// [Fix] 修复后的查询参数获取函数
-// 增加对 # (fragment) 的检测，防止读取越界到备注信息中
 char* GetQueryParam(const char* query, const char* key) {
     if (!query || !key) return NULL;
     
@@ -217,7 +217,6 @@ char* GetQueryParam(const char* query, const char* key) {
     
     int len = end ? (int)(end - p) : (int)strlen(p);
     
-    // 防止 len < 0 或为 0
     if (len <= 0) return NULL;
 
     char* val = (char*)malloc(len + 1);
@@ -246,8 +245,6 @@ static const int b64_table[] = {
 
 unsigned char* Base64Decode(const char* input, size_t* out_len) {
     size_t len = strlen(input);
-    
-    // 估算输出大小 (Base64 大约是原数据的 4/3)
     size_t out_size = len / 4 * 3;
     unsigned char* out = (unsigned char*)malloc(out_size + 1);
     
@@ -257,13 +254,10 @@ unsigned char* Base64Decode(const char* input, size_t* out_len) {
     
     size_t i = 0, j = 0;
     while (i < len) {
-        // 跳过换行符
         if (input[i] == '\r' || input[i] == '\n') { 
             i++; 
             continue; 
         } 
-        
-        // 结束标志
         if (input[i] == '=') break; 
         
         unsigned char a = (unsigned char)input[i];
@@ -271,7 +265,6 @@ unsigned char* Base64Decode(const char* input, size_t* out_len) {
         unsigned char c = (unsigned char)input[i+2];
         unsigned char d = (unsigned char)input[i+3];
         
-        // 边界检查与非法字符检查
         if (i + 1 >= len) break;
         if (a > 127 || b64_table[a] == -1) break;
         if (b > 127 || b64_table[b] == -1) break;
@@ -296,6 +289,130 @@ unsigned char* Base64Decode(const char* input, size_t* out_len) {
         *out_len = j;
     }
     return out;
+}
+
+// --------------------------------------------------------------------------
+// ECH (Encrypted Client Hello) 辅助实现 [新增]
+// --------------------------------------------------------------------------
+
+// 辅助：十六进制字符串转二进制
+static int HexToBin(const char* hex, unsigned char* out, int max_len) {
+    int len = 0;
+    while (*hex && len < max_len) {
+        char c = *hex;
+        int val = 0;
+        // 跳过非 hex 字符 (如空格, \x 等)
+        if (!isxdigit(c)) { hex++; continue; }
+
+        if (c >= '0' && c <= '9') val = c - '0';
+        else if (c >= 'a' && c <= 'f') val = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') val = c - 'A' + 10;
+        
+        hex++;
+        if (!*hex) break; // 奇数长度，不完整，停止
+        
+        char c2 = *hex;
+        int val2 = 0;
+        if (c2 >= '0' && c2 <= '9') val2 = c2 - '0';
+        else if (c2 >= 'a' && c2 <= 'f') val2 = c2 - 'a' + 10;
+        else if (c2 >= 'A' && c2 <= 'F') val2 = c2 - 'A' + 10;
+        
+        out[len++] = (val << 4) | val2;
+        hex++;
+    }
+    return len;
+}
+
+// 通过 DoH 获取 ECH 配置 (Type 65 / HTTPS Record)
+// 依赖 cJSON 解析 DoH 的 JSON 响应
+unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t* out_len) {
+    if (!domain || !doh_server) return NULL;
+
+    // 构造 DoH 查询 URL
+    // 支持 Google/Cloudflare 格式: ?name=DOM&type=HTTPS
+    char url[1024];
+    snprintf(url, sizeof(url), "%s?name=%s&type=HTTPS&ct=application/dns-json", doh_server, domain);
+
+    log_msg("[ECH] Querying %s for %s", doh_server, domain);
+    char* json_str = Utils_HttpGet(url);
+    if (!json_str) {
+        log_msg("[ECH] DoH request failed.");
+        return NULL;
+    }
+
+    cJSON* root = cJSON_Parse(json_str);
+    free(json_str);
+    if (!root) {
+        log_msg("[ECH] Invalid JSON response.");
+        return NULL;
+    }
+
+    unsigned char* ech_config = NULL;
+    *out_len = 0;
+
+    cJSON* answer = cJSON_GetObjectItem(root, "Answer");
+    if (cJSON_IsArray(answer)) {
+        cJSON* record = NULL;
+        cJSON_ArrayForEach(record, answer) {
+            cJSON* type = cJSON_GetObjectItem(record, "type");
+            // DNS HTTPS Record Type = 65
+            if (type && type->valueint == 65) { 
+                cJSON* data = cJSON_GetObjectItem(record, "data");
+                if (data && data->valuestring) {
+                    // data 格式通常为: "\# <len> <hex string>" 或纯 hex
+                    const char* data_str = data->valuestring;
+                    unsigned char rdata[4096];
+                    int rdata_len = HexToBin(data_str, rdata, sizeof(rdata));
+                    
+                    if (rdata_len > 0) {
+                        // 解析 RFC 9460 HTTPS RDATA
+                        // Format: Priority(2) + TargetName(var) + Params(var)
+                        int p = 0;
+                        if (rdata_len < 2) continue;
+                        
+                        // 跳过 Priority
+                        p += 2; 
+
+                        // 跳过 TargetName (DNS Wire Format)
+                        // 遇到 0x00 结束，或按照 label length 跳转
+                        while (p < rdata_len) {
+                            int label_len = rdata[p++];
+                            if (label_len == 0) break; // root label
+                            p += label_len;
+                        }
+
+                        // 解析 Params
+                        // Format: Key(2) + Len(2) + Value(Len)
+                        while (p + 4 <= rdata_len) {
+                            int key = (rdata[p] << 8) | rdata[p+1];
+                            int len = (rdata[p+2] << 8) | rdata[p+3];
+                            p += 4;
+
+                            // ECH Config Key = 5
+                            if (key == 5) { 
+                                if (p + len <= rdata_len) {
+                                    ech_config = (unsigned char*)malloc(len);
+                                    if (ech_config) {
+                                        memcpy(ech_config, rdata + p, len);
+                                        *out_len = len;
+                                        log_msg("[ECH] Found config (len=%d)", len);
+                                    }
+                                }
+                                break; // 找到即停止
+                            }
+                            p += len;
+                        }
+                    }
+                }
+            }
+            if (ech_config) break; 
+        }
+    } else {
+        log_msg("[ECH] No Answer section found.");
+    }
+
+    cJSON_Delete(root);
+    return ech_config;
 }
 
 // --------------------------------------------------------------------------
