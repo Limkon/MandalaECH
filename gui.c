@@ -285,6 +285,12 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             int pMax = g_padSizeMax;
             int uaIdx = g_uaPlatformIndex;
             char uaStr[512]; strcpy(uaStr, g_userAgentStr);
+            
+            // [新增] ECH 全局变量读取
+            BOOL ech = g_enableECH;
+            char echServer[256]; strcpy(echServer, g_echConfigServer);
+            char echPub[256]; strcpy(echPub, g_echPublicName);
+            
             LeaveCriticalSection(&g_configLock);
 
             int y = 25;
@@ -301,9 +307,9 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             hPortEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", NULL, WS_CHILD|WS_VISIBLE|ES_NUMBER, 160, y-3, 100, 25, hWnd, (HMENU)ID_PORT_EDIT, NULL,NULL);
             SetDlgItemInt(hWnd, ID_PORT_EDIT, localPort, FALSE);
 
-            // 抗封锁设置 GroupBox
+            // 抗封锁设置 GroupBox (增加高度以容纳 ECH)
             y += 50;
-            CreateWindowW(L"BUTTON", L"抗封锁策略配置", WS_CHILD|WS_VISIBLE|BS_GROUPBOX, 20, y, 420, 340, hWnd, NULL, NULL, NULL);
+            CreateWindowW(L"BUTTON", L"抗封锁策略配置", WS_CHILD|WS_VISIBLE|BS_GROUPBOX, 20, y, 420, 440, hWnd, NULL, NULL, NULL);
             
             y += 30;
             HWND hChk1 = CreateWindowW(L"BUTTON", L"启用 Chrome 浏览器指纹模拟", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 35, y, 380, 22, hWnd, (HMENU)ID_CHK_CIPHERS, NULL, NULL);
@@ -333,6 +339,18 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             CreateWindowW(L"STATIC", L"-", WS_CHILD|WS_VISIBLE, 215, y+2, 10, 20, hWnd, NULL,NULL,NULL);
             HWND hPMax = CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER|ES_CENTER, 230, y, 40, 22, hWnd, (HMENU)ID_EDIT_PAD_MAX, NULL, NULL);
 
+            // --- [新增] ECH 设置 ---
+            y += 40;
+            HWND hChkECH = CreateWindowW(L"BUTTON", L"启用 ECH (Encrypted Client Hello)", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 35, y, 380, 22, hWnd, (HMENU)ID_CHK_ECH, NULL, NULL);
+            
+            y += 30;
+            CreateWindowW(L"STATIC", L"DoH服务器:", WS_CHILD|WS_VISIBLE, 55, y+2, 80, 20, hWnd, NULL,NULL,NULL);
+            HWND hEchSrv = CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_AUTOHSCROLL, 140, y, 255, 22, hWnd, (HMENU)ID_EDIT_ECH_SERVER, NULL, NULL);
+
+            y += 30;
+            CreateWindowW(L"STATIC", L"ECH域名:", WS_CHILD|WS_VISIBLE, 55, y+2, 80, 20, hWnd, NULL,NULL,NULL);
+            HWND hEchPub = CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_AUTOHSCROLL, 140, y, 255, 22, hWnd, (HMENU)ID_EDIT_ECH_DOMAIN, NULL, NULL);
+
             // --- UA 设置 ---
             y += 45;
             CreateWindowW(L"STATIC", L"伪装平台:", WS_CHILD|WS_VISIBLE, 35, y+3, 80, 20, hWnd, NULL,NULL,NULL);
@@ -350,6 +368,13 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             SendMessage(hChk2, BM_SETCHECK, alpn ? BST_CHECKED : BST_UNCHECKED, 0);
             SendMessage(hChk3, BM_SETCHECK, frag ? BST_CHECKED : BST_UNCHECKED, 0);
             SendMessage(hChkPad, BM_SETCHECK, pad ? BST_CHECKED : BST_UNCHECKED, 0);
+            
+            // [新增] ECH 初始化控件状态
+            SendMessage(hChkECH, BM_SETCHECK, ech ? BST_CHECKED : BST_UNCHECKED, 0);
+            wchar_t wEchSrv[256]; MultiByteToWideChar(CP_UTF8, 0, echServer, -1, wEchSrv, 256);
+            SetWindowTextW(hEchSrv, wEchSrv);
+            wchar_t wEchPub[256]; MultiByteToWideChar(CP_UTF8, 0, echPub, -1, wEchPub, 256);
+            SetWindowTextW(hEchPub, wEchPub);
 
             SetDlgItemInt(hWnd, ID_EDIT_FRAG_MIN, fMin, FALSE);
             SetDlgItemInt(hWnd, ID_EDIT_FRAG_MAX, fMax, FALSE);
@@ -400,6 +425,16 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
                 g_enableALPN = (IsDlgButtonChecked(hWnd, ID_CHK_ALPN) == BST_CHECKED);
                 g_enableFragment = (IsDlgButtonChecked(hWnd, ID_CHK_FRAG) == BST_CHECKED);
                 g_enablePadding = (IsDlgButtonChecked(hWnd, ID_CHK_PADDING) == BST_CHECKED);
+                
+                // [新增] 保存 ECH 设置
+                g_enableECH = (IsDlgButtonChecked(hWnd, ID_CHK_ECH) == BST_CHECKED);
+                
+                wchar_t wBuf[256];
+                GetDlgItemTextW(hWnd, ID_EDIT_ECH_SERVER, wBuf, 256);
+                WideCharToMultiByte(CP_UTF8, 0, wBuf, -1, g_echConfigServer, 256, NULL, NULL);
+
+                GetDlgItemTextW(hWnd, ID_EDIT_ECH_DOMAIN, wBuf, 256);
+                WideCharToMultiByte(CP_UTF8, 0, wBuf, -1, g_echPublicName, 256, NULL, NULL);
 
                 g_uaPlatformIndex = SendMessage(GetDlgItem(hWnd, ID_COMBO_PLATFORM), CB_GETCURSEL, 0, 0);
                 GetDlgItemTextA(hWnd, ID_EDIT_UA_STR, g_userAgentStr, 511);
@@ -432,7 +467,8 @@ void OpenSettingsWindow() {
     }
     WNDCLASSW wc = {0}; wc.lpfnWndProc=SettingsWndProc; wc.hInstance=GetModuleHandle(NULL); wc.lpszClassName=L"Settings"; wc.hbrBackground=(HBRUSH)(COLOR_BTNFACE+1);
     WNDCLASSW temp; if (!GetClassInfoW(GetModuleHandle(NULL), L"Settings", &temp)) RegisterClassW(&wc);
-    hSettingsWnd = CreateWindowW(L"Settings", L"软件设置", WS_VISIBLE|WS_CAPTION|WS_SYSMENU, CW_USEDEFAULT,0,480,560, hwnd,NULL,wc.hInstance,NULL);
+    // [Fix] 增加窗口高度到 660 以容纳新增的 ECH 控件
+    hSettingsWnd = CreateWindowW(L"Settings", L"软件设置", WS_VISIBLE|WS_CAPTION|WS_SYSMENU, CW_USEDEFAULT,0,480,660, hwnd,NULL,wc.hInstance,NULL);
     ShowWindow(hSettingsWnd, SW_SHOW);
 }
 
@@ -984,3 +1020,4 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nSho
     
     return 0;
 }
+
