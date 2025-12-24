@@ -27,7 +27,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: boringssl_dist
-          key: boringssl-${{ runner.os }}-v6  # 升级版本，避免旧缓存
+          # 升级到 v7，避免使用旧的错误缓存
+          key: boringssl-${{ runner.os }}-v7
 
       - name: Build BoringSSL
         if: steps.cache-boringssl.outputs.cache-hit != 'true'
@@ -43,17 +44,22 @@ jobs:
           mkdir build
           cd build
           
-          # 【关键修复】强制使用 MinGW GCC，避免 BoringSSL 偏向 MSVC 的 cl.exe
+          # 【关键配置】
+          # - 强制使用 MinGW GCC，避免默认选择 MSVC 的 cl.exe
+          # - 使用 NASM 汇编（已安装 nasm，会自动启用）
+          # - 添加 -mno-adx 禁止 ADX 指令集，避免链接时出现 undefined reference to fiat_p256_adx_*
           cmake -GNinja \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=OFF \
             -DCMAKE_C_COMPILER=gcc \
             -DCMAKE_CXX_COMPILER=g++ \
+            -DCMAKE_C_FLAGS="-mno-adx" \
+            -DCMAKE_CXX_FLAGS="-mno-adx" \
             ..
           
           ninja
           
-          # 提取头文件和静态库
+          # 手动提取头文件和静态库
           cd ..
           mkdir -p ../boringssl_dist/include
           mkdir -p ../boringssl_dist/lib
@@ -92,7 +98,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: boringssl_dist
-          key: boringssl-${{ runner.os }}-v6  # 与任务1一致
+          key: boringssl-${{ runner.os }}-v7  # 与任务1保持一致
 
       - name: Compile Resources
         shell: msys2 {0}
