@@ -1,0 +1,111 @@
+name: B Windows Manual Build
+on:
+  workflow_dispatch:
+
+jobs:
+  # --- 任务 1：专门负责编译 BoringSSL ---
+  build-boringssl:
+    runs-on: windows-latest
+    steps:
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          cache: true
+          # BoringSSL 构建需要 Go, CMake, Ninja, NASM
+          install: >-
+            git
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-go
+            mingw-w64-x86_64-nasm
+          path-type: minimal
+
+      - name: Cache BoringSSL
+        id: cache-boringssl
+        uses: actions/cache@v4
+        with:
+          path: boringssl_dist
+          key: boringssl-${{ runner.os }}-v1 # 固定版本 Key
+
+      - name: Build BoringSSL
+        if: steps.cache-boringssl.outputs.cache-hit != 'true'
+        shell: msys2 {0}
+        run: |
+          echo "Building BoringSSL..."
+          # 使用 Google 官方镜像或 GitHub 镜像
+          git clone --depth 1 https://github.com/google/boringssl.git
+          cd boringssl
+          mkdir build
+          cd build
+          
+          # 使用 Ninja 生成构建文件，关闭动态库，编译 Release 版本
+          cmake -GNinja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF ..
+          ninja
+          
+          # BoringSSL 没有 make install，手动提取头文件和静态库
+          cd ..
+          mkdir -p ../boringssl_dist/include
+          mkdir -p ../boringssl_dist/lib
+          
+          # 复制头文件 (保持目录结构)
+          cp -r include/* ../boringssl_dist/include/
+          
+          # 复制编译好的静态库 (MinGW 环境下通常是 libssl.a 和 libcrypto.a)
+          cp build/ssl/libssl.a ../boringssl_dist/lib/
+          cp build/crypto/libcrypto.a ../boringssl_dist/lib/
+          
+          echo "BoringSSL build complete."
+
+  # --- 任务 2：编译 Mandala 主程序 ---
+  build-app:
+    needs: build-boringssl # 依赖 BoringSSL 任务完成
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          cache: true
+          install: git
+          path-type: minimal
+
+      - name: Install Build Tools
+        shell: msys2 {0}
+        run: |
+          sed -i 's/^SigLevel.*/SigLevel = Never/' /etc/pacman.conf
+          pacman -Sy --noconfirm mingw-w64-x86_64-gcc mingw-w64-x86_64-make
+
+      - name: Restore BoringSSL Cache
+        id: cache-boringssl
+        uses: actions/cache@v4
+        with:
+          path: boringssl_dist
+          key: boringssl-${{ runner.os }}-v1 # 必须与任务 1 的 Key 一致
+
+      - name: Compile Resources
+        shell: msys2 {0}
+        run: windres -i resource.rc -o resource.res --target=pe-x86-64 -O coff
+
+      - name: Compile Executable
+        shell: msys2 {0}
+        run: |
+          # 使用 boringssl_dist 进行编译
+          gcc gui.c config.c proxy.c crypto.c utils.c globals.c cJSON.c resource.res -o Mandala.exe \
+            -I${GITHUB_WORKSPACE}/boringssl_dist/include \
+            -L${GITHUB_WORKSPACE}/boringssl_dist/lib \
+            -lssl -lcrypto -lws2_32 -lgdi32 -lcomctl32 -lwininet -lcrypt32 -luser32 \
+            -mwindows -municode -finput-charset=UTF-8 \
+            -static
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mandala-Windows-x64-BoringSSL-ECH
+          path: Mandala.exe
