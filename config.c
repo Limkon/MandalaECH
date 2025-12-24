@@ -102,7 +102,14 @@ void LoadSettings() {
     int padMax = GetPrivateProfileIntW(L"Settings", L"PadMax", 500, g_iniFilePath);
     int uaIdx = GetPrivateProfileIntW(L"Settings", L"UAPlatform", 0, g_iniFilePath);
 
-    // 新增：读取订阅更新配置
+    // [新增] 读取 ECH 配置
+    int enableECH = GetPrivateProfileIntW(L"Settings", L"EnableECH", 0, g_iniFilePath);
+    wchar_t wEchServer[256] = {0};
+    GetPrivateProfileStringW(L"Settings", L"ECHServer", L"https://cloudflare-dns.com/dns-query", wEchServer, 256, g_iniFilePath);
+    wchar_t wEchPub[256] = {0};
+    GetPrivateProfileStringW(L"Settings", L"ECHPublicName", L"", wEchPub, 256, g_iniFilePath);
+
+    // 读取订阅更新配置
     int upMode = GetPrivateProfileIntW(L"Subscriptions", L"UpdateMode", 0, g_iniFilePath);
     int upInterval = GetPrivateProfileIntW(L"Subscriptions", L"UpdateInterval", 24, g_iniFilePath);
 
@@ -123,12 +130,16 @@ void LoadSettings() {
     g_padSizeMin = padMin;
     g_padSizeMax = padMax;
 
+    // [新增] 赋值 ECH 全局变量
+    g_enableECH = enableECH;
+    WideCharToMultiByte(CP_UTF8, 0, wEchServer, -1, g_echConfigServer, sizeof(g_echConfigServer), NULL, NULL);
+    WideCharToMultiByte(CP_UTF8, 0, wEchPub, -1, g_echPublicName, sizeof(g_echPublicName), NULL, NULL);
+
     if (g_fragSizeMin < 1) g_fragSizeMin = 1; if (g_fragSizeMax < g_fragSizeMin) g_fragSizeMax = g_fragSizeMin;
     if (g_fragDelayMs < 0) g_fragDelayMs = 0; if (g_padSizeMin < 0) g_padSizeMin = 0; if (g_padSizeMax < g_padSizeMin) g_padSizeMax = g_padSizeMin;
 
     g_uaPlatformIndex = uaIdx;
     
-    // 赋值新增变量
     g_subUpdateMode = upMode;
     g_subUpdateInterval = upInterval;
 
@@ -172,6 +183,18 @@ void SaveSettings() {
     _snwprintf(buffer, 16, L"%d", g_padSizeMax); WritePrivateProfileStringW(L"Settings", L"PadMax", buffer, g_iniFilePath);
     _snwprintf(buffer, 16, L"%d", g_uaPlatformIndex); WritePrivateProfileStringW(L"Settings", L"UAPlatform", buffer, g_iniFilePath);
     
+    // [新增] 保存 ECH 配置
+    _snwprintf(buffer, 16, L"%d", g_enableECH); 
+    WritePrivateProfileStringW(L"Settings", L"EnableECH", buffer, g_iniFilePath);
+    
+    wchar_t wEchServerOut[256] = {0};
+    MultiByteToWideChar(CP_UTF8, 0, g_echConfigServer, -1, wEchServerOut, 256);
+    WritePrivateProfileStringW(L"Settings", L"ECHServer", wEchServerOut, g_iniFilePath);
+
+    wchar_t wEchPubOut[256] = {0};
+    MultiByteToWideChar(CP_UTF8, 0, g_echPublicName, -1, wEchPubOut, 256);
+    WritePrivateProfileStringW(L"Settings", L"ECHPublicName", wEchPubOut, g_iniFilePath);
+
     wchar_t wUABuf[512] = {0}; 
     MultiByteToWideChar(CP_UTF8, 0, g_userAgentStr, -1, wUABuf, 512);
     WritePrivateProfileStringW(L"Settings", L"UserAgent", wUABuf, g_iniFilePath);
@@ -180,7 +203,6 @@ void SaveSettings() {
 
     WritePrivateProfileStringW(L"Subscriptions", NULL, NULL, g_iniFilePath);
     
-    // 新增：保存订阅更新设置
     _snwprintf(buffer, 16, L"%d", g_subUpdateMode); WritePrivateProfileStringW(L"Subscriptions", L"UpdateMode", buffer, g_iniFilePath);
     _snwprintf(buffer, 16, L"%d", g_subUpdateInterval); WritePrivateProfileStringW(L"Subscriptions", L"UpdateInterval", buffer, g_iniFilePath);
 
@@ -326,7 +348,6 @@ void ParseNodeConfigToGlobal(cJSON *node) {
         g_proxyConfig.host, g_proxyConfig.port, g_proxyConfig.type, g_proxyConfig.sni);
 }
 
-// [核心修复] 实现节点热切换，移除冗余的 Stop/Start 逻辑
 void SwitchNode(const wchar_t* tag) {
     EnterCriticalSection(&g_configLock);
     wcsncpy(currentNode, tag, 63);
@@ -347,13 +368,9 @@ void SwitchNode(const wchar_t* tag) {
     }
     
     if (targetNode) {
-        /* [修复点] 移除 StopProxyCore()。
-           监听线程 (server_thread) 会在每个新连接进入时拷贝全局配置。
-           直接更新全局配置即可实现“热更新”，无需重启监听套接字。 */
-        
-        ParseNodeConfigToGlobal(targetNode); // 原子更新全局变量
-        StartProxyCore(); // 确保代理处于运行状态
-        SaveSettings();   // 保存持久化设置
+        ParseNodeConfigToGlobal(targetNode); 
+        StartProxyCore(); 
+        SaveSettings();   
         
         wchar_t tip[128]; 
         _snwprintf(tip, 128, L"已切换: %s", tag);
