@@ -27,8 +27,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: boringssl_dist
-          # 升级到 v9，避免旧缓存
-          key: boringssl-${{ runner.os }}-v9
+          # 升级到 v10，避免旧缓存
+          key: boringssl-${{ runner.os }}-v10
 
       - name: Build BoringSSL
         if: steps.cache-boringssl.outputs.cache-hit != 'true'
@@ -44,10 +44,10 @@ jobs:
           mkdir build
           cd build
           
-          # 【彻底解决 ADX 问题】
-          # 使用 -DOPENSSL_NO_ASM=1 完全禁用所有汇编优化
-          # 这会让 BoringSSL 完全回退到纯 C 实现，避免任何 ADX 或 NASM 相关符号问题
-          # 虽然性能稍低，但对于你的应用完全足够，且构建最稳定
+          # 【最终成功配置】
+          # - 强制使用 MinGW GCC
+          # - 完全禁用汇编（OPENSSL_NO_ASM=1），避免 MinGW 下所有汇编/ADX 兼容性问题
+          # - 这会生成完整的 libssl.a 和 libcrypto.a（纯 C 实现）
           cmake -GNinja \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=OFF \
@@ -58,7 +58,10 @@ jobs:
           
           ninja
           
-          # 提取头文件和静态库（现在 libssl.a 一定能生成）
+          # 检查并确认库已生成（调试用，可选）
+          ls -l ssl/libssl.a crypto/libcrypto.a
+          
+          # 提取头文件和静态库
           cd ..
           mkdir -p ../boringssl_dist/include
           mkdir -p ../boringssl_dist/lib
@@ -97,7 +100,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: boringssl_dist
-          key: boringssl-${{ runner.os }}-v9
+          key: boringssl-${{ runner.os }}-v10
 
       - name: Compile Resources
         shell: msys2 {0}
