@@ -42,7 +42,9 @@ jobs:
           cd build
           
           # 使用 Ninja 生成构建文件，关闭动态库，编译 Release 版本
-          cmake -GNinja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF ..
+          # 修复：显式指定使用 gcc 和 g++ 编译器，防止 CMake 默认寻找 MSVC (cl.exe)
+          cmake -GNinja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+            -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ ..
           ninja
           
           # BoringSSL 没有 make install，手动提取头文件和静态库
