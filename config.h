@@ -10,6 +10,13 @@
 // --- 新增：订阅管理系统 ---
 #define MAX_SUBS 20
 
+// 定义更新模式枚举
+enum UpdateMode {
+    UPDATE_MODE_DAILY = 0,
+    UPDATE_MODE_WEEKLY,
+    UPDATE_MODE_CUSTOM
+};
+
 typedef struct {
     BOOL enabled;   // 是否启用
     char url[512];  // 订阅地址
@@ -17,6 +24,10 @@ typedef struct {
 
 extern Subscription g_subs[MAX_SUBS];
 extern int g_subCount;
+
+// 新增：订阅更新配置全局变量
+extern int g_subUpdateMode;      // 更新模式: 0=每天, 1=每周, 2=自定义
+extern int g_subUpdateInterval;  // 自定义间隔（单位：小时）
 
 // 函数声明
 void LoadSettings();
