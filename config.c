@@ -9,6 +9,10 @@
 Subscription g_subs[MAX_SUBS];
 int g_subCount = 0;
 
+// 新增：订阅更新配置默认值
+int g_subUpdateMode = 0;      // 0=每天 (默认)
+int g_subUpdateInterval = 24; // 24小时 (默认)
+
 // --- 内部辅助函数声明 ---
 int Internal_BatchAddNodesFromText(const char* text, cJSON* outbounds);
 char* GetUniqueTagName(cJSON* outbounds, const char* type, const char* base_name);
@@ -98,6 +102,10 @@ void LoadSettings() {
     int padMax = GetPrivateProfileIntW(L"Settings", L"PadMax", 500, g_iniFilePath);
     int uaIdx = GetPrivateProfileIntW(L"Settings", L"UAPlatform", 0, g_iniFilePath);
 
+    // 新增：读取订阅更新配置
+    int upMode = GetPrivateProfileIntW(L"Subscriptions", L"UpdateMode", 0, g_iniFilePath);
+    int upInterval = GetPrivateProfileIntW(L"Subscriptions", L"UpdateInterval", 24, g_iniFilePath);
+
     EnterCriticalSection(&g_configLock);
 
     g_hotkeyModifiers = modifiers;
@@ -120,6 +128,10 @@ void LoadSettings() {
 
     g_uaPlatformIndex = uaIdx;
     
+    // 赋值新增变量
+    g_subUpdateMode = upMode;
+    g_subUpdateInterval = upInterval;
+
     wchar_t wUABuf[512] = {0}; 
     GetPrivateProfileStringW(L"Settings", L"UserAgent", L"", wUABuf, 512, g_iniFilePath);
     if (wcslen(wUABuf) > 5) WideCharToMultiByte(CP_UTF8, 0, wUABuf, -1, g_userAgentStr, sizeof(g_userAgentStr), NULL, NULL);
@@ -167,6 +179,11 @@ void SaveSettings() {
     WritePrivateProfileStringW(L"Settings", L"LastNode", currentNode, g_iniFilePath);
 
     WritePrivateProfileStringW(L"Subscriptions", NULL, NULL, g_iniFilePath);
+    
+    // 新增：保存订阅更新设置
+    _snwprintf(buffer, 16, L"%d", g_subUpdateMode); WritePrivateProfileStringW(L"Subscriptions", L"UpdateMode", buffer, g_iniFilePath);
+    _snwprintf(buffer, 16, L"%d", g_subUpdateInterval); WritePrivateProfileStringW(L"Subscriptions", L"UpdateInterval", buffer, g_iniFilePath);
+
     _snwprintf(buffer, 16, L"%d", g_subCount); WritePrivateProfileStringW(L"Subscriptions", L"Count", buffer, g_iniFilePath);
     for (int i = 0; i < g_subCount; i++) {
         wchar_t wKeyEn[32], wKeyUrl[32], wUrl[512], wVal[2];
