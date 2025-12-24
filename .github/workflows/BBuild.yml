@@ -28,7 +28,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: boringssl_dist
-          key: boringssl-${{ runner.os }}-v1 # 固定版本 Key
+          key: boringssl-${{ runner.os }}-v2 # 更新 Key 以强制重新构建
 
       - name: Build BoringSSL
         if: steps.cache-boringssl.outputs.cache-hit != 'true'
@@ -38,13 +38,21 @@ jobs:
           # 使用 Google 官方镜像或 GitHub 镜像
           git clone --depth 1 https://github.com/google/boringssl.git
           cd boringssl
+          
+          # [修复] 修正 GCC 15 下的格式化字符串类型匹配错误
+          # 将 int 类型的 error 强制转换为 unsigned int 以匹配 %x
+          sed -i 's/unknown error (0x%x)", error/unknown error (0x%x)", (unsigned int)error/' tool/transport_common.cc
+          
           mkdir build
           cd build
           
           # 使用 Ninja 生成构建文件，关闭动态库，编译 Release 版本
-          # 修复：显式指定使用 gcc 和 g++ 编译器，防止 CMake 默认寻找 MSVC (cl.exe)
+          # 1. 显式指定编译器为 gcc/g++
+          # 2. 添加 -Wno-error 防止将警告视为错误 (BoringSSL 默认开启 -Werror)
           cmake -GNinja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
-            -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ ..
+            -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ \
+            -DCMAKE_C_FLAGS="-Wno-error" -DCMAKE_CXX_FLAGS="-Wno-error" ..
+          
           ninja
           
           # BoringSSL 没有 make install，手动提取头文件和静态库
@@ -89,7 +97,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: boringssl_dist
-          key: boringssl-${{ runner.os }}-v1 # 必须与任务 1 的 Key 一致
+          key: boringssl-${{ runner.os }}-v2 # 必须与任务 1 的 Key 一致
 
       - name: Compile Resources
         shell: msys2 {0}
