@@ -37,6 +37,14 @@
 #define ID_NODEMGR_DEL      3003
 #define ID_NODEMGR_SUB      2003
 
+// 订阅设置窗口新增 ID
+#define IDC_GROUP_SUB_UPDATE    3100 // 分组框
+#define IDC_RADIO_DAILY         3101 // 每天
+#define IDC_RADIO_WEEKLY        3102 // 每周
+#define IDC_RADIO_CUSTOM        3103 // 自定义
+#define IDC_EDIT_CUSTOM_TIME    3104 // 自定义时间输入框
+#define IDC_STATIC_CUSTOM_UNIT  3105 // 单位提示
+
 // 日誌窗口
 #define ID_LOG_CHK          4001
 #define ID_LOGVIEWER_EDIT   4002
