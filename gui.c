@@ -3,7 +3,8 @@
 #include "proxy.h"
 #include "utils.h"
 #include "crypto.h"
-#include "common.h" // [Fix] 引入全局锁定义
+#include "common.h" 
+#include "resource.h" // 引入资源ID定义
 #include <commctrl.h>
 #include <stdio.h>
 #include <wchar.h> 
@@ -459,6 +460,12 @@ void RefreshSubList() {
     LeaveCriticalSection(&g_configLock);
 }
 
+// 辅助：更新自定义时间编辑框的启用状态
+void UpdateSubUIState(HWND hDlg) {
+    BOOL isCustom = (SendMessage(GetDlgItem(hDlg, IDC_RADIO_CUSTOM), BM_GETCHECK, 0, 0) == BST_CHECKED);
+    EnableWindow(GetDlgItem(hDlg, IDC_EDIT_CUSTOM_TIME), isCustom);
+}
+
 LRESULT CALLBACK SubWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch(msg) {
         case WM_CREATE: {
@@ -477,6 +484,30 @@ LRESULT CALLBACK SubWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             CreateWindowW(L"BUTTON", L"保存设置", WS_CHILD|WS_VISIBLE, 280, 210, 80, 28, hWnd, (HMENU)ID_SUB_SAVE_BTN, NULL,NULL);
             CreateWindowW(L"BUTTON", L"立即更新", WS_CHILD|WS_VISIBLE, 370, 210, 100, 28, hWnd, (HMENU)ID_SUB_UPD_BTN, NULL,NULL);
             
+            // --- 新增：更新周期设置区域 ---
+            int yGrp = 250;
+            CreateWindowW(L"BUTTON", L"自动更新周期", WS_CHILD|WS_VISIBLE|BS_GROUPBOX, 10, yGrp, 460, 60, hWnd, (HMENU)IDC_GROUP_SUB_UPDATE, NULL, NULL);
+            
+            HWND hDaily = CreateWindowW(L"BUTTON", L"每天", WS_CHILD|WS_VISIBLE|BS_AUTORADIOBUTTON|WS_GROUP, 25, yGrp+25, 60, 20, hWnd, (HMENU)IDC_RADIO_DAILY, NULL, NULL);
+            HWND hWeekly = CreateWindowW(L"BUTTON", L"每周", WS_CHILD|WS_VISIBLE|BS_AUTORADIOBUTTON, 100, yGrp+25, 60, 20, hWnd, (HMENU)IDC_RADIO_WEEKLY, NULL, NULL);
+            HWND hCustom = CreateWindowW(L"BUTTON", L"自定义", WS_CHILD|WS_VISIBLE|BS_AUTORADIOBUTTON, 180, yGrp+25, 70, 20, hWnd, (HMENU)IDC_RADIO_CUSTOM, NULL, NULL);
+            
+            HWND hTime = CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER|ES_CENTER, 260, yGrp+23, 50, 22, hWnd, (HMENU)IDC_EDIT_CUSTOM_TIME, NULL, NULL);
+            CreateWindowW(L"STATIC", L"小时", WS_CHILD|WS_VISIBLE, 315, yGrp+25, 40, 20, hWnd, (HMENU)IDC_STATIC_CUSTOM_UNIT, NULL, NULL);
+
+            // 初始化控件状态
+            EnterCriticalSection(&g_configLock);
+            int mode = g_subUpdateMode;
+            int interval = g_subUpdateInterval;
+            LeaveCriticalSection(&g_configLock);
+
+            if (mode == UPDATE_MODE_WEEKLY) SendMessage(hWeekly, BM_SETCHECK, BST_CHECKED, 0);
+            else if (mode == UPDATE_MODE_CUSTOM) SendMessage(hCustom, BM_SETCHECK, BST_CHECKED, 0);
+            else SendMessage(hDaily, BM_SETCHECK, BST_CHECKED, 0);
+
+            SetDlgItemInt(hWnd, IDC_EDIT_CUSTOM_TIME, interval, FALSE);
+            UpdateSubUIState(hWnd);
+
             RefreshSubList();
             EnumChildWindows(hWnd, EnumSetFont, (LPARAM)hAppFont);
             SendMessage(hWnd, WM_SETFONT, (WPARAM)hAppFont, TRUE);
@@ -484,7 +515,11 @@ LRESULT CALLBACK SubWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         case WM_COMMAND: {
             int id = LOWORD(wParam);
-            if (id == ID_SUB_ADD_BTN) {
+            
+            if (id == IDC_RADIO_DAILY || id == IDC_RADIO_WEEKLY || id == IDC_RADIO_CUSTOM) {
+                UpdateSubUIState(hWnd);
+            }
+            else if (id == ID_SUB_ADD_BTN) {
                 EnterCriticalSection(&g_configLock); // [Lock]
                 if (g_subCount >= MAX_SUBS) { 
                     LeaveCriticalSection(&g_configLock);
@@ -514,21 +549,33 @@ LRESULT CALLBACK SubWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     RefreshSubList();
                 } else MessageBoxW(hWnd, L"请先在列表中选中一项", L"提示", MB_OK);
             }
-            else if (id == ID_SUB_SAVE_BTN) {
+            else if (id == ID_SUB_SAVE_BTN || id == ID_SUB_UPD_BTN) {
                 EnterCriticalSection(&g_configLock); // [Lock]
+                
                 for(int i=0; i<g_subCount; i++) g_subs[i].enabled = ListView_GetCheckState(hSubList, i);
+                
+                if (SendMessage(GetDlgItem(hWnd, IDC_RADIO_WEEKLY), BM_GETCHECK, 0, 0) == BST_CHECKED) {
+                    g_subUpdateMode = UPDATE_MODE_WEEKLY;
+                } else if (SendMessage(GetDlgItem(hWnd, IDC_RADIO_CUSTOM), BM_GETCHECK, 0, 0) == BST_CHECKED) {
+                    g_subUpdateMode = UPDATE_MODE_CUSTOM;
+                } else {
+                    g_subUpdateMode = UPDATE_MODE_DAILY;
+                }
+
+                int interval = GetDlgItemInt(hWnd, IDC_EDIT_CUSTOM_TIME, NULL, FALSE);
+                if (interval > 0) g_subUpdateInterval = interval;
+                
                 LeaveCriticalSection(&g_configLock); // [Unlock]
+                
                 SaveSettings(); 
-                MessageBoxW(hWnd, L"订阅设置已保存", L"成功", MB_OK);
-            }
-            else if (id == ID_SUB_UPD_BTN) { 
-                EnterCriticalSection(&g_configLock); // [Lock]
-                for(int i=0; i<g_subCount; i++) g_subs[i].enabled = ListView_GetCheckState(hSubList, i);
-                LeaveCriticalSection(&g_configLock); // [Unlock]
-                SaveSettings(); 
-                SetWindowTextW(hWnd, L"正在更新 (后台进行中)...");
-                EnableWindow(GetDlgItem(hWnd, ID_SUB_UPD_BTN), FALSE); 
-                CreateThread(NULL, 0, ManualUpdateThread, (LPVOID)hWnd, 0, NULL);
+
+                if (id == ID_SUB_SAVE_BTN) {
+                    MessageBoxW(hWnd, L"订阅设置已保存", L"成功", MB_OK);
+                } else {
+                    SetWindowTextW(hWnd, L"正在更新 (后台进行中)...");
+                    EnableWindow(GetDlgItem(hWnd, ID_SUB_UPD_BTN), FALSE); 
+                    CreateThread(NULL, 0, ManualUpdateThread, (LPVOID)hWnd, 0, NULL);
+                }
             }
             break;
         }
@@ -537,7 +584,6 @@ LRESULT CALLBACK SubWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             EnableWindow(GetDlgItem(hWnd, ID_SUB_UPD_BTN), TRUE);
             SetWindowTextW(hWnd, L"订阅设置");
             wchar_t msg[128]; 
-            // [Safety] 替换 wsprintfW
             swprintf_s(msg, 128, L"更新完成，共获取 %d 个节点。", count);
             MessageBoxW(hWnd, msg, L"结果", MB_OK);
             HWND hMgr = FindWindowW(L"NodeMgr", NULL);
@@ -558,7 +604,7 @@ void OpenSubWindow() {
         wc.lpszClassName = L"SubWnd"; wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE+1);
         wc.hCursor = LoadCursor(NULL, IDC_ARROW); RegisterClassW(&wc);
     }
-    hSubWnd = CreateWindowW(L"SubWnd", L"订阅设置", WS_VISIBLE|WS_CAPTION|WS_SYSMENU, CW_USEDEFAULT,0,500,290, NULL,NULL,GetModuleHandle(NULL),NULL);
+    hSubWnd = CreateWindowW(L"SubWnd", L"订阅设置", WS_VISIBLE|WS_CAPTION|WS_SYSMENU, CW_USEDEFAULT,0,500,360, NULL,NULL,GetModuleHandle(NULL),NULL);
     ShowWindow(hSubWnd, SW_SHOW); UpdateWindow(hSubWnd);
 }
 
