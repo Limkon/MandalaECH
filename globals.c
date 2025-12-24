@@ -60,6 +60,11 @@ int g_padSizeMax = 500;
 int g_uaPlatformIndex = 0;
 char g_userAgentStr[512] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
+// [新增] ECH 全局变量定义
+BOOL g_enableECH = FALSE;
+char g_echConfigServer[256] = "https://cloudflare-dns.com/dns-query"; // 默认 DoH
+char g_echPublicName[256] = ""; // 默认为空
+
 // 定义常用 UA 模板
 const wchar_t* UA_PLATFORMS[] = {
     L"Windows (Chrome 120)",
