@@ -13,7 +13,6 @@ jobs:
           msystem: MINGW64
           update: false
           cache: true
-          # BoringSSL 构建需要 Go, CMake, Ninja, NASM
           install: >-
             git
             mingw-w64-x86_64-gcc
@@ -28,8 +27,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: boringssl_dist
-          # 更新 Cache Key 版本，确保不使用旧缓存
-          key: boringssl-${{ runner.os }}-v5  # 升级到 v5，避免旧的错误缓存
+          key: boringssl-${{ runner.os }}-v6  # 升级版本，避免旧缓存
 
       - name: Build BoringSSL
         if: steps.cache-boringssl.outputs.cache-hit != 'true'
@@ -39,29 +37,28 @@ jobs:
           git clone --depth 1 https://github.com/google/boringssl.git
           cd boringssl
           
-          # 保留原有的 GCC 15 格式化字符串修复
+          # GCC 15 格式化字符串修复（保留）
           sed -i 's/unknown error (0x%x)", error/unknown error (0x%x)", (unsigned int)error/' tool/transport_common.cc
           
           mkdir build
           cd build
           
-          # 【关键修改】移除所有 OPENSSL_NO_ASM 相关选项，让 BoringSSL 使用 NASM 汇编
-          # 这能确保 libssl.a 正常生成并链接
+          # 【关键修复】强制使用 MinGW GCC，避免 BoringSSL 偏向 MSVC 的 cl.exe
           cmake -GNinja \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=OFF \
+            -DCMAKE_C_COMPILER=gcc \
+            -DCMAKE_CXX_COMPILER=g++ \
             ..
           
           ninja
           
-          # 手动提取头文件和静态库
+          # 提取头文件和静态库
           cd ..
           mkdir -p ../boringssl_dist/include
           mkdir -p ../boringssl_dist/lib
           
           cp -r include/* ../boringssl_dist/include/
-          
-          # 复制静态库（现在 libssl.a 会正常生成）
           cp build/ssl/libssl.a ../boringssl_dist/lib/
           cp build/crypto/libcrypto.a ../boringssl_dist/lib/
           
@@ -95,7 +92,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: boringssl_dist
-          key: boringssl-${{ runner.os }}-v5  # 与任务1保持一致
+          key: boringssl-${{ runner.os }}-v6  # 与任务1一致
 
       - name: Compile Resources
         shell: msys2 {0}
