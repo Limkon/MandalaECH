@@ -27,7 +27,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: boringssl_dist
-          key: boringssl-${{ runner.os }}-v8  # 升级到 v8
+          # 升级到 v9，避免旧缓存
+          key: boringssl-${{ runner.os }}-v9
 
       - name: Build BoringSSL
         if: steps.cache-boringssl.outputs.cache-hit != 'true'
@@ -37,28 +38,27 @@ jobs:
           git clone --depth 1 https://github.com/google/boringssl.git
           cd boringssl
           
-          # GCC 15 格式化字符串修复
+          # GCC 15 格式化字符串修复（保留）
           sed -i 's/unknown error (0x%x)", error/unknown error (0x%x)", (unsigned int)error/' tool/transport_common.cc
           
           mkdir build
           cd build
           
-          # 【最终修复】
-          # - 强制使用 MinGW GCC
-          # - 明确启用汇编 (默认会用 NASM)
-          # - 关键：OPENSSL_NO_ASM_ADX=1 彻底禁用 ADX 路径，避免 fiat_p256_adx_* 符号
+          # 【彻底解决 ADX 问题】
+          # 使用 -DOPENSSL_NO_ASM=1 完全禁用所有汇编优化
+          # 这会让 BoringSSL 完全回退到纯 C 实现，避免任何 ADX 或 NASM 相关符号问题
+          # 虽然性能稍低，但对于你的应用完全足够，且构建最稳定
           cmake -GNinja \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=OFF \
             -DCMAKE_C_COMPILER=gcc \
             -DCMAKE_CXX_COMPILER=g++ \
-            -DOPENSSL_NO_ASM=0 \
-            -DOPENSSL_NO_ASM_ADX=1 \
+            -DOPENSSL_NO_ASM=1 \
             ..
           
           ninja
           
-          # 提取库和头文件
+          # 提取头文件和静态库（现在 libssl.a 一定能生成）
           cd ..
           mkdir -p ../boringssl_dist/include
           mkdir -p ../boringssl_dist/lib
@@ -97,7 +97,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: boringssl_dist
-          key: boringssl-${{ runner.os }}-v8
+          key: boringssl-${{ runner.os }}-v9
 
       - name: Compile Resources
         shell: msys2 {0}
