@@ -34,7 +34,7 @@
 #include <ctype.h>
 #include <wininet.h>
 
-// OpenSSL Headers
+// OpenSSL Headers (BoringSSL 兼容 API)
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/bio.h>
@@ -91,6 +91,11 @@
 #define ID_CHK_PADDING    7019
 #define ID_EDIT_PAD_MIN   7020
 #define ID_EDIT_PAD_MAX   7021
+
+// [新增] ECH 设置控件 ID
+#define ID_CHK_ECH         7022
+#define ID_EDIT_ECH_SERVER 7023
+#define ID_EDIT_ECH_DOMAIN 7024
 
 // Node Edit IDs
 #define ID_EDIT_TAG      8001
@@ -158,6 +163,11 @@ extern int g_padSizeMin;
 extern int g_padSizeMax;
 extern int g_uaPlatformIndex; 
 extern char g_userAgentStr[512];
+
+// [新增] ECH 全局配置变量
+extern BOOL g_enableECH;
+extern char g_echConfigServer[256]; // DoH Server
+extern char g_echPublicName[256];   // ECH Public Name (Cover SNI)
 
 extern const wchar_t* UA_PLATFORMS[];
 extern const char* UA_TEMPLATES[];
