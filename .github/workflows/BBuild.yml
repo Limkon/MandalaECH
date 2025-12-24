@@ -27,8 +27,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: boringssl_dist
-          # 升级到 v7，避免使用旧的错误缓存
-          key: boringssl-${{ runner.os }}-v7
+          key: boringssl-${{ runner.os }}-v8  # 升级到 v8
 
       - name: Build BoringSSL
         if: steps.cache-boringssl.outputs.cache-hit != 'true'
@@ -38,28 +37,28 @@ jobs:
           git clone --depth 1 https://github.com/google/boringssl.git
           cd boringssl
           
-          # GCC 15 格式化字符串修复（保留）
+          # GCC 15 格式化字符串修复
           sed -i 's/unknown error (0x%x)", error/unknown error (0x%x)", (unsigned int)error/' tool/transport_common.cc
           
           mkdir build
           cd build
           
-          # 【关键配置】
-          # - 强制使用 MinGW GCC，避免默认选择 MSVC 的 cl.exe
-          # - 使用 NASM 汇编（已安装 nasm，会自动启用）
-          # - 添加 -mno-adx 禁止 ADX 指令集，避免链接时出现 undefined reference to fiat_p256_adx_*
+          # 【最终修复】
+          # - 强制使用 MinGW GCC
+          # - 明确启用汇编 (默认会用 NASM)
+          # - 关键：OPENSSL_NO_ASM_ADX=1 彻底禁用 ADX 路径，避免 fiat_p256_adx_* 符号
           cmake -GNinja \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=OFF \
             -DCMAKE_C_COMPILER=gcc \
             -DCMAKE_CXX_COMPILER=g++ \
-            -DCMAKE_C_FLAGS="-mno-adx" \
-            -DCMAKE_CXX_FLAGS="-mno-adx" \
+            -DOPENSSL_NO_ASM=0 \
+            -DOPENSSL_NO_ASM_ADX=1 \
             ..
           
           ninja
           
-          # 手动提取头文件和静态库
+          # 提取库和头文件
           cd ..
           mkdir -p ../boringssl_dist/include
           mkdir -p ../boringssl_dist/lib
@@ -98,7 +97,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: boringssl_dist
-          key: boringssl-${{ runner.os }}-v7  # 与任务1保持一致
+          key: boringssl-${{ runner.os }}-v8
 
       - name: Compile Resources
         shell: msys2 {0}
