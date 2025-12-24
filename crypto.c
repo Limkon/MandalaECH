@@ -1,11 +1,24 @@
 #include "crypto.h"
 #include "utils.h"
-#include <openssl/rand.h>
-#include <openssl/err.h>
+#include "common.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
-// [Fix] g_ssl_ctx 已移动到 globals.c 定义，此处移除定义，仅保留使用
+// [BoringSSL] 核心头文件
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <openssl/rand.h>
+#include <openssl/bio.h>
+
+// ---------------------- Global Variables ----------------------
+
+// 全局 SSL 上下文 (用于代理连接)
+static SSL_CTX *g_ssl_ctx = NULL;
+
 // 全局 BIO 方法 (用于分片)
 static BIO_METHOD *method_frag = NULL;
+
 // 仅初始化一次的标志
 static INIT_ONCE g_crypto_init_once = INIT_ONCE_STATIC_INIT;
 
@@ -174,6 +187,10 @@ BOOL CALLBACK InitCryptoCallback(PINIT_ONCE InitOnce, PVOID Parameter, PVOID *Co
         return FALSE;
     }
 
+    // [BoringSSL 特性] 开启 ECH GREASE
+    // 这有助于掩盖真实的 ECH 使用情况，即使未配置 ECH 也会发送伪造扩展
+    SSL_CTX_set_enable_ech_grease(g_ssl_ctx, 1);
+
     // 3. 设置基础 TLS 属性
     SSL_CTX_set_min_proto_version(g_ssl_ctx, TLS1_2_VERSION);
     SSL_CTX_set_max_proto_version(g_ssl_ctx, TLS1_3_VERSION);
@@ -226,6 +243,31 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
     if (!ctx->ssl) return -1;
     SSL_set_fd(ctx->ssl, (int)ctx->sock);
     
+    // [新增] ECH (Encrypted Client Hello) 处理逻辑
+    if (g_enableECH) {
+        // 1. 获取 ECH 配置 (ECHConfigList)
+        // 使用目标 SNI 或 Host 作为查询域名，使用全局配置的 DoH 服务器
+        const char* query_domain = (target_sni && strlen(target_sni)) ? target_sni : target_host;
+        
+        size_t ech_len = 0;
+        // FetchECHConfig 在 utils.c 中定义
+        unsigned char* ech_config = FetchECHConfig(query_domain, g_echConfigServer, &ech_len);
+        
+        if (ech_config && ech_len > 0) {
+            // 2. 设置 ECH Config List (BoringSSL API)
+            // 成功设置后，BoringSSL 会自动处理 ClientHello 的加密，
+            // 并在外部 SNI 中使用 public_name (如果 ECHConfig 中有)
+            if (SSL_set1_ech_config_list(ctx->ssl, ech_config, ech_len) != 1) {
+                 log_msg("[ECH] Failed to set ECH config for %s", query_domain);
+            } else {
+                 log_msg("[ECH] Config set for %s (len=%d)", query_domain, ech_len);
+            }
+            free(ech_config);
+        } else {
+            log_msg("[ECH] No config found for %s, fallback to plain TLS", query_domain);
+        }
+    }
+
     // 1. 应用 Padding 配置
     if (settings && settings->enablePadding) {
         int range = settings->padMax - settings->padMin;
@@ -254,6 +296,9 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
     const char *sni_name = (target_sni && strlen(target_sni)) ? target_sni : target_host;
     SSL_set_tlsext_host_name(ctx->ssl, sni_name);
     
+    // [注意] 如果 ECH 生效，Outer SNI 可能会被 BoringSSL 根据 ECHConfig 自动替换为 public_name
+    // 这里设置的是 Inner SNI (加密后只有服务器能看到的真实域名)
+
     // 4. 设置 ALPN (模拟 http/1.1)
     unsigned char alpn_protos[] = { 8, 'h', 't', 't', 'p', '/', '1', '.', '1' };
     SSL_set_alpn_protos(ctx->ssl, alpn_protos, sizeof(alpn_protos));
@@ -261,6 +306,7 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
     int ret = SSL_connect(ctx->ssl);
     if (ret != 1) {
         // 握手失败
+        // 可以通过 SSL_get_error 检查是否因为 ECH 失败导致的回退等
         return -1;
     }
     return 0;
