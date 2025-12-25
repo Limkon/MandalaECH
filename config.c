@@ -55,7 +55,6 @@ static void ParseSSPlugin(cJSON* outbound, const char* pluginParam) {
     char* start = pluginCopy;
     char* end = NULL;
     
-    // 解析插件参数字符串 (例如: obfs-host=xxx;obfs=tls)
     while (start && *start) {
         end = strchr(start, ';');
         if (end) *end = '\0'; 
@@ -94,13 +93,11 @@ static void ParseSSPlugin(cJSON* outbound, const char* pluginParam) {
 // --- 配置文件加载与保存 ---
 
 void LoadSettings() {
-    // 1. 读取 INI 文件中的所有配置到局部变量
     UINT modifiers = GetPrivateProfileIntW(L"Settings", L"Modifiers", MOD_CONTROL | MOD_ALT, g_iniFilePath);
     UINT vk = GetPrivateProfileIntW(L"Settings", L"VK", 'H', g_iniFilePath);
     int port = GetPrivateProfileIntW(L"Settings", L"LocalPort", 10809, g_iniFilePath);
     int hideTray = GetPrivateProfileIntW(L"Settings", L"HideTray", 0, g_iniFilePath);
     
-    // 抗封锁设置
     int enableChrome = GetPrivateProfileIntW(L"Settings", L"ChromeCiphers", 1, g_iniFilePath);
     int enableALPN = GetPrivateProfileIntW(L"Settings", L"EnableALPN", 1, g_iniFilePath);
     int enableFrag = GetPrivateProfileIntW(L"Settings", L"EnableFragment", 0, g_iniFilePath);
@@ -112,28 +109,23 @@ void LoadSettings() {
     int padMax = GetPrivateProfileIntW(L"Settings", L"PadMax", 500, g_iniFilePath);
     int uaIdx = GetPrivateProfileIntW(L"Settings", L"UAPlatform", 0, g_iniFilePath);
 
-    // ECH 设置
     int enableECH = GetPrivateProfileIntW(L"Settings", L"EnableECH", 0, g_iniFilePath);
     wchar_t wEchServer[256] = {0};
     GetPrivateProfileStringW(L"Settings", L"ECHServer", L"https://cloudflare-dns.com/dns-query", wEchServer, 256, g_iniFilePath);
     wchar_t wEchPub[256] = {0};
     GetPrivateProfileStringW(L"Settings", L"ECHPublicName", L"", wEchPub, 256, g_iniFilePath);
 
-    // 订阅设置
     int upMode = GetPrivateProfileIntW(L"Subscriptions", L"UpdateMode", 0, g_iniFilePath);
     int upInterval = GetPrivateProfileIntW(L"Subscriptions", L"UpdateInterval", 24, g_iniFilePath);
-
     wchar_t wTimeBuf[64] = {0};
     GetPrivateProfileStringW(L"Subscriptions", L"LastUpdateTime", L"0", wTimeBuf, 64, g_iniFilePath);
     long long lastTime = _wtoi64(wTimeBuf);
 
     wchar_t wUABuf[512] = {0}; 
     GetPrivateProfileStringW(L"Settings", L"UserAgent", L"", wUABuf, 512, g_iniFilePath);
-    
     wchar_t wLastNode[64] = {0};
     GetPrivateProfileStringW(L"Settings", L"LastNode", L"", wLastNode, 64, g_iniFilePath);
 
-    // 2. 加锁并应用到全局变量
     EnterCriticalSection(&g_configLock);
 
     g_hotkeyModifiers = modifiers;
@@ -151,7 +143,6 @@ void LoadSettings() {
     g_padSizeMin = padMin; 
     g_padSizeMax = padMax;
 
-    // 参数边界检查
     if (g_fragSizeMin < 1) g_fragSizeMin = 1; 
     if (g_fragSizeMax < g_fragSizeMin) g_fragSizeMax = g_fragSizeMin;
     if (g_padSizeMin < 0) g_padSizeMin = 0; 
@@ -188,11 +179,9 @@ void LoadSettings() {
 }
 
 void SaveSettings() {
-    // 1. 读取全局变量到临时缓冲区 (减少锁持有时间)
     EnterCriticalSection(&g_configLock);
     
     wchar_t buffer[32];
-    
     swprintf(buffer, 32, L"%u", g_hotkeyModifiers); WritePrivateProfileStringW(L"Settings", L"Modifiers", buffer, g_iniFilePath);
     swprintf(buffer, 32, L"%u", g_hotkeyVk); WritePrivateProfileStringW(L"Settings", L"VK", buffer, g_iniFilePath);
     swprintf(buffer, 32, L"%d", g_localPort); WritePrivateProfileStringW(L"Settings", L"LocalPort", buffer, g_iniFilePath);
@@ -222,9 +211,7 @@ void SaveSettings() {
 
     WritePrivateProfileStringW(L"Settings", L"LastNode", currentNode, g_iniFilePath);
 
-    // 订阅部分 (先清除旧的，再写新的)
     WritePrivateProfileStringW(L"Subscriptions", NULL, NULL, g_iniFilePath);
-    
     swprintf(buffer, 32, L"%lld", g_lastUpdateTime); WritePrivateProfileStringW(L"Subscriptions", L"LastUpdateTime", buffer, g_iniFilePath);
     swprintf(buffer, 32, L"%d", g_subUpdateMode); WritePrivateProfileStringW(L"Subscriptions", L"UpdateMode", buffer, g_iniFilePath);
     swprintf(buffer, 32, L"%d", g_subUpdateInterval); WritePrivateProfileStringW(L"Subscriptions", L"UpdateInterval", buffer, g_iniFilePath);
@@ -284,16 +271,18 @@ void ParseTags() {
     }
 
     cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
-    cJSON* node;
-    cJSON_ArrayForEach(node, outbounds) {
-        cJSON* tag = cJSON_GetObjectItem(node, "tag");
-        if (tag && tag->valuestring) {
-            nodeCount++;
-            nodeTags = (wchar_t**)realloc(nodeTags, nodeCount * sizeof(wchar_t*));
-            int wlen = MultiByteToWideChar(CP_UTF8, 0, tag->valuestring, -1, NULL, 0);
-            nodeTags[nodeCount-1] = (wchar_t*)malloc((wlen+1)*sizeof(wchar_t));
-            MultiByteToWideChar(CP_UTF8, 0, tag->valuestring, -1, nodeTags[nodeCount-1], wlen+1);
-            nodeTags[nodeCount-1][wlen] = 0;
+    if (outbounds) {
+        cJSON* node;
+        cJSON_ArrayForEach(node, outbounds) {
+            cJSON* tag = cJSON_GetObjectItem(node, "tag");
+            if (tag && tag->valuestring) {
+                nodeCount++;
+                nodeTags = (wchar_t**)realloc(nodeTags, nodeCount * sizeof(wchar_t*));
+                int wlen = MultiByteToWideChar(CP_UTF8, 0, tag->valuestring, -1, NULL, 0);
+                nodeTags[nodeCount-1] = (wchar_t*)malloc((wlen+1)*sizeof(wchar_t));
+                MultiByteToWideChar(CP_UTF8, 0, tag->valuestring, -1, nodeTags[nodeCount-1], wlen+1);
+                nodeTags[nodeCount-1][wlen] = 0;
+            }
         }
     }
     cJSON_Delete(root);
@@ -304,7 +293,6 @@ char* GetUniqueTagName(cJSON* outbounds, const char* type, const char* base_name
     static char final_tag[512]; char candidate[450];
     const char* safe_name = (base_name && strlen(base_name) > 0) ? base_name : "Unnamed";
     
-    // 移除文件名不友好字符
     char clean_name[256];
     strncpy(clean_name, safe_name, 255); clean_name[255] = 0;
     for(int i=0; clean_name[i]; i++) {
@@ -319,10 +307,12 @@ char* GetUniqueTagName(cJSON* outbounds, const char* type, const char* base_name
         else snprintf(final_tag, sizeof(final_tag), "%s (%d)", candidate, index);
         
         BOOL exists = FALSE; 
-        cJSON* item = NULL;
-        cJSON_ArrayForEach(item, outbounds) {
-            cJSON* t = cJSON_GetObjectItem(item, "tag");
-            if (t && t->valuestring && strcmp(t->valuestring, final_tag) == 0) { exists = TRUE; break; }
+        if (outbounds) {
+            cJSON* item = NULL;
+            cJSON_ArrayForEach(item, outbounds) {
+                cJSON* t = cJSON_GetObjectItem(item, "tag");
+                if (t && t->valuestring && strcmp(t->valuestring, final_tag) == 0) { exists = TRUE; break; }
+            }
         }
         if (!exists) break;
         index++;
@@ -380,19 +370,15 @@ void ParseNodeConfigToGlobal(cJSON *node) {
     if (strlen(g_proxyConfig.sni) == 0) SafeStrCpy(g_proxyConfig.sni, sizeof(g_proxyConfig.sni), g_proxyConfig.host);
 
     cJSON *type = cJSON_GetObjectItem(node, "type");
-    if (type && type->valuestring) {
-        SafeStrCpy(g_proxyConfig.type, sizeof(g_proxyConfig.type), type->valuestring);
-    } else {
-        SafeStrCpy(g_proxyConfig.type, sizeof(g_proxyConfig.type), "socks");
-    }
+    if (type && type->valuestring) SafeStrCpy(g_proxyConfig.type, sizeof(g_proxyConfig.type), type->valuestring);
+    else SafeStrCpy(g_proxyConfig.type, sizeof(g_proxyConfig.type), "socks");
 
     LeaveCriticalSection(&g_configLock);
-
-    log_msg("Node Config Loaded: %s:%d (Type: %s, SNI: %s)", 
-        g_proxyConfig.host, g_proxyConfig.port, g_proxyConfig.type, g_proxyConfig.sni);
+    log_msg("Node Config Loaded: %s:%d (Type: %s, SNI: %s)", g_proxyConfig.host, g_proxyConfig.port, g_proxyConfig.type, g_proxyConfig.sni);
 }
 
 void SwitchNode(const wchar_t* tag) {
+    if (!tag) return;
     EnterCriticalSection(&g_configLock);
     wcsncpy(currentNode, tag, 63); currentNode[63] = 0;
     LeaveCriticalSection(&g_configLock);
@@ -405,10 +391,12 @@ void SwitchNode(const wchar_t* tag) {
     cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
     cJSON* targetNode = NULL;
     char tagUtf8[256]; WideCharToMultiByte(CP_UTF8, 0, tag, -1, tagUtf8, 256, NULL, NULL);
-    cJSON* node;
-    cJSON_ArrayForEach(node, outbounds) {
-        cJSON* t = cJSON_GetObjectItem(node, "tag");
-        if (t && strcmp(t->valuestring, tagUtf8) == 0) { targetNode = node; break; }
+    if (outbounds) {
+        cJSON* node;
+        cJSON_ArrayForEach(node, outbounds) {
+            cJSON* t = cJSON_GetObjectItem(node, "tag");
+            if (t && strcmp(t->valuestring, tagUtf8) == 0) { targetNode = node; break; }
+        }
     }
     
     if (targetNode) {
@@ -416,8 +404,7 @@ void SwitchNode(const wchar_t* tag) {
         StartProxyCore(); 
         SaveSettings();   
         
-        wchar_t tip[128]; 
-        swprintf(tip, 128, L"当前节点: %s", tag);
+        wchar_t tip[128]; swprintf(tip, 128, L"当前节点: %s", tag);
         wcsncpy(nid.szInfo, tip, 255); 
         wcsncpy(nid.szInfoTitle, L"连接切换", 63); 
         nid.uFlags |= NIF_INFO;
@@ -427,23 +414,24 @@ void SwitchNode(const wchar_t* tag) {
 }
 
 void DeleteNode(const wchar_t* tag) {
+    if (!tag) return;
     char* buffer = NULL; long size = 0;
     if (!ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) return;
     cJSON* root = cJSON_Parse(buffer); free(buffer);
     if (!root) return;
     
     cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
-    char tagUtf8[256]; WideCharToMultiByte(CP_UTF8, 0, tag, -1, tagUtf8, 256, NULL, NULL);
-    int idx = 0; cJSON* node;
-    cJSON_ArrayForEach(node, outbounds) {
-        cJSON* t = cJSON_GetObjectItem(node, "tag");
-        if (t && strcmp(t->valuestring, tagUtf8) == 0) { cJSON_DeleteItemFromArray(outbounds, idx); break; }
-        idx++;
+    if (outbounds) {
+        char tagUtf8[256]; WideCharToMultiByte(CP_UTF8, 0, tag, -1, tagUtf8, 256, NULL, NULL);
+        int idx = 0; cJSON* node;
+        cJSON_ArrayForEach(node, outbounds) {
+            cJSON* t = cJSON_GetObjectItem(node, "tag");
+            if (t && strcmp(t->valuestring, tagUtf8) == 0) { cJSON_DeleteItemFromArray(outbounds, idx); break; }
+            idx++;
+        }
+        char* out = cJSON_Print(root); 
+        if (out) { WriteBufferToFile(CONFIG_FILE, out); free(out); }
     }
-    
-    char* out = cJSON_Print(root); 
-    WriteBufferToFile(CONFIG_FILE, out); 
-    free(out); 
     cJSON_Delete(root);
     ParseTags(); 
 }
@@ -468,8 +456,8 @@ BOOL AddNodeToConfig(cJSON* newNode) {
     
     cJSON_AddItemToArray(outbounds, newNode);
     char* out = cJSON_Print(root); 
-    BOOL ret = WriteBufferToFile(CONFIG_FILE, out); 
-    free(out); 
+    BOOL ret = FALSE;
+    if (out) { ret = WriteBufferToFile(CONFIG_FILE, out); free(out); }
     cJSON_Delete(root);
     return ret;
 }
@@ -483,90 +471,78 @@ int Internal_BatchAddNodesFromText(const char* text, cJSON* outbounds) {
     unsigned char* decoded = NULL;
     size_t decLen = 0;
 
-    if (strstr(text, "://")) {
-        sourceText = _strdup(text);
-    } else {
+    if (strstr(text, "://")) { sourceText = _strdup(text); } 
+    else {
         decoded = Base64Decode(text, &decLen);
-        if (decoded && decLen > 0) {
-            sourceText = (char*)decoded;
-        } else {
-            sourceText = _strdup(text);
-            if (decoded) free(decoded);
-        }
+        if (decoded && decLen > 0) sourceText = (char*)decoded;
+        else { sourceText = _strdup(text); if (decoded) free(decoded); }
     }
     
     if (!sourceText) return 0;
     
     char* p = sourceText;
     while (*p) {
-        size_t span = strspn(p, "\r\n ,");
-        p += span;
+        p += strspn(p, "\r\n ,");
         if (!*p) break;
-        
         size_t len = strcspn(p, "\r\n ,");
         if (len > 0) {
             char* line = (char*)malloc(len + 1);
-            strncpy(line, p, len);
-            line[len] = '\0';
-            TrimString(line);
-            
-            if (strlen(line) > 0) {
-                cJSON* node = NULL;
-                if (_strnicmp(line, "vmess://", 8) == 0) node = ParseVmess(line);
-                else if (_strnicmp(line, "ss://", 5) == 0) node = ParseShadowsocks(line);
-                else if (_strnicmp(line, "vless://", 8) == 0) node = ParseVlessOrTrojan(line);
-                else if (_strnicmp(line, "trojan://", 9) == 0) node = ParseVlessOrTrojan(line);
-                else if (_strnicmp(line, "socks://", 8) == 0) node = ParseSocks(line);
-                else if (_strnicmp(line, "mandala://", 10) == 0) node = ParseMandala(line); 
-                
-                if (node) {
-                    cJSON* jsonType = cJSON_GetObjectItem(node, "type");
-                    const char* typeStr = (jsonType && jsonType->valuestring) ? jsonType->valuestring : "proxy";
-                    cJSON* jsonTag = cJSON_GetObjectItem(node, "tag");
-                    const char* originalTag = (jsonTag && jsonTag->valuestring) ? jsonTag->valuestring : "Auto";
+            if (line) {
+                strncpy(line, p, len); line[len] = '\0';
+                TrimString(line);
+                if (strlen(line) > 0) {
+                    cJSON* node = NULL;
+                    if (_strnicmp(line, "vmess://", 8) == 0) node = ParseVmess(line);
+                    else if (_strnicmp(line, "ss://", 5) == 0) node = ParseShadowsocks(line);
+                    else if (_strnicmp(line, "vless://", 8) == 0) node = ParseVlessOrTrojan(line);
+                    else if (_strnicmp(line, "trojan://", 9) == 0) node = ParseVlessOrTrojan(line);
+                    else if (_strnicmp(line, "socks://", 8) == 0) node = ParseSocks(line);
+                    else if (_strnicmp(line, "mandala://", 10) == 0) node = ParseMandala(line); 
                     
-                    char* uniqueTag = GetUniqueTagName(outbounds, typeStr, originalTag);
-                    
-                    if (cJSON_HasObjectItem(node, "tag")) cJSON_ReplaceItemInObject(node, "tag", cJSON_CreateString(uniqueTag));
-                    else cJSON_AddStringToObject(node, "tag", uniqueTag);
-                    
-                    cJSON_AddItemToArray(outbounds, node); 
-                    count++;
+                    if (node) {
+                        cJSON* jsonType = cJSON_GetObjectItem(node, "type");
+                        const char* typeStr = (jsonType && jsonType->valuestring) ? jsonType->valuestring : "proxy";
+                        cJSON* jsonTag = cJSON_GetObjectItem(node, "tag");
+                        const char* originalTag = (jsonTag && jsonTag->valuestring) ? jsonTag->valuestring : "Auto";
+                        char* uniqueTag = GetUniqueTagName(outbounds, typeStr, originalTag);
+                        if (cJSON_HasObjectItem(node, "tag")) cJSON_ReplaceItemInObject(node, "tag", cJSON_CreateString(uniqueTag));
+                        else cJSON_AddStringToObject(node, "tag", uniqueTag);
+                        cJSON_AddItemToArray(outbounds, node); 
+                        count++;
+                    }
                 }
+                free(line);
             }
-            free(line);
             p += len;
         }
     }
-    
-    free(sourceText); 
+    if (sourceText != (char*)decoded) free(sourceText); else free(decoded);
     return count;
 }
 
 int ImportFromClipboard() {
     char* text = GetClipboardText(); if (!text) return 0;
+    EnterCriticalSection(&g_configLock);
     char* buffer = NULL; long size = 0; cJSON* root = NULL;
     if (ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) { root = cJSON_Parse(buffer); free(buffer); }
-    if (!root) { root = cJSON_CreateObject(); cJSON_AddItemToObject(root, "outbounds", cJSON_CreateArray()); }
-    
+    if (!root) { root = cJSON_CreateObject(); }
     cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
     if (!outbounds) { outbounds = cJSON_CreateArray(); cJSON_AddItemToObject(root, "outbounds", outbounds); }
-    
     int successCount = Internal_BatchAddNodesFromText(text, outbounds);
-    
     if (successCount > 0) { 
         char* out = cJSON_Print(root); 
-        WriteBufferToFile(CONFIG_FILE, out); 
-        free(out); 
+        if (out) { WriteBufferToFile(CONFIG_FILE, out); free(out); }
     }
-    cJSON_Delete(root); free(text); 
+    cJSON_Delete(root); 
+    ParseTags();
+    LeaveCriticalSection(&g_configLock);
+    free(text); 
     return successCount;
 }
 
+// [修复] 解决订阅更新时的线程冲突与 Runtime 错误
 int UpdateAllSubscriptions(BOOL forceMsg) {
-    char subUrls[MAX_SUBS][512];
-    int count = 0;
-
+    char subUrls[MAX_SUBS][512]; int count = 0;
     EnterCriticalSection(&g_configLock);
     for (int i = 0; i < g_subCount; i++) {
         if (g_subs[i].enabled && strlen(g_subs[i].url) > 4) {
@@ -575,375 +551,194 @@ int UpdateAllSubscriptions(BOOL forceMsg) {
         }
     }
     LeaveCriticalSection(&g_configLock);
+    if (count == 0) return 0;
 
-    if (count == 0) { 
-        if (forceMsg) log_msg("[Sub] No active subscriptions found."); 
-        return 0; 
-    }
-
-    log_msg("[Sub] Starting update for %d subscriptions...", count);
-    
     char* rawData[MAX_SUBS] = {0}; 
-    int downloadSuccess = 0;
-    
     for (int i = 0; i < count; i++) {
         log_msg("[Sub] Downloading (%d/%d): %s", i+1, count, subUrls[i]);
-        char* data = Utils_HttpGet(subUrls[i]);
-        if (data) { 
-            rawData[i] = data; 
-            downloadSuccess++; 
-        } else {
-            log_msg("[Sub] Download failed: %s", subUrls[i]);
-        }
+        rawData[i] = Utils_HttpGet(subUrls[i]);
     }
 
-    if (downloadSuccess == 0) { 
-        log_msg("[Error] All downloads failed. Config not updated."); 
-        return 0; 
-    }
-    
+    // 必须在加锁状态下操作配置文件
+    EnterCriticalSection(&g_configLock);
     char* buffer = NULL; long size = 0; cJSON* root = NULL;
     if (ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) { root = cJSON_Parse(buffer); free(buffer); }
-    if (!root) { root = cJSON_CreateObject(); }
+    if (!root) root = cJSON_CreateObject();
     
-    if (cJSON_HasObjectItem(root, "outbounds")) cJSON_DeleteItemFromObject(root, "outbounds");
+    cJSON_DeleteItemFromObject(root, "outbounds");
     cJSON* outbounds = cJSON_CreateArray(); 
     cJSON_AddItemToObject(root, "outbounds", outbounds);
     
     int totalNewNodes = 0;
     for (int i = 0; i < count; i++) {
         if (rawData[i]) { 
-            int c = Internal_BatchAddNodesFromText(rawData[i], outbounds); 
-            totalNewNodes += c; 
-            free(rawData[i]); 
+            totalNewNodes += Internal_BatchAddNodesFromText(rawData[i], outbounds); 
+            free(rawData[i]); rawData[i] = NULL;
         }
     }
     
-    log_msg("[Sub] Total nodes parsed: %d. Saving config...", totalNewNodes);
     char* out = cJSON_Print(root); 
-    WriteBufferToFile(CONFIG_FILE, out); 
-    free(out); 
+    if (out) { WriteBufferToFile(CONFIG_FILE, out); free(out); }
     cJSON_Delete(root);
-    
-    EnterCriticalSection(&g_configLock);
     g_lastUpdateTime = (long long)time(NULL);
-    LeaveCriticalSection(&g_configLock);
-    
     SaveSettings(); 
     ParseTags(); 
+    LeaveCriticalSection(&g_configLock);
     
-    log_msg("[Sub] Update complete.");
+    log_msg("[Sub] Update complete. New nodes: %d", totalNewNodes);
     return totalNewNodes;
 }
 
-// --- 协议解析 ---
+// --- 协议解析 (保持原有逻辑并修复内存泄漏) ---
 
 cJSON* ParseVlessOrTrojan(const char* link) {
     char protocol[16] = {0};
     if (strncmp(link, "vless://", 8) == 0) strcpy(protocol, "vless");
     else if (strncmp(link, "trojan://", 9) == 0) strcpy(protocol, "trojan");
     else return NULL;
-
-    const char* p = link + strlen(protocol) + 3; 
-    const char* at = strchr(p, '@'); 
-    if (!at) return NULL;
-
-    int uuidLen = (int)(at - p); 
-    char* uuid = (char*)malloc(uuidLen + 1); 
-    strncpy(uuid, p, uuidLen); uuid[uuidLen] = 0;
-
-    p = at + 1; 
-    const char* colon = strchr(p, ':'); 
-    const char* qMark = strchr(p, '?'); 
-    const char* hash = strchr(p, '#');
-    
+    const char* p = link + strlen(protocol) + 3; const char* at = strchr(p, '@'); if (!at) return NULL;
+    int uuidLen = (int)(at - p); char* uuid = (char*)malloc(uuidLen + 1); strncpy(uuid, p, uuidLen); uuid[uuidLen] = 0;
+    p = at + 1; const char* colon = strchr(p, ':'); const char* qMark = strchr(p, '?'); const char* hash = strchr(p, '#');
     const char* hostEnd = colon;
     if (!hostEnd || (qMark && qMark < hostEnd)) hostEnd = qMark;
     if (!hostEnd || (hash && hash < hostEnd)) hostEnd = hash;
     if (!hostEnd) hostEnd = p + strlen(p);
-
-    const char* portStart = colon ? colon + 1 : NULL; 
-    int hostLen = (int)(hostEnd - p); 
-    char* host = (char*)malloc(hostLen + 1); 
+    const char* portStart = colon ? colon + 1 : NULL; int hostLen = (int)(hostEnd - p); char* host = (char*)malloc(hostLen + 1); 
     strncpy(host, p, hostLen); host[hostLen] = 0;
-    
     int portNum = portStart ? atoi(portStart) : 443;
-    
     char* tag = hash ? (char*)malloc(strlen(hash+1)+1) : _strdup(protocol);
     if(hash) UrlDecode(tag, hash+1);
-    
     cJSON* outbound = cJSON_CreateObject();
-    cJSON_AddStringToObject(outbound, "type", protocol); 
-    cJSON_AddStringToObject(outbound, "tag", tag);
-    cJSON_AddStringToObject(outbound, "server", host); 
-    cJSON_AddNumberToObject(outbound, "server_port", portNum);
-    
+    cJSON_AddStringToObject(outbound, "type", protocol); cJSON_AddStringToObject(outbound, "tag", tag);
+    cJSON_AddStringToObject(outbound, "server", host); cJSON_AddNumberToObject(outbound, "server_port", portNum);
     if (strcmp(protocol, "vless") == 0) cJSON_AddStringToObject(outbound, "uuid", uuid);
     else cJSON_AddStringToObject(outbound, "password", uuid);
-
     const char* query = qMark ? qMark + 1 : NULL;
     char* type = GetQueryParam(query, "type");
     if (type && strcmp(type, "ws") == 0) {
         cJSON* t = cJSON_CreateObject(); cJSON_AddStringToObject(t, "type", "ws");
-        char* path = GetQueryParam(query, "path");
-        if (path) { 
-             char* decodedPath = _strdup(path); 
-             if(decodedPath) { UrlDecode(decodedPath, path); cJSON_AddStringToObject(t, "path", decodedPath); free(decodedPath); }
-             free(path); 
-        }
-        char* hHeader = GetQueryParam(query, "host");
-        if (hHeader) {
-             cJSON* headers = cJSON_CreateObject(); cJSON_AddStringToObject(headers, "Host", hHeader);
-             cJSON_AddItemToObject(t, "headers", headers); free(hHeader);
-        }
+        char* pth = GetQueryParam(query, "path");
+        if (pth) { char* dPath = _strdup(pth); if(dPath) { UrlDecode(dPath, pth); cJSON_AddStringToObject(t, "path", dPath); free(dPath); } free(pth); }
+        char* hHdr = GetQueryParam(query, "host");
+        if (hHdr) { cJSON* hdrs = cJSON_CreateObject(); cJSON_AddStringToObject(hdrs, "Host", hHdr); cJSON_AddItemToObject(t, "headers", hdrs); free(hHdr); }
         cJSON_AddItemToObject(outbound, "transport", t);
     }
     if (type) free(type);
-    
-    char* security = GetQueryParam(query, "security");
-    if (security && strcmp(security, "tls") == 0) {
-        cJSON* tlsObj = cJSON_CreateObject(); cJSON_AddBoolToObject(tlsObj, "enabled", cJSON_True);
+    char* sec = GetQueryParam(query, "security");
+    if (sec && strcmp(sec, "tls") == 0) {
+        cJSON* tObj = cJSON_CreateObject(); cJSON_AddBoolToObject(tObj, "enabled", cJSON_True);
         char* sni = GetQueryParam(query, "sni");
-        if (sni) { cJSON_AddStringToObject(tlsObj, "server_name", sni); free(sni); }
-        else cJSON_AddStringToObject(tlsObj, "server_name", host);
-        cJSON_AddItemToObject(outbound, "tls", tlsObj);
+        if (sni) { cJSON_AddStringToObject(tObj, "server_name", sni); free(sni); }
+        else cJSON_AddStringToObject(tObj, "server_name", host);
+        cJSON_AddItemToObject(outbound, "tls", tObj);
     }
-    if (security) free(security);
-
-    free(uuid); free(host); free(tag); 
-    return outbound;
+    if (sec) free(sec);
+    free(uuid); free(host); free(tag); return outbound;
 }
 
 cJSON* ParseVmess(const char* link) {
     if (strncmp(link, "vmess://", 8) != 0) return NULL;
-    size_t len; 
-    unsigned char* decoded = Base64Decode(link + 8, &len); 
-    if (!decoded) return NULL;
-    
-    cJSON* vmessJson = cJSON_Parse((const char*)decoded); 
-    free(decoded); 
-    if (!vmessJson) return NULL;
-
+    size_t len; unsigned char* decoded = Base64Decode(link + 8, &len); if (!decoded) return NULL;
+    cJSON* vmessJson = cJSON_Parse((const char*)decoded); free(decoded); if (!vmessJson) return NULL;
     cJSON* outbound = cJSON_CreateObject();
     cJSON_AddStringToObject(outbound, "type", "vmess");
-    
-    cJSON* ps = cJSON_GetObjectItem(vmessJson, "ps");
-    cJSON_AddStringToObject(outbound, "tag", cJSON_IsString(ps) ? ps->valuestring : "VMess");
-    
-    cJSON* add = cJSON_GetObjectItem(vmessJson, "add");
-    cJSON_AddStringToObject(outbound, "server", cJSON_IsString(add) ? add->valuestring : "");
-    
-    cJSON* port = cJSON_GetObjectItem(vmessJson, "port");
-    cJSON_AddNumberToObject(outbound, "server_port", cJSON_IsNumber(port)?port->valueint:atoi(port->valuestring));
-    
-    cJSON* id = cJSON_GetObjectItem(vmessJson, "id");
-    cJSON_AddStringToObject(outbound, "uuid", cJSON_IsString(id) ? id->valuestring : "");
-    
+    cJSON* ps = cJSON_GetObjectItem(vmessJson, "ps"); cJSON_AddStringToObject(outbound, "tag", cJSON_IsString(ps) ? ps->valuestring : "VMess");
+    cJSON* add = cJSON_GetObjectItem(vmessJson, "add"); cJSON_AddStringToObject(outbound, "server", cJSON_IsString(add) ? add->valuestring : "");
+    cJSON* prt = cJSON_GetObjectItem(vmessJson, "port");
+    cJSON_AddNumberToObject(outbound, "server_port", cJSON_IsNumber(prt)?prt->valueint:(prt?atoi(prt->valuestring):0));
+    cJSON* id = cJSON_GetObjectItem(vmessJson, "id"); cJSON_AddStringToObject(outbound, "uuid", cJSON_IsString(id) ? id->valuestring : "");
     cJSON* net = cJSON_GetObjectItem(vmessJson, "net");
     if (cJSON_IsString(net) && strcmp(net->valuestring, "ws") == 0) {
         cJSON* t = cJSON_CreateObject(); cJSON_AddStringToObject(t, "type", "ws");
-        cJSON* path = cJSON_GetObjectItem(vmessJson, "path");
-        if(cJSON_IsString(path)) cJSON_AddStringToObject(t, "path", path->valuestring);
-        cJSON* host = cJSON_GetObjectItem(vmessJson, "host");
-        if(cJSON_IsString(host) && strlen(host->valuestring)>0) {
-            cJSON* h = cJSON_CreateObject(); cJSON_AddStringToObject(h, "Host", host->valuestring);
-            cJSON_AddItemToObject(t, "headers", h);
+        cJSON* pth = cJSON_GetObjectItem(vmessJson, "path"); if(cJSON_IsString(pth)) cJSON_AddStringToObject(t, "path", pth->valuestring);
+        cJSON* hst = cJSON_GetObjectItem(vmessJson, "host");
+        if(cJSON_IsString(hst) && strlen(hst->valuestring)>0) {
+            cJSON* h = cJSON_CreateObject(); cJSON_AddStringToObject(h, "Host", hst->valuestring); cJSON_AddItemToObject(t, "headers", h);
         }
         cJSON_AddItemToObject(outbound, "transport", t);
     } 
-    
     cJSON* tls = cJSON_GetObjectItem(vmessJson, "tls");
-    if ((cJSON_IsString(tls) && strcmp(tls->valuestring, "tls") == 0)) {
+    if (cJSON_IsString(tls) && strcmp(tls->valuestring, "tls") == 0) {
         cJSON* t = cJSON_CreateObject(); cJSON_AddBoolToObject(t, "enabled", cJSON_True);
-        cJSON* sni = cJSON_GetObjectItem(vmessJson, "sni");
-        if (cJSON_IsString(sni) && strlen(sni->valuestring)>0) cJSON_AddStringToObject(t, "server_name", sni->valuestring);
+        cJSON* sni = cJSON_GetObjectItem(vmessJson, "sni"); if (cJSON_IsString(sni) && strlen(sni->valuestring)>0) cJSON_AddStringToObject(t, "server_name", sni->valuestring);
         cJSON_AddItemToObject(outbound, "tls", t);
     }
-    
-    cJSON_Delete(vmessJson); 
-    return outbound;
+    cJSON_Delete(vmessJson); return outbound;
 }
 
 cJSON* ParseShadowsocks(const char* link) {
     if (strncmp(link, "ss://", 5) != 0) return NULL;
-    const char* p = link + 5; 
-    
-    const char* hash = strchr(p, '#'); 
-    char* tag = hash ? (char*)malloc(strlen(hash+1)+1) : _strdup("SS-Node");
-    if (hash) UrlDecode(tag, hash+1); 
-    
-    const char* qMark = strchr(p, '?');
-    const char* endOfMain = qMark ? qMark : (hash ? hash : p + strlen(p));
-    
-    size_t mainLen = (size_t)(endOfMain - p);
-    if (mainLen <= 0) { free(tag); return NULL; }
-    
-    char* mainPart = (char*)malloc(mainLen + 1); 
-    strncpy(mainPart, p, mainLen); mainPart[mainLen] = 0;
-    
-    char serverPort[256] = {0};
-    char methodPass[256] = {0}; 
-    char* at = strchr(mainPart, '@');
-
+    const char* p = link + 5; const char* hash = strchr(p, '#'); 
+    char* tag = hash ? (char*)malloc(strlen(hash+1)+1) : _strdup("SS-Node"); if (hash) UrlDecode(tag, hash+1); 
+    const char* qMark = strchr(p, '?'); const char* endOfMain = qMark ? qMark : (hash ? hash : p + strlen(p));
+    size_t mainLen = (size_t)(endOfMain - p); if (mainLen <= 0) { free(tag); return NULL; }
+    char* mainPart = (char*)malloc(mainLen + 1); strncpy(mainPart, p, mainLen); mainPart[mainLen] = 0;
+    char serverPort[256] = {0}, methodPass[256] = {0}; char* at = strchr(mainPart, '@');
     if (!at) {
-        size_t decLen; 
-        unsigned char* decoded = Base64Decode(mainPart, &decLen);
+        size_t decLen; unsigned char* decoded = Base64Decode(mainPart, &decLen);
         if(!decoded) { free(mainPart); free(tag); return NULL; }
-        
-        char* dStr = (char*)decoded; 
-        at = strchr(dStr, '@');
-        if (at) { 
-            SafeStrCpy(serverPort, sizeof(serverPort), at+1); 
-            size_t mpLen = at - dStr;
-            if (mpLen >= sizeof(methodPass)) mpLen = sizeof(methodPass) - 1;
-            strncpy(methodPass, dStr, mpLen); methodPass[mpLen]=0; 
-        }
+        at = strchr((char*)decoded, '@');
+        if (at) { SafeStrCpy(serverPort, sizeof(serverPort), at+1); size_t mpLen = at - (char*)decoded; if (mpLen >= sizeof(methodPass)) mpLen = sizeof(methodPass) - 1; strncpy(methodPass, (char*)decoded, mpLen); methodPass[mpLen]=0; }
         free(decoded);
     } else {
-        SafeStrCpy(serverPort, sizeof(serverPort), at+1); 
-        
-        char b64User[256]; 
-        size_t uLen = at - mainPart;
-        if (uLen >= sizeof(b64User)) uLen = sizeof(b64User) - 1;
-        strncpy(b64User, mainPart, uLen); b64User[uLen] = 0;
-        
-        size_t decLen; 
-        unsigned char* decoded = Base64Decode(b64User, &decLen);
-        if(decoded) { 
-            SafeStrCpy(methodPass, sizeof(methodPass), (char*)decoded); 
-            free(decoded); 
-        } else {
-            SafeStrCpy(methodPass, sizeof(methodPass), b64User);
-        }
+        SafeStrCpy(serverPort, sizeof(serverPort), at+1); char b64User[256]; size_t uLen = at - mainPart;
+        if (uLen >= sizeof(b64User)) uLen = sizeof(b64User) - 1; strncpy(b64User, mainPart, uLen); b64User[uLen] = 0;
+        size_t decLen; unsigned char* decoded = Base64Decode(b64User, &decLen);
+        if(decoded) { SafeStrCpy(methodPass, sizeof(methodPass), (char*)decoded); free(decoded); }
+        else SafeStrCpy(methodPass, sizeof(methodPass), b64User);
     }
     free(mainPart);
-
-    char* colon = strrchr(serverPort, ':'); 
-    if (!colon) { free(tag); return NULL; }
-    int port = atoi(colon + 1); 
-    *colon = 0; 
-
-    char* pass = strchr(methodPass, ':'); 
-    if (!pass) { free(tag); return NULL; } 
-    *pass = 0; pass++; 
-
+    char* colon = strrchr(serverPort, ':'); if (!colon) { free(tag); return NULL; }
+    int prt = atoi(colon + 1); *colon = 0; 
+    char* pass = strchr(methodPass, ':'); if (!pass) { free(tag); return NULL; } *pass = 0; pass++; 
     cJSON* outbound = cJSON_CreateObject();
-    cJSON_AddStringToObject(outbound, "type", "shadowsocks"); 
-    cJSON_AddStringToObject(outbound, "tag", tag);
-    cJSON_AddStringToObject(outbound, "server", serverPort); 
-    cJSON_AddNumberToObject(outbound, "server_port", port);
-    cJSON_AddStringToObject(outbound, "method", methodPass); 
-    cJSON_AddStringToObject(outbound, "password", pass);
-
+    cJSON_AddStringToObject(outbound, "type", "shadowsocks"); cJSON_AddStringToObject(outbound, "tag", tag);
+    cJSON_AddStringToObject(outbound, "server", serverPort); cJSON_AddNumberToObject(outbound, "server_port", prt);
+    cJSON_AddStringToObject(outbound, "method", methodPass); cJSON_AddStringToObject(outbound, "password", pass);
     if (qMark) {
-        const char* qStart = qMark + 1; 
-        size_t qLen = hash ? (size_t)(hash - qStart) : strlen(qStart);
-        char* queryStr = (char*)malloc(qLen + 1); 
-        strncpy(queryStr, qStart, qLen); queryStr[qLen] = 0;
-        
-        char* pluginVal = GetQueryParam(queryStr, "plugin");
-        if (pluginVal) { 
-            UrlDecode(pluginVal, pluginVal); 
-            ParseSSPlugin(outbound, pluginVal); 
-            free(pluginVal); 
-        }
-        free(queryStr);
+        const char* qStart = qMark + 1; size_t qLen = hash ? (size_t)(hash - qStart) : strlen(qStart);
+        char* qStr = (char*)malloc(qLen + 1); strncpy(qStr, qStart, qLen); qStr[qLen] = 0;
+        char* pVal = GetQueryParam(qStr, "plugin"); if (pVal) { UrlDecode(pVal, pVal); ParseSSPlugin(outbound, pVal); free(pVal); }
+        free(qStr);
     }
-    
-    free(tag); 
-    return outbound;
+    free(tag); return outbound;
 }
 
 cJSON* ParseSocks(const char* link) {
     if (strncmp(link, "socks://", 8) != 0) return NULL;
-    const char* p = link + 8; 
-    
-    const char* at = strchr(p, '@'); 
-    if (!at) return NULL; 
-    
-    int authLen = (int)(at - p); 
-    char* authBase64 = (char*)malloc(authLen + 1); 
-    strncpy(authBase64, p, authLen); authBase64[authLen] = 0;
-    
-    size_t decLen; 
-    unsigned char* decoded = Base64Decode(authBase64, &decLen); 
-    free(authBase64); 
-    if (!decoded) return NULL;
-    
-    char* user = (char*)decoded; 
-    char* pass = strchr(user, ':'); 
-    if (pass) { *pass = 0; pass++; } else pass = "";
-    
-    p = at + 1; 
-    const char* colon = strchr(p, ':'); 
-    const char* qMark = strchr(p, '?'); 
-    const char* hash = strchr(p, '#');
-    
+    const char* p = link + 8; const char* at = strchr(p, '@'); if (!at) return NULL; 
+    int authLen = (int)(at - p); char* authB64 = (char*)malloc(authLen + 1); strncpy(authB64, p, authLen); authB64[authLen] = 0;
+    size_t decLen; unsigned char* decoded = Base64Decode(authB64, &decLen); free(authB64); if (!decoded) return NULL;
+    char* user = (char*)decoded; char* pass = strchr(user, ':'); if (pass) { *pass = 0; pass++; } else pass = "";
+    p = at + 1; const char* colon = strchr(p, ':'); const char* qMark = strchr(p, '?'); const char* hash = strchr(p, '#');
     const char* hostEnd = colon;
     if (!hostEnd || (qMark && qMark < hostEnd)) hostEnd = qMark;
     if (!hostEnd || (hash && hash < hostEnd)) hostEnd = hash;
     if (!hostEnd) hostEnd = p + strlen(p);
-
-    int portNum = 443;
-    if (colon && colon < hostEnd) portNum = atoi(colon + 1);
-
-    int hostLen = (int)(hostEnd - p); 
-    char* host = (char*)malloc(hostLen + 1); 
-    strncpy(host, p, hostLen); host[hostLen] = 0;
-    
-    char* tag = hash ? (char*)malloc(strlen(hash+1)+1) : _strdup("Socks-Import"); 
-    if(hash) UrlDecode(tag, hash+1);
-
-    const char* query = qMark ? qMark + 1 : NULL;
-    char* sni = GetQueryParam(query, "sni"); if (!sni) sni = GetQueryParam(query, "peer");
-    
-    char* path = GetQueryParam(query, "path");
-    if (path) {
-        char* decodedPath = _strdup(path);
-        if (decodedPath) {
-             UrlDecode(decodedPath, path);
-             free(path); path = decodedPath;
-        }
-    }
-    
-    char* type = GetQueryParam(query, "type"); if (!type) type = GetQueryParam(query, "transport");
-    char* security = GetQueryParam(query, "security"); 
-    char* hostHeader = GetQueryParam(query, "host");
-
+    int prtNum = (colon && colon < hostEnd) ? atoi(colon + 1) : 443;
+    int hostLen = (int)(hostEnd - p); char* host = (char*)malloc(hostLen + 1); strncpy(host, p, hostLen); host[hostLen] = 0;
+    char* tag = hash ? (char*)malloc(strlen(hash+1)+1) : _strdup("Socks-Import"); if(hash) UrlDecode(tag, hash+1);
+    const char* qry = qMark ? qMark + 1 : NULL; char* sni = GetQueryParam(qry, "sni"); if (!sni) sni = GetQueryParam(qry, "peer");
+    char* pth = GetQueryParam(qry, "path");
+    if (pth) { char* dPth = _strdup(pth); if (dPth) { UrlDecode(dPth, pth); free(pth); pth = dPth; } }
+    char* typ = GetQueryParam(qry, "type"); if (!typ) typ = GetQueryParam(qry, "transport");
+    char* sec = GetQueryParam(qry, "security"); char* hHdr = GetQueryParam(qry, "host");
     cJSON* outbound = cJSON_CreateObject();
-    cJSON_AddStringToObject(outbound, "type", "socks_tls"); 
-    cJSON_AddStringToObject(outbound, "tag", tag);
-    cJSON_AddStringToObject(outbound, "server", host); 
-    cJSON_AddNumberToObject(outbound, "server_port", portNum);
-    cJSON_AddStringToObject(outbound, "username", user); 
-    cJSON_AddStringToObject(outbound, "password", pass);
-
-    BOOL enableTls = (security && strcmp(security, "tls") == 0) || sni != NULL;
-    if (enableTls) {
-        cJSON* tls = cJSON_CreateObject(); 
-        cJSON_AddBoolToObject(tls, "enabled", cJSON_True);
-        if (sni) cJSON_AddStringToObject(tls, "server_name", sni); 
-        else cJSON_AddStringToObject(tls, "server_name", host);
-        cJSON_AddItemToObject(outbound, "tls", tls);
+    cJSON_AddStringToObject(outbound, "type", "socks_tls"); cJSON_AddStringToObject(outbound, "tag", tag);
+    cJSON_AddStringToObject(outbound, "server", host); cJSON_AddNumberToObject(outbound, "server_port", prtNum);
+    cJSON_AddStringToObject(outbound, "username", user); cJSON_AddStringToObject(outbound, "password", pass);
+    if ((sec && strcmp(sec, "tls") == 0) || sni != NULL) {
+        cJSON* tls = cJSON_CreateObject(); cJSON_AddBoolToObject(tls, "enabled", cJSON_True);
+        cJSON_AddStringToObject(tls, "server_name", sni ? sni : host); cJSON_AddItemToObject(outbound, "tls", tls);
     }
-    
-    if (type && strcmp(type, "ws") == 0) {
-        cJSON* trans = cJSON_CreateObject(); 
-        cJSON_AddStringToObject(trans, "type", "ws");
-        if (path) cJSON_AddStringToObject(trans, "path", path);
-        cJSON* headers = cJSON_CreateObject(); 
-        if (hostHeader) cJSON_AddStringToObject(headers, "Host", hostHeader); 
-        else cJSON_AddStringToObject(headers, "Host", host);
-        cJSON_AddItemToObject(trans, "headers", headers); 
-        cJSON_AddItemToObject(outbound, "transport", trans);
+    if (typ && strcmp(typ, "ws") == 0) {
+        cJSON* trans = cJSON_CreateObject(); cJSON_AddStringToObject(trans, "type", "ws");
+        if (pth) cJSON_AddStringToObject(trans, "path", pth);
+        cJSON* hdrs = cJSON_CreateObject(); cJSON_AddStringToObject(hdrs, "Host", hHdr ? hHdr : host);
+        cJSON_AddItemToObject(trans, "headers", hdrs); cJSON_AddItemToObject(outbound, "transport", trans);
     }
-    
-    if (sni) free(sni); if (path) free(path); if (type) free(type); 
-    if (security) free(security); if (hostHeader) free(hostHeader);
-    free(host); free(tag); free(decoded); 
-    return outbound;
+    if (sni) free(sni); if (pth) free(pth); if (typ) free(typ); if (sec) free(sec); if (hHdr) free(hHdr);
+    free(host); free(tag); free(decoded); return outbound;
 }
 
-cJSON* ParseMandala(const char* link) {
-     return ParseVlessOrTrojan(link); 
-}
+cJSON* ParseMandala(const char* link) { return ParseVlessOrTrojan(link); }
