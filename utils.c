@@ -8,7 +8,6 @@
 #include <windows.h>
 #include <wininet.h>
 #include <ctype.h> 
-#include <excpt.h> // 用于 SEH 异常捕获
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
@@ -168,19 +167,14 @@ unsigned char* Base64Decode(const char* input, size_t* out_len) {
         if (input[i] == '\r' || input[i] == '\n') { i++; continue; } 
         if (input[i] == '=') break; 
         
-        // [Crash Fix] 关键修复：防止中文字符导致的数组越界
+        // [Crash Fix] 关键修复：防止中文字符或非法字符导致的数组越界
         unsigned char a = (unsigned char)input[i];
-        if (a >= 128) { i++; continue; } // 跳过非法字符
+        if (a >= 128 || b64_table[a] == -1) { i++; continue; } // 跳过非法字符
 
         if (i+1 >= len) break;
         unsigned char b = (unsigned char)input[i+1];
-        if (b >= 128) { i+=2; continue; }
+        if (b >= 128 || b64_table[b] == -1) { i++; continue; }
 
-        if (b64_table[a] == -1 || b64_table[b] == -1) {
-             // 遇到非法字符中断或跳过
-             break;
-        }
-        
         uint32_t n = (b64_table[a] << 18) | (b64_table[b] << 12);
         out[j++] = (n >> 16) & 0xFF;
         
@@ -336,12 +330,12 @@ static BOOL ParseUrl(const char* url, URL_COMPONENTS_SIMPLE* out) {
     return TRUE;
 }
 
-// [Safety] 内部实际执行 HTTP 请求的函数，包裹在 SEH 中调用
-static char* SafeInternalHttpsGet(const char* url) {
+// [Fix] 移除 SEH 异常处理，改为标准的资源清理逻辑
+static char* InternalHttpsGet(const char* url) {
     URL_COMPONENTS_SIMPLE u;
     if (!ParseUrl(url, &u)) return NULL;
 
-    // 创建局部 SSL_CTX，避免多线程干扰
+    // [Thread Safety] 局部 SSL Context，避免静态变量多线程冲突
     SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
     if (!ctx) return NULL;
     SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
@@ -369,7 +363,8 @@ static char* SafeInternalHttpsGet(const char* url) {
         return NULL; 
     }
     
-    DWORD timeout = 8000; // 稍微增加超时
+    // 设置超时防止卡死
+    DWORD timeout = 8000; 
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
     setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
 
@@ -430,21 +425,6 @@ cleanup:
     if (s != INVALID_SOCKET) closesocket(s);
     if (ctx) SSL_CTX_free(ctx); 
     return result;
-}
-
-// [Safety] 封装的入口，处理 Runtime 异常
-static char* InternalHttpsGet(const char* url) {
-    char* res = NULL;
-    // 使用 Windows SEH (Structured Exception Handling) 捕获底层崩溃
-    // 这能有效防止程序退出时因 OpenSSL 资源释放顺序导致的 Runtime Error
-    __try {
-        res = SafeInternalHttpsGet(url);
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        log_msg("[Fatal] Exception caught during HTTPS request to %s", url);
-        res = NULL;
-    }
-    return res;
 }
 
 char* Utils_HttpGet(const char* url) {
