@@ -75,19 +75,23 @@ DWORD WINAPI AutoUpdateThread(LPVOID lpParam) {
     return 0;
 }
 
-// [修复] 手动更新线程：增加安全性校验，防止 Runtime 错误
+// [修复] 手动更新线程：增加安全性校验，防止窗口销毁后 PostMessage 导致的 Runtime 错误
 DWORD WINAPI ManualUpdateThread(LPVOID param) {
     HWND hWnd = (HWND)param;
     if (!IsWindow(hWnd)) return 0;
 
     log_msg("[Thread] 手动更新订阅开始...");
     
-    // 执行更新逻辑 (UpdateAllSubscriptions 内部需有文件锁保护)
+    // 执行更新逻辑 (UpdateAllSubscriptions 内部已由文件锁保护)
     int count = UpdateAllSubscriptions(TRUE);
     
     // 确保窗口依然存在再发送完成消息
     if (IsWindow(hWnd)) {
         PostMessage(hWnd, WM_UPDATE_FINISH, (WPARAM)count, 0);
+    } else {
+        // 如果订阅窗口已关闭，尝试通知节点管理器刷新
+        HWND hMgr = FindWindowW(L"NodeMgr", NULL);
+        if (hMgr) PostMessage(hMgr, WM_REFRESH_NODELIST, 0, 0);
     }
     return 0;
 }
@@ -878,7 +882,7 @@ void OpenLogViewer(BOOL bShow) {
     if (bShow) ShowWindow(hLogViewerWnd, SW_SHOW); else ShowWindow(hLogViewerWnd, SW_HIDE);
 }
 
-// [修复] 补全 ToggleTrayIcon 函数实现，解决链接错误
+// [补全] ToggleTrayIcon 函数实现
 void ToggleTrayIcon() {
     if (g_isIconVisible) {
         Shell_NotifyIconW(NIM_DELETE, &nid);
@@ -925,14 +929,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
     else if (msg == WM_COMMAND) {
         int id = LOWORD(wParam);
-        // [修复] 优化退出流程，防止程序停止响应
+        // [修复] 优化退出流程
         if (id == ID_TRAY_EXIT) { 
             log_msg("[System] 正在安全退出程序...");
             Shell_NotifyIconW(NIM_DELETE, &nid); 
             if (IsSystemProxyEnabled()) SetSystemProxy(FALSE); 
             StopProxyCore(); 
             Sleep(200);
-            ExitProcess(0); 
+            PostQuitMessage(0); 
         }
         else if (id == ID_TRAY_SYSTEM_PROXY) SetSystemProxy(!IsSystemProxyEnabled());
         else if (id == ID_TRAY_SHOW_CONSOLE) OpenLogViewer(TRUE);
@@ -944,7 +948,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             int count = ImportFromClipboard(); 
             if (count > 0) {
                 ParseTags();
-                HWND hMgr = FindWindowW(L"NodeMgr", L"节点管理 (支持 Ctrl+A 全选/多选)");
+                HWND hMgr = FindWindowW(L"NodeMgr", NULL);
                 if (hMgr && IsWindow(hMgr)) SendMessage(hMgr, WM_REFRESH_NODELIST, 0, 0);
                 wchar_t msgBuf[128]; 
                 swprintf_s(msgBuf, 128, L"成功导入 %d 个节点！", count);
@@ -977,6 +981,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
     }
     else if (msg == WM_HOTKEY && wParam == ID_GLOBAL_HOTKEY) ToggleTrayIcon();
+    else if (msg == WM_DESTROY) PostQuitMessage(0);
     return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
 
