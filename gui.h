@@ -31,3 +31,4 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 extern HWND hSubList;
 
 #endif // GUI_H
+
