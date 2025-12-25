@@ -9,7 +9,6 @@
 #include <wininet.h>
 #include <ctype.h> 
 
-// 引入 OpenSSL/BoringSSL 头文件
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 
@@ -22,29 +21,19 @@
 #pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "wininet.lib")
 
-// 全局 SSL_CTX 复用，避免每次请求都初始化，降低 CPU 占用
+// 工具类专用 SSL_CTX，单例模式
 static SSL_CTX* g_utils_ctx = NULL;
 
-// --------------------------------------------------------------------------
-// 基础工具函数：系统版本判断
-// --------------------------------------------------------------------------
 BOOL IsWindows8OrGreater() {
     HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
-    if (hKernel32 == NULL) {
-        return FALSE;
-    }
+    if (hKernel32 == NULL) return FALSE;
     FARPROC pFunc = GetProcAddress(hKernel32, "SetProcessMitigationPolicy");
     return (pFunc != NULL);
 }
 
-// --------------------------------------------------------------------------
-// 日志系统实现
-// --------------------------------------------------------------------------
+// [Robustness] 改进日志函数，防止过长消息溢出
 void log_msg(const char *format, ...) {
-    // 如果未开启日志且不是致命错误，则直接返回
-    if (!g_enableLog && strstr(format, "[Fatal]") == NULL) {
-        return;
-    }
+    if (!g_enableLog && strstr(format, "[Fatal]") == NULL) return;
 
     char buf[2048]; 
     char time_buf[64]; 
@@ -55,32 +44,32 @@ void log_msg(const char *format, ...) {
     
     va_list args; 
     va_start(args, format); 
-    vsnprintf(buf, sizeof(buf) - 64, format, args); 
+    // 使用 vsnprintf 保证不越界
+    vsnprintf(buf, sizeof(buf) - 2, format, args); 
     va_end(args);
+    buf[sizeof(buf) - 1] = 0; // 确保截断
     
+    // 拼接时间戳
     char final_msg[2200]; 
     snprintf(final_msg, sizeof(final_msg), "%s%s\r\n", time_buf, buf);
     
-    // 输出到调试器
     OutputDebugStringA(final_msg);
     
-    // 发送消息给 GUI 日志窗口
     extern HWND hLogViewerWnd; 
     if (hLogViewerWnd && IsWindow(hLogViewerWnd)) {
         int wLen = MultiByteToWideChar(CP_UTF8, 0, final_msg, -1, NULL, 0);
-        wchar_t* wBuf = (wchar_t*)malloc((wLen + 1) * sizeof(wchar_t));
-        
-        if (wBuf) {
-            MultiByteToWideChar(CP_UTF8, 0, final_msg, -1, wBuf, wLen);
-            wBuf[wLen] = 0;
-            PostMessageW(hLogViewerWnd, WM_LOG_UPDATE, 0, (LPARAM)wBuf);
+        if (wLen > 0) {
+            wchar_t* wBuf = (wchar_t*)malloc((wLen + 1) * sizeof(wchar_t));
+            if (wBuf) {
+                MultiByteToWideChar(CP_UTF8, 0, final_msg, -1, wBuf, wLen);
+                wBuf[wLen] = 0;
+                PostMessageW(hLogViewerWnd, WM_LOG_UPDATE, 0, (LPARAM)wBuf);
+            }
         }
     }
 }
 
-// --------------------------------------------------------------------------
-// 文件 IO 操作
-// --------------------------------------------------------------------------
+// --- 文件 IO ---
 BOOL ReadFileToBuffer(const wchar_t* filename, char** buffer, long* size) {
     FILE* f = _wfopen(filename, L"rb");
     if (!f) return FALSE;
@@ -89,16 +78,15 @@ BOOL ReadFileToBuffer(const wchar_t* filename, char** buffer, long* size) {
     long fsize = ftell(f);
     fseek(f, 0, SEEK_SET);
     
+    if (fsize < 0) { fclose(f); return FALSE; }
+
     *buffer = (char*)malloc(fsize + 1);
-    if (!*buffer) { 
-        fclose(f); 
-        return FALSE; 
-    }
+    if (!*buffer) { fclose(f); return FALSE; }
     
-    fread(*buffer, 1, fsize, f);
-    (*buffer)[fsize] = 0; 
+    size_t read_bytes = fread(*buffer, 1, fsize, f);
+    (*buffer)[read_bytes] = 0; 
     
-    if (size) *size = fsize;
+    if (size) *size = (long)read_bytes;
     
     fclose(f);
     return TRUE;
@@ -115,96 +103,51 @@ BOOL WriteBufferToFile(const wchar_t* filename, const char* buffer) {
     return TRUE;
 }
 
-// --------------------------------------------------------------------------
-// 字符串处理工具
-// --------------------------------------------------------------------------
+// --- 字符串处理 ---
 void TrimString(char* str) {
     if (!str) return;
-    
     char* p = str;
-    // 去除头部
-    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
-        p++;
-    }
-    
-    if (p > str) {
-        memmove(str, p, strlen(p) + 1);
-    }
-    
-    // 去除尾部
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    if (p > str) memmove(str, p, strlen(p) + 1);
     char* pEnd = str + strlen(str) - 1;
-    while (pEnd >= str && (*pEnd == ' ' || *pEnd == '\t' || *pEnd == '\r' || *pEnd == '\n')) {
-        *pEnd-- = 0;
-    }
+    while (pEnd >= str && (*pEnd == ' ' || *pEnd == '\t' || *pEnd == '\r' || *pEnd == '\n')) *pEnd-- = 0;
 }
 
 void UrlDecode(char* dst, const char* src) {
     char a, b;
     while (*src) {
-        if ((*src == '%') &&
-            ((a = src[1]) && (b = src[2])) &&
-            (isxdigit(a) && isxdigit(b))) {
-            
-            if (a >= 'a') a -= 'a' - 10;
-            else if (a >= 'A') a -= 'A' - 10;
-            else a -= '0';
-            
-            if (b >= 'a') b -= 'a' - 10;
-            else if (b >= 'A') b -= 'A' - 10;
-            else b -= '0';
-            
-            *dst++ = 16 * a + b;
-            src += 3;
-        } else if (*src == '+') {
-            *dst++ = ' ';
-            src++;
-        } else {
-            *dst++ = *src++;
-        }
+        if ((*src == '%') && ((a = src[1]) && (b = src[2])) && (isxdigit(a) && isxdigit(b))) {
+            if (a >= 'a') a -= 'a' - 10; else if (a >= 'A') a -= 'A' - 10; else a -= '0';
+            if (b >= 'a') b -= 'a' - 10; else if (b >= 'A') b -= 'A' - 10; else b -= '0';
+            *dst++ = 16 * a + b; src += 3;
+        } else if (*src == '+') { *dst++ = ' '; src++; } 
+        else { *dst++ = *src++; }
     }
     *dst++ = '\0';
 }
 
 char* GetQueryParam(const char* query, const char* key) {
     if (!query || !key) return NULL;
-    
-    char search[128];
-    snprintf(search, sizeof(search), "%s=", key);
-    
+    char search[128]; snprintf(search, sizeof(search), "%s=", key);
     const char* p = strstr(query, search);
     if (!p) return NULL;
-    
-    // 确保匹配完整单词
-    if (p != query && *(p-1) != '&' && *(p-1) != '?') {
-        return NULL; 
-    }
-    
+    if (p != query && *(p-1) != '&' && *(p-1) != '?') return NULL; 
     p += strlen(search);
-    
     const char* end_amp = strchr(p, '&');
     const char* end_hash = strchr(p, '#');
     const char* end = NULL;
-
     if (end_amp && end_hash) end = (end_amp < end_hash) ? end_amp : end_hash;
     else if (end_amp) end = end_amp;
     else if (end_hash) end = end_hash;
-    
     int len = end ? (int)(end - p) : (int)strlen(p);
-    
     if (len <= 0) return NULL;
-
     char* val = (char*)malloc(len + 1);
     if (!val) return NULL;
-    
-    strncpy(val, p, len);
-    val[len] = 0;
-    
+    strncpy(val, p, len); val[len] = 0;
     return val;
 }
 
-// --------------------------------------------------------------------------
-// Base64 解码实现 (用于 ECH 解析)
-// --------------------------------------------------------------------------
+// --- Base64 ---
 static const int b64_table[] = {
     -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
     -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
@@ -217,10 +160,10 @@ static const int b64_table[] = {
 };
 
 unsigned char* Base64Decode(const char* input, size_t* out_len) {
+    if (!input) return NULL;
     size_t len = strlen(input);
     size_t out_size = len / 4 * 3;
     unsigned char* out = (unsigned char*)malloc(out_size + 1);
-    
     if (!out) return NULL;
     
     size_t i = 0, j = 0;
@@ -230,37 +173,33 @@ unsigned char* Base64Decode(const char* input, size_t* out_len) {
         
         unsigned char a = (unsigned char)input[i];
         unsigned char b = (unsigned char)input[i+1];
-        unsigned char c = (unsigned char)input[i+2];
-        unsigned char d = (unsigned char)input[i+3];
-        
-        if (i + 1 >= len) break;
-        if (a > 127 || b64_table[a] == -1) break;
-        if (b > 127 || b64_table[b] == -1) break;
+        if (i+1 >= len || b64_table[a] == -1 || b64_table[b] == -1) break;
         
         uint32_t n = (b64_table[a] << 18) | (b64_table[b] << 12);
         out[j++] = (n >> 16) & 0xFF;
         
-        if (i + 2 < len && c != '=' && c < 128 && b64_table[c] != -1) {
-            n |= (b64_table[c] << 6);
-            out[j++] = (n >> 8) & 0xFF;
-            
-            if (i + 3 < len && d != '=' && d < 128 && b64_table[d] != -1) {
-                n |= b64_table[d];
-                out[j++] = n & 0xFF;
+        if (i + 2 < len) {
+            unsigned char c = (unsigned char)input[i+2];
+            if (c != '=' && b64_table[c] != -1) {
+                n |= (b64_table[c] << 6);
+                out[j++] = (n >> 8) & 0xFF;
+                if (i + 3 < len) {
+                    unsigned char d = (unsigned char)input[i+3];
+                    if (d != '=' && b64_table[d] != -1) {
+                        n |= b64_table[d];
+                        out[j++] = n & 0xFF;
+                    }
+                }
             }
         }
         i += 4;
     }
-    
     out[j] = 0;
     if (out_len) *out_len = j;
     return out;
 }
 
-// --------------------------------------------------------------------------
-// ECH (Encrypted Client Hello) 解析实现 (最新修复版：支持 Hex 和 ech="...")
-// --------------------------------------------------------------------------
-
+// --- ECH Helper ---
 static int HexToBin(const char* hex, unsigned char* out, int max_len) {
     int len = 0;
     while (*hex && len < max_len) {
@@ -280,26 +219,22 @@ static int HexToBin(const char* hex, unsigned char* out, int max_len) {
     return len;
 }
 
+// [Security] FetchECHConfig 实现
 unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t* out_len) {
     if (!domain || !doh_server) return NULL;
-
     char url[1024];
-    // 使用 type=65 查询 HTTPS 记录
     snprintf(url, sizeof(url), "%s?name=%s&type=65", doh_server, domain);
 
     log_msg("[ECH] Querying %s for %s", doh_server, domain);
     char* json_str = Utils_HttpGet(url);
     if (!json_str) {
-        log_msg("[ECH] DoH request failed (Network error).");
+        log_msg("[ECH] DoH request failed.");
         return NULL;
     }
 
     cJSON* root = cJSON_Parse(json_str);
     free(json_str);
-    if (!root) {
-        log_msg("[ECH] Invalid JSON response.");
-        return NULL;
-    }
+    if (!root) return NULL;
 
     unsigned char* ech_config = NULL;
     *out_len = 0;
@@ -309,63 +244,45 @@ unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t
         cJSON* record = NULL;
         cJSON_ArrayForEach(record, answer) {
             cJSON* type = cJSON_GetObjectItem(record, "type");
-            // DNS HTTPS Record Type = 65
             if (type && type->valueint == 65) { 
                 cJSON* data = cJSON_GetObjectItem(record, "data");
                 if (data && data->valuestring) {
                     const char* data_str = data->valuestring;
-                    log_msg("[ECH] Found Type 65: %.64s...", data_str); 
-
-                    // 策略 1: [关键] 解析 Presentation Format (ech="...")
-                    // 支持 Cloudflare/AliDNS 返回的格式
                     const char* ech_pos = strstr(data_str, "ech=\"");
                     if (ech_pos) {
-                        ech_pos += 5; // 跳过 ech="
+                        ech_pos += 5; 
                         const char* end_quote = strchr(ech_pos, '\"');
                         if (end_quote) {
                             size_t b64_len = end_quote - ech_pos;
                             char* b64_str = (char*)malloc(b64_len + 1);
                             if (b64_str) {
-                                strncpy(b64_str, ech_pos, b64_len);
-                                b64_str[b64_len] = 0;
-                                
-                                // 解码 Base64 得到二进制 Config
+                                strncpy(b64_str, ech_pos, b64_len); b64_str[b64_len] = 0;
                                 ech_config = Base64Decode(b64_str, out_len);
                                 free(b64_str);
-                                
-                                if (ech_config) {
-                                    log_msg("[ECH] Success: Parsed ech=\"...\" (len=%d)", *out_len);
-                                    break; 
-                                }
+                                if (ech_config) break; 
                             }
                         }
                     }
-
-                    // 策略 2: 解析 Hex 格式 (RFC 3597 style)
                     if (!ech_config) {
                         unsigned char rdata[4096];
                         int rdata_len = HexToBin(data_str, rdata, sizeof(rdata));
-                        
                         if (rdata_len > 5) { 
                             int p = 2; // Priority
-                            // 跳过 TargetName
                             while (p < rdata_len) {
                                 int label_len = rdata[p++];
                                 if (label_len == 0) break; 
                                 p += label_len;
                             }
-                            // 解析 Params
                             while (p + 4 <= rdata_len) {
                                 int key = (rdata[p] << 8) | rdata[p+1];
                                 int len = (rdata[p+2] << 8) | rdata[p+3];
                                 p += 4;
-                                if (key == 5) { // ECH Config Key
+                                if (key == 5) { 
                                     if (p + len <= rdata_len) {
                                         ech_config = (unsigned char*)malloc(len);
                                         if (ech_config) {
                                             memcpy(ech_config, rdata + p, len);
                                             *out_len = len;
-                                            log_msg("[ECH] Success: Parsed Hex (len=%d)", len);
                                         }
                                     }
                                     break; 
@@ -378,18 +295,12 @@ unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t
             }
             if (ech_config) break; 
         }
-    } else {
-        log_msg("[ECH] No Answer section found.");
     }
-
     cJSON_Delete(root);
     return ech_config;
 }
 
-// --------------------------------------------------------------------------
-// 网络请求与 HTTPS 实现
-// --------------------------------------------------------------------------
-
+// --- HTTPS Request ---
 typedef struct { 
     char host[256]; 
     int port; 
@@ -399,40 +310,23 @@ typedef struct {
 static BOOL ParseUrl(const char* url, URL_COMPONENTS_SIMPLE* out) {
     if (!url || !out) return FALSE;
     memset(out, 0, sizeof(URL_COMPONENTS_SIMPLE));
-    
     const char* p = url;
-    if (strncmp(p, "http://", 7) == 0) { 
-        p += 7; 
-        out->port = 80; 
-    }
-    else if (strncmp(p, "https://", 8) == 0) { 
-        p += 8; 
-        out->port = 443; 
-    }
-    else {
-        return FALSE; 
-    }
+    if (strncmp(p, "http://", 7) == 0) { p += 7; out->port = 80; }
+    else if (strncmp(p, "https://", 8) == 0) { p += 8; out->port = 443; }
+    else return FALSE;
     
     const char* slash = strchr(p, '/');
     int hostLen = slash ? (int)(slash - p) : (int)strlen(p);
-    
     if (hostLen >= sizeof(out->host)) return FALSE;
-    
-    strncpy(out->host, p, hostLen);
-    out->host[hostLen] = 0;
+    strncpy(out->host, p, hostLen); out->host[hostLen] = 0;
     
     char* colon = strchr(out->host, ':');
-    if (colon) {
-        *colon = 0;
-        out->port = atoi(colon + 1);
-    }
+    if (colon) { *colon = 0; out->port = atoi(colon + 1); }
     
     if (slash) {
         if (strlen(slash) >= sizeof(out->path)) return FALSE;
         strcpy(out->path, slash);
-    } else {
-        strcpy(out->path, "/");
-    }
+    } else strcpy(out->path, "/");
     return TRUE;
 }
 
@@ -449,6 +343,7 @@ static char* InternalHttpsGet(const char* url) {
     SOCKET s = INVALID_SOCKET;
     SSL *ssl = NULL;
     char* result = NULL;
+    char* buf = NULL;
     struct addrinfo hints, *res = NULL;
     
     memset(&hints, 0, sizeof(hints));
@@ -457,6 +352,7 @@ static char* InternalHttpsGet(const char* url) {
     char portStr[16]; snprintf(portStr, 16, "%d", u.port);
     
     if (getaddrinfo(u.host, portStr, &hints, &res) != 0) return NULL;
+    
     s = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
     if (s == INVALID_SOCKET) { freeaddrinfo(res); return NULL; }
     
@@ -474,14 +370,9 @@ static char* InternalHttpsGet(const char* url) {
     SSL_set_fd(ssl, (int)s);
     SSL_set_tlsext_host_name(ssl, u.host);
 
-    if (SSL_connect(ssl) != 1) {
-        if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); }
-        closesocket(s);
-        return NULL;
-    }
+    if (SSL_connect(ssl) != 1) goto cleanup;
 
     char req[2048];
-    // [Fix] Accept: application/dns-json 是关键
     snprintf(req, sizeof(req), 
         "GET %s HTTP/1.1\r\n"
         "Host: %s\r\n"
@@ -494,7 +385,7 @@ static char* InternalHttpsGet(const char* url) {
 
     int total_cap = 65536; 
     int total_len = 0;
-    char* buf = (char*)malloc(total_cap);
+    buf = (char*)malloc(total_cap);
     if (!buf) goto cleanup;
 
     while (1) {
@@ -508,13 +399,14 @@ static char* InternalHttpsGet(const char* url) {
         if (n <= 0) break;
         total_len += n;
     }
-    if (buf) buf[total_len] = 0;
+    buf[total_len] = 0;
 
     char* body = strstr(buf, "\r\n\r\n");
-    if (body) { body += 4; result = strdup(body); free(buf); } 
-    else { result = buf; }
+    if (body) { body += 4; result = _strdup(body); free(buf); buf = NULL; } 
+    else { result = buf; buf = NULL; }
 
 cleanup:
+    if (buf) free(buf);
     if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); }
     if (s != INVALID_SOCKET) closesocket(s);
     return result;
@@ -525,69 +417,43 @@ char* Utils_HttpGet(const char* url) {
     return InternalHttpsGet(url);
 }
 
-// --------------------------------------------------------------------------
-// 剪贴板操作
-// --------------------------------------------------------------------------
+// --- 剪贴板 ---
 char* GetClipboardText() {
     if (!OpenClipboard(NULL)) return NULL;
-    
     HANDLE hData = GetClipboardData(CF_TEXT);
-    if (!hData) { 
-        CloseClipboard(); 
-        return NULL; 
-    }
-    
+    if (!hData) { CloseClipboard(); return NULL; }
     char* pszText = (char*)GlobalLock(hData);
-    if (!pszText) { 
-        CloseClipboard(); 
-        return NULL; 
-    }
-    
-    char* text = strdup(pszText);
-    
+    if (!pszText) { CloseClipboard(); return NULL; }
+    char* text = _strdup(pszText);
     GlobalUnlock(hData);
     CloseClipboard();
-    
     return text;
 }
 
-// --------------------------------------------------------------------------
-// 系统代理设置 (完整实现)
-// --------------------------------------------------------------------------
+// --- 系统代理 ---
 void SetSystemProxy(BOOL enable) {
     extern int g_localPort;
     if (g_localPort <= 0) g_localPort = 1080; 
 
     wchar_t proxyServerString[256] = {0};
     wchar_t proxyBypassString[64] = L"<local>";
-    
     if (enable) swprintf_s(proxyServerString, 256, L"127.0.0.1:%d", g_localPort);
 
-    // 分支 1: Windows 8 或更高版本 (使用注册表，更稳定)
     if (IsWindows8OrGreater()) {
         HKEY hKey;
-        // 使用 common.h 中的 REG_PATH_PROXY
-        if (RegCreateKeyExW(HKEY_CURRENT_USER, REG_PATH_PROXY, 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) != ERROR_SUCCESS) {
-            log_msg("[Proxy] Failed to open registry key.");
-            return;
+        if (RegCreateKeyExW(HKEY_CURRENT_USER, REG_PATH_PROXY, 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
+            if (enable) {
+                DWORD dwEnable = 1;
+                RegSetValueExW(hKey, L"ProxyEnable", 0, REG_DWORD, (const BYTE*)&dwEnable, sizeof(dwEnable));
+                RegSetValueExW(hKey, L"ProxyOverride", 0, REG_SZ, (const BYTE*)proxyBypassString, (wcslen(proxyBypassString)+1)*sizeof(wchar_t));
+                RegSetValueExW(hKey, L"ProxyServer", 0, REG_SZ, (const BYTE*)proxyServerString, (wcslen(proxyServerString)+1)*sizeof(wchar_t));
+            } else {
+                DWORD dwEnable = 0;
+                RegSetValueExW(hKey, L"ProxyEnable", 0, REG_DWORD, (const BYTE*)&dwEnable, sizeof(dwEnable));
+            }
+            RegCloseKey(hKey);
         }
-
-        if (enable) {
-            DWORD dwEnable = 1;
-            RegSetValueExW(hKey, L"ProxyEnable", 0, REG_DWORD, (const BYTE*)&dwEnable, sizeof(dwEnable));
-            RegSetValueExW(hKey, L"ProxyOverride", 0, REG_SZ, (const BYTE*)proxyBypassString, (wcslen(proxyBypassString) + 1) * sizeof(wchar_t));
-            RegSetValueExW(hKey, L"ProxyServer", 0, REG_SZ, (const BYTE*)proxyServerString, (wcslen(proxyServerString) + 1) * sizeof(wchar_t));
-            RegDeleteValueW(hKey, L"SocksProxyServer"); 
-        } else {
-            DWORD dwEnable = 0;
-            RegSetValueExW(hKey, L"ProxyEnable", 0, REG_DWORD, (const BYTE*)&dwEnable, sizeof(dwEnable));
-            RegSetValueExW(hKey, L"ProxyServer", 0, REG_SZ, (const BYTE*)L"", sizeof(wchar_t));
-            RegDeleteValueW(hKey, L"SocksProxyServer");
-        }
-        RegCloseKey(hKey);
-    } 
-    // 分支 2: 旧版系统 (使用 InternetSetOption)
-    else {
+    } else {
         INTERNET_PER_CONN_OPTION_LISTW list;
         INTERNET_PER_CONN_OPTIONW options[3];
         DWORD dwBufSize = sizeof(list);
@@ -613,7 +479,6 @@ void SetSystemProxy(BOOL enable) {
         list.pOptions = options;
         InternetSetOptionW(NULL, INTERNET_OPTION_PER_CONNECTION_OPTION, &list, dwBufSize);
     }
-    // 刷新系统设置
     InternetSetOptionW(NULL, INTERNET_OPTION_SETTINGS_CHANGED, NULL, 0);
     InternetSetOptionW(NULL, INTERNET_OPTION_REFRESH, NULL, 0);
 }
@@ -630,7 +495,6 @@ BOOL IsSystemProxyEnabled() {
     if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_PATH_PROXY, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
         if (RegQueryValueExW(hKey, L"ProxyEnable", NULL, NULL, (LPBYTE)&dwEnable, &dwSize) == ERROR_SUCCESS) {
             if (dwEnable == 1) {
-                // 仅当 ProxyEnable=1 时，检查 ProxyServer 是否匹配当前端口
                 if (RegQueryValueExW(hKey, L"ProxyServer", NULL, NULL, (LPBYTE)proxyServer, &dwProxySize) == ERROR_SUCCESS) {
                     wchar_t expected[64];
                     swprintf_s(expected, 64, L"127.0.0.1:%d", g_localPort);
