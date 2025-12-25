@@ -94,6 +94,7 @@ static void ParseSSPlugin(cJSON* outbound, const char* pluginParam) {
 // --- 配置文件加载与保存 ---
 
 void LoadSettings() {
+    log_msg("[Config] Loading settings from ini file...");
     UINT modifiers = GetPrivateProfileIntW(L"Settings", L"Modifiers", MOD_CONTROL | MOD_ALT, g_iniFilePath);
     UINT vk = GetPrivateProfileIntW(L"Settings", L"VK", 'H', g_iniFilePath);
     int port = GetPrivateProfileIntW(L"Settings", L"LocalPort", 10809, g_iniFilePath);
@@ -167,6 +168,7 @@ void LoadSettings() {
     g_subCount = GetPrivateProfileIntW(L"Subscriptions", L"Count", 0, g_iniFilePath);
     if (g_subCount > MAX_SUBS) g_subCount = MAX_SUBS;
     
+    log_msg("[Config] Sub count: %d", g_subCount);
     for (int i = 0; i < g_subCount; i++) {
         wchar_t wKeyEn[32], wKeyUrl[32], wUrl[512];
         swprintf(wKeyEn, 32, L"Sub%d_Enabled", i); 
@@ -177,9 +179,11 @@ void LoadSettings() {
     }
 
     LeaveCriticalSection(&g_configLock);
+    log_msg("[Config] LoadSettings completed.");
 }
 
 void SaveSettings() {
+    log_msg("[Config] Saving settings...");
     EnterCriticalSection(&g_configLock);
     
     wchar_t buffer[32];
@@ -258,9 +262,15 @@ void ParseTags_NoLock() {
     nodeCount = 0; nodeTags = NULL;
     char* buffer = NULL; long size = 0;
     
-    if (!ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) return;
+    if (!ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) {
+        log_msg("[Config] Failed to read config file for tagging.");
+        return;
+    }
     cJSON* root = cJSON_Parse(buffer); free(buffer);
-    if (!root) return;
+    if (!root) {
+        log_msg("[Config] JSON parse error in ParseTags.");
+        return;
+    }
 
     cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
     if (outbounds) {
@@ -277,6 +287,7 @@ void ParseTags_NoLock() {
             }
         }
     }
+    log_msg("[Config] Parsed %d tags.", nodeCount);
     cJSON_Delete(root);
 }
 
@@ -375,15 +386,22 @@ void ParseNodeConfigToGlobal(cJSON *node) {
 }
 
 void SwitchNode(const wchar_t* tag) {
+    log_msg("[Switch] Switching to node: %ls", tag);
     if (!tag) return;
     EnterCriticalSection(&g_configLock);
     wcsncpy(currentNode, tag, 63); currentNode[63] = 0;
     LeaveCriticalSection(&g_configLock);
 
     char* buffer = NULL; long size = 0;
-    if (!ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) return;
+    if (!ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) {
+        log_msg("[Switch] Failed to read config file.");
+        return;
+    }
     cJSON* root = cJSON_Parse(buffer); free(buffer);
-    if (!root) return;
+    if (!root) {
+        log_msg("[Switch] JSON parse error.");
+        return;
+    }
     
     cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
     cJSON* targetNode = NULL;
@@ -397,6 +415,7 @@ void SwitchNode(const wchar_t* tag) {
     }
     
     if (targetNode) {
+        log_msg("[Switch] Node found. Applying config...");
         ParseNodeConfigToGlobal(targetNode); 
         StartProxyCore(); 
         SaveSettings();   
@@ -406,12 +425,15 @@ void SwitchNode(const wchar_t* tag) {
         wcsncpy(nid.szInfoTitle, L"连接切换", 63); 
         nid.uFlags |= NIF_INFO;
         Shell_NotifyIconW(NIM_MODIFY, &nid);
+    } else {
+        log_msg("[Switch] Node tag not found in config: %s", tagUtf8);
     }
     cJSON_Delete(root);
 }
 
 void DeleteNode(const wchar_t* tag) {
     if (!tag) return;
+    log_msg("[Delete] Deleting node: %ls", tag);
     char* buffer = NULL; long size = 0;
     if (!ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) return;
     cJSON* root = cJSON_Parse(buffer); free(buffer);
@@ -434,6 +456,7 @@ void DeleteNode(const wchar_t* tag) {
 }
 
 BOOL AddNodeToConfig(cJSON* newNode) {
+    log_msg("[Config] Adding new node...");
     if (!newNode) return FALSE;
     char* buffer = NULL; long size = 0; cJSON* root = NULL;
     if (ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) { root = cJSON_Parse(buffer); free(buffer); }
@@ -468,8 +491,11 @@ int Internal_BatchAddNodesFromText(const char* text, cJSON* outbounds) {
     unsigned char* decoded = NULL;
     size_t decLen = 0;
 
+    log_msg("[Sub] Parsing subscription content...");
+
     if (strstr(text, "://")) { sourceText = _strdup(text); } 
     else {
+        log_msg("[Sub] Content seems Base64 encoded, decoding...");
         decoded = Base64Decode(text, &decLen);
         if (decoded && decLen > 0) sourceText = (char*)decoded;
         else { sourceText = _strdup(text); if (decoded) free(decoded); }
@@ -514,18 +540,25 @@ int Internal_BatchAddNodesFromText(const char* text, cJSON* outbounds) {
         }
     }
     if (sourceText != (char*)decoded) free(sourceText); else free(decoded);
+    log_msg("[Sub] Parsed %d nodes.", count);
     return count;
 }
 
 int ImportFromClipboard() {
-    char* text = GetClipboardText(); if (!text) return 0;
+    log_msg("[Import] Reading clipboard...");
+    char* text = GetClipboardText(); if (!text) {
+        log_msg("[Import] Clipboard empty or inaccessible.");
+        return 0;
+    }
     EnterCriticalSection(&g_configLock);
     char* buffer = NULL; long size = 0; cJSON* root = NULL;
     if (ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) { root = cJSON_Parse(buffer); free(buffer); }
     if (!root) { root = cJSON_CreateObject(); }
     cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
     if (!outbounds) { outbounds = cJSON_CreateArray(); cJSON_AddItemToObject(root, "outbounds", outbounds); }
+    
     int successCount = Internal_BatchAddNodesFromText(text, outbounds);
+    
     if (successCount > 0) { 
         char* out = cJSON_Print(root); 
         if (out) { WriteBufferToFile(CONFIG_FILE, out); free(out); }
@@ -539,11 +572,13 @@ int ImportFromClipboard() {
 
 // [重构] 解决订阅更新时的线程冲突与 Runtime 错误 (重点修改函数)
 int UpdateAllSubscriptions(BOOL forceMsg) {
+    log_msg("[Sub] Start updating all subscriptions...");
+    
     // 1. 使用 malloc 替代大数组栈分配，防止 Stack Overflow
     // char subUrls[MAX_SUBS][512]; -> 移至堆
     char (*subUrls)[512] = (char (*)[512])malloc(MAX_SUBS * 512);
     if (!subUrls) {
-        log_msg("[Error] 内存分配失败 (UpdateAllSubscriptions)");
+        log_msg("[Fatal] Memory allocation failed (UpdateAllSubscriptions)");
         return 0;
     }
 
@@ -558,6 +593,8 @@ int UpdateAllSubscriptions(BOOL forceMsg) {
     }
     LeaveCriticalSection(&g_configLock);
     
+    log_msg("[Sub] Valid enabled URLs: %d", count);
+
     if (count == 0) {
         free(subUrls);
         return 0;
@@ -565,11 +602,13 @@ int UpdateAllSubscriptions(BOOL forceMsg) {
 
     char* rawData[MAX_SUBS] = {0}; 
     for (int i = 0; i < count; i++) {
-        log_msg("[Sub] 正在下载 (%d/%d): %s", i+1, count, subUrls[i]);
+        log_msg("[Sub] Downloading (%d/%d): %s", i+1, count, subUrls[i]);
         // 增加对 Utils_HttpGet 返回值的保护
         rawData[i] = Utils_HttpGet(subUrls[i]);
         if (!rawData[i]) {
-            log_msg("[Warn] 下载失败: %s", subUrls[i]);
+            log_msg("[Warn] Download failed: %s", subUrls[i]);
+        } else {
+            log_msg("[Sub] Download success. Size: %zu", strlen(rawData[i]));
         }
     }
     
@@ -577,6 +616,7 @@ int UpdateAllSubscriptions(BOOL forceMsg) {
     free(subUrls);
 
     // 关键区：处理配置文件
+    log_msg("[Sub] Processing node data...");
     EnterCriticalSection(&g_configLock);
     char* buffer = NULL; long size = 0; cJSON* root = NULL;
     if (ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) { 
@@ -596,7 +636,9 @@ int UpdateAllSubscriptions(BOOL forceMsg) {
     for (int i = 0; i < count; i++) {
         if (rawData[i]) { 
             // [GCC Fix] 移除 SEH，仅保留逻辑
-            totalNewNodes += Internal_BatchAddNodesFromText(rawData[i], outbounds); 
+            int added = Internal_BatchAddNodesFromText(rawData[i], outbounds); 
+            log_msg("[Sub] Parsed %d nodes from source %d", added, i+1);
+            totalNewNodes += added;
             free(rawData[i]); rawData[i] = NULL;
         }
     }
@@ -616,7 +658,7 @@ int UpdateAllSubscriptions(BOOL forceMsg) {
     
     SaveSettings(); // 内部带锁
     
-    log_msg("[Sub] 更新完成。新增节点: %d", totalNewNodes);
+    log_msg("[Sub] Update complete. Total nodes: %d", totalNewNodes);
     return totalNewNodes;
 }
 
