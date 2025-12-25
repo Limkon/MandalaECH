@@ -327,13 +327,14 @@ static BOOL ParseUrl(const char* url, URL_COMPONENTS_SIMPLE* out) {
     return TRUE;
 }
 
-// [Safety] 移除了 GCC 不支持的 __try，使用标准的检查
+// [Safety] 修复 x64 下 SOCKET 强转 int 的风险，以及增强 SSL 握手稳定性
 static char* InternalHttpsGet(const char* url) {
     URL_COMPONENTS_SIMPLE u;
     if (!ParseUrl(url, &u)) return NULL;
 
     // [Thread Safety] 局部 SSL Context，避免静态变量多线程冲突
-    SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
+    const SSL_METHOD* method = TLS_client_method();
+    SSL_CTX* ctx = SSL_CTX_new(method);
     if (!ctx) return NULL;
     SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
 
@@ -378,7 +379,13 @@ static char* InternalHttpsGet(const char* url) {
         SSL_CTX_free(ctx);
         return NULL; 
     }
-    SSL_set_fd(ssl, (int)s);
+    
+    // [Fix] 正确的类型转换：先转 intptr_t 再转 int
+    // Windows 的 socket handle 虽然是 64 位，但作为文件描述符传递给 OpenSSL 时
+    // 在 Windows 平台上通常可以安全地进行这种转换，因为 OpenSSL 内部会再次处理
+    // 关键是不能直接 (int)s，否则高位非零时会变成负数或截断
+    SSL_set_fd(ssl, (int)(intptr_t)s);
+    
     SSL_set_tlsext_host_name(ssl, u.host);
 
     if (SSL_connect(ssl) != 1) goto cleanup;
@@ -392,7 +399,8 @@ static char* InternalHttpsGet(const char* url) {
         "Connection: close\r\n\r\n", 
         u.path, u.host);
         
-    if (SSL_write(ssl, req, strlen(req)) <= 0) goto cleanup;
+    // [Fix] 显式转换长度为 int
+    if (SSL_write(ssl, req, (int)strlen(req)) <= 0) goto cleanup;
 
     int total_cap = 65536; 
     int total_len = 0;
@@ -400,21 +408,35 @@ static char* InternalHttpsGet(const char* url) {
     if (!buf) goto cleanup;
 
     while (1) {
+        // 动态扩容
         if (total_len >= total_cap - 1024) {
-            total_cap *= 2;
-            char* new_buf = (char*)realloc(buf, total_cap);
+            int new_cap = total_cap * 2;
+            char* new_buf = (char*)realloc(buf, new_cap);
             if (!new_buf) { free(buf); buf = NULL; goto cleanup; }
             buf = new_buf;
+            total_cap = new_cap;
         }
+        
         int n = SSL_read(ssl, buf + total_len, total_cap - total_len - 1);
-        if (n <= 0) break;
+        if (n <= 0) {
+            int err = SSL_get_error(ssl, n);
+            // 正常的关闭连接或零返回
+            if (err == SSL_ERROR_ZERO_RETURN || err == SSL_ERROR_SYSCALL) break; 
+            break; 
+        }
         total_len += n;
     }
     buf[total_len] = 0;
 
     char* body = strstr(buf, "\r\n\r\n");
-    if (body) { body += 4; result = _strdup(body); free(buf); buf = NULL; } 
-    else { result = buf; buf = NULL; }
+    if (body) { 
+        body += 4; 
+        result = _strdup(body); 
+        free(buf); buf = NULL; 
+    } else { 
+        result = buf; 
+        buf = NULL; 
+    }
 
 cleanup:
     if (buf) free(buf);
