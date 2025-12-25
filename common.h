@@ -18,6 +18,11 @@
 #endif
 
 #define WIN32_LEAN_AND_MEAN
+
+// [Fix] 关键修复：定义 NOCRYPT 禁止 windows.h 包含 wincrypt.h
+// 这解决了与 BoringSSL/OpenSSL 中 X509_NAME, OCSP_RESPONSE 等符号的冲突
+#define NOCRYPT 
+
 #define MAX_CONNECTIONS 512
 
 #include <windows.h>
