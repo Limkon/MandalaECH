@@ -4,7 +4,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h> // [新增] 引入时间函数
+#include <wchar.h> // [修复] 引入宽字符处理头文件
+#include <time.h> 
 
 // --- 全局变量声明 ---
 Subscription g_subs[MAX_SUBS];
@@ -118,7 +119,9 @@ void LoadSettings() {
     // [新增] 读取上次更新时间
     wchar_t wTimeBuf[64] = {0};
     GetPrivateProfileStringW(L"Subscriptions", L"LastUpdateTime", L"0", wTimeBuf, 64, g_iniFilePath);
-    g_lastUpdateTime = _wtoll(wTimeBuf);
+    
+    // [修复] 使用标准 wcstoll 替代 _wtoll
+    g_lastUpdateTime = wcstoll(wTimeBuf, NULL, 10);
 
     EnterCriticalSection(&g_configLock);
 
@@ -211,8 +214,9 @@ void SaveSettings() {
     WritePrivateProfileStringW(L"Subscriptions", NULL, NULL, g_iniFilePath);
     
     // [新增] 保存上次更新时间
+    // [修复] 使用 _snwprintf 替代 _i64tow (非标准函数)
     wchar_t wTimeBuf[64];
-    _i64tow(g_lastUpdateTime, wTimeBuf, 10);
+    _snwprintf(wTimeBuf, 64, L"%lld", g_lastUpdateTime);
     WritePrivateProfileStringW(L"Subscriptions", L"LastUpdateTime", wTimeBuf, g_iniFilePath);
 
     _snwprintf(buffer, 16, L"%d", g_subUpdateMode); WritePrivateProfileStringW(L"Subscriptions", L"UpdateMode", buffer, g_iniFilePath);
