@@ -5,11 +5,11 @@
 ProxyConfig g_proxyConfig;
 volatile BOOL g_proxyRunning = FALSE;
 SOCKET g_listen_sock = INVALID_SOCKET;
-SSL_CTX *g_ssl_ctx = NULL; // 核心代理使用的 SSL 上下文
+SSL_CTX *g_ssl_ctx = NULL; 
 
 HANDLE hProxyThread = NULL;
 
-CRITICAL_SECTION g_configLock; // 全局配置锁
+CRITICAL_SECTION g_configLock; 
 
 void InitGlobalLocks() {
     InitializeCriticalSection(&g_configLock);
@@ -27,6 +27,9 @@ HMENU hNodeSubMenu = NULL;
 HWND hLogViewerWnd = NULL;
 HFONT hLogFont = NULL;
 HFONT hAppFont = NULL;
+
+// [修复] 解决链接错误：定义在 gui.h 中 extern 的变量
+HWND hSubList = NULL; 
 
 // 节点管理数据
 wchar_t** nodeTags = NULL;
