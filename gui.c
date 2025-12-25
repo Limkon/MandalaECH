@@ -61,54 +61,37 @@ DWORD WINAPI AutoUpdateThread(LPVOID lpParam) {
             return 0;
         }
 
-        // [Security] 增加异常捕获，防止后台线程崩溃导致主程序退出
-        __try {
-            // 执行更新 (FALSE=静默模式)
-            int count = UpdateAllSubscriptions(FALSE);
-            
-            // 如果有更新，通知 UI 刷新
-            if (count > 0) {
-                HWND hMgr = FindWindowW(L"NodeMgr", NULL);
-                if (hMgr && IsWindow(hMgr)) {
-                    PostMessage(hMgr, WM_REFRESH_NODELIST, 0, 0);
-                }
+        // 执行更新 (FALSE=静默模式)
+        int count = UpdateAllSubscriptions(FALSE);
+        
+        // 如果有更新，通知 UI 刷新
+        if (count > 0) {
+            HWND hMgr = FindWindowW(L"NodeMgr", NULL);
+            if (hMgr && IsWindow(hMgr)) {
+                PostMessage(hMgr, WM_REFRESH_NODELIST, 0, 0);
             }
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
-            log_msg("[Fatal] 自动更新线程发生严重崩溃！");
         }
     }
     return 0;
 }
 
-// [修复] 手动更新线程：增加安全性校验和 SEH 异常处理
+// [修复] 手动更新线程：增加安全性校验
 DWORD WINAPI ManualUpdateThread(LPVOID param) {
     HWND hWnd = (HWND)param;
     if (!IsWindow(hWnd)) return 0;
 
     log_msg("[Thread] 手动更新订阅开始...");
     
-    int count = 0;
-    BOOL success = FALSE;
-
-    // [Security] 使用 SEH 捕获 Runtime Error
-    __try {
-        // UpdateAllSubscriptions 内部已由文件锁保护
-        count = UpdateAllSubscriptions(TRUE);
-        success = TRUE;
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        log_msg("[Fatal] 订阅更新过程中发生崩溃 (Exception Code: 0x%08X)", GetExceptionCode());
-        success = FALSE;
-    }
+    // 执行更新逻辑
+    // UpdateAllSubscriptions 内部已由文件锁保护，且已修复内存分配问题
+    int count = UpdateAllSubscriptions(TRUE);
     
     // 确保窗口依然存在再发送完成消息
     if (IsWindow(hWnd)) {
-        // 如果成功返回数量，如果崩溃返回 -1
-        PostMessage(hWnd, WM_UPDATE_FINISH, (WPARAM)(success ? count : -1), 0);
+        PostMessage(hWnd, WM_UPDATE_FINISH, (WPARAM)count, 0);
     } else {
         // 如果订阅窗口已关闭，尝试通知节点管理器刷新
-        if (success) {
+        if (count > 0) {
             HWND hMgr = FindWindowW(L"NodeMgr", NULL);
             if (hMgr) PostMessage(hMgr, WM_REFRESH_NODELIST, 0, 0);
         }
@@ -907,7 +890,7 @@ void OpenLogViewer(BOOL bShow) {
     if (bShow) ShowWindow(hLogViewerWnd, SW_SHOW); else ShowWindow(hLogViewerWnd, SW_HIDE);
 }
 
-// [补全] ToggleTrayIcon 函数实现
+// 补全 ToggleTrayIcon 函数
 void ToggleTrayIcon() {
     if (g_isIconVisible) {
         Shell_NotifyIconW(NIM_DELETE, &nid);
@@ -954,7 +937,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
     else if (msg == WM_COMMAND) {
         int id = LOWORD(wParam);
-        // [修复] 优化退出流程
+        
         if (id == ID_TRAY_EXIT) { 
             log_msg("[System] 正在安全退出程序...");
             Shell_NotifyIconW(NIM_DELETE, &nid); 
