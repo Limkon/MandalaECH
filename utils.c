@@ -1,3 +1,4 @@
+#define WIN32_LEAN_AND_MEAN // [Fix] 防止头文件冲突
 #include "utils.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -266,11 +267,10 @@ static char* InternalHttpsGet(const char* url) {
         return NULL;
     }
 
-    log_msg("[HTTP] Creating SSL Context...");
     const SSL_METHOD* method = TLS_client_method();
     SSL_CTX* ctx = SSL_CTX_new(method);
     if (!ctx) {
-        log_msg("[HTTP] SSL_CTX_new failed. Check OpenSSL libs.");
+        log_msg("[HTTP] SSL_CTX_new failed.");
         return NULL;
     }
     SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
@@ -279,43 +279,46 @@ static char* InternalHttpsGet(const char* url) {
     SSL *ssl = NULL;
     char* result = NULL;
     char* buf = NULL;
-    struct addrinfo hints, *res = NULL;
+    struct addrinfo hints, *res = NULL, *ptr = NULL;
     
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC; 
     hints.ai_socktype = SOCK_STREAM;
     char portStr[16]; snprintf(portStr, 16, "%d", u.port);
     
-    log_msg("[HTTP] Resolving DNS for %s...", u.host);
+    log_msg("[HTTP] DNS Lookup: %s", u.host);
     if (getaddrinfo(u.host, portStr, &hints, &res) != 0) {
         log_msg("[HTTP] getaddrinfo failed for %s", u.host);
         SSL_CTX_free(ctx); 
         return NULL;
     }
     
-    s = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (s == INVALID_SOCKET) { 
-        log_msg("[HTTP] Socket creation failed.");
-        freeaddrinfo(res); 
-        SSL_CTX_free(ctx);
-        return NULL; 
+    // [Fix] 遍历所有 IP 地址进行连接
+    for (ptr = res; ptr != NULL; ptr = ptr->ai_next) {
+        s = socket(ptr->ai_family, ptr->ai_socktype, ptr->ai_protocol);
+        if (s == INVALID_SOCKET) continue;
+        
+        DWORD timeout = 8000; 
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
+
+        log_msg("[HTTP] Trying connect...");
+        if (connect(s, ptr->ai_addr, (int)ptr->ai_addrlen) == 0) {
+            log_msg("[HTTP] TCP Connected!");
+            break; // 连接成功
+        }
+        closesocket(s);
+        s = INVALID_SOCKET;
     }
     
-    DWORD timeout = 8000; 
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
-    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
+    freeaddrinfo(res);
 
-    log_msg("[HTTP] Connecting to %s:%d...", u.host, u.port);
-    if (connect(s, res->ai_addr, (int)res->ai_addrlen) != 0) {
-        log_msg("[HTTP] TCP connect failed.");
-        closesocket(s); freeaddrinfo(res); 
+    if (s == INVALID_SOCKET) {
+        log_msg("[HTTP] Failed to connect to any resolved address.");
         SSL_CTX_free(ctx);
         return NULL;
     }
-    log_msg("[HTTP] TCP Connected. Freeing addrinfo...");
-    freeaddrinfo(res);
 
-    log_msg("[HTTP] Creating SSL structure...");
     ssl = SSL_new(ctx);
     if (!ssl) { 
         log_msg("[HTTP] SSL_new failed.");
@@ -324,29 +327,22 @@ static char* InternalHttpsGet(const char* url) {
         return NULL; 
     }
     
-    // [CRITICAL] 使用 BIO_new_socket 替代 SSL_set_fd
-    // 这种方式在 Windows x64 下更安全，避免了 (int)SOCKET 的截断风险
-    log_msg("[HTTP] Setting up SSL BIO...");
+    // [CRITICAL] 使用 BIO_new_socket 防止句柄截断问题
     BIO* bio = BIO_new_socket((int)(intptr_t)s, BIO_NOCLOSE);
     if (!bio) {
-        log_msg("[HTTP] BIO_new_socket failed.");
-        SSL_free(ssl);
-        closesocket(s);
-        SSL_CTX_free(ctx);
+        log_msg("[HTTP] BIO creation failed.");
+        SSL_free(ssl); closesocket(s); SSL_CTX_free(ctx);
         return NULL;
     }
     SSL_set_bio(ssl, bio, bio);
     
     SSL_set_tlsext_host_name(ssl, u.host);
 
-    log_msg("[HTTP] Performing SSL handshake...");
+    log_msg("[HTTP] SSL Handshake...");
     if (SSL_connect(ssl) != 1) {
-        long err = ERR_get_error();
-        log_msg("[HTTP] SSL_connect failed. ERR: %lx (%s)", err, ERR_error_string(err, NULL));
-        // 注意：不要在此处 free(bio)，SSL_free 会处理它
+        log_msg("[HTTP] SSL_connect failed.");
         goto cleanup;
     }
-    log_msg("[HTTP] SSL Handshake success.");
 
     char req[2048];
     snprintf(req, sizeof(req), 
@@ -357,31 +353,24 @@ static char* InternalHttpsGet(const char* url) {
         "Connection: close\r\n\r\n", 
         u.path, u.host);
         
-    log_msg("[HTTP] Sending Request...");
     if (SSL_write(ssl, req, (int)strlen(req)) <= 0) {
-        log_msg("[HTTP] Failed to send request header.");
+        log_msg("[HTTP] Failed to send request.");
         goto cleanup;
     }
 
     int total_cap = 65536; 
     int total_len = 0;
-    log_msg("[HTTP] Allocating buffer (%d bytes)...", total_cap);
     buf = (char*)malloc(total_cap);
     if (!buf) {
-        log_msg("[HTTP] OOM allocating receive buffer.");
+        log_msg("[HTTP] OOM.");
         goto cleanup;
     }
 
-    log_msg("[HTTP] Receiving data...");
     while (1) {
         if (total_len >= total_cap - 1024) {
             int new_cap = total_cap * 2;
-            log_msg("[HTTP] Expanding buffer to %d...", new_cap);
             char* new_buf = (char*)realloc(buf, new_cap);
-            if (!new_buf) { 
-                log_msg("[HTTP] OOM reallocating buffer.");
-                free(buf); buf = NULL; goto cleanup; 
-            }
+            if (!new_buf) { free(buf); buf = NULL; goto cleanup; }
             buf = new_buf;
             total_cap = new_cap;
         }
@@ -390,14 +379,13 @@ static char* InternalHttpsGet(const char* url) {
         if (n <= 0) {
             int err = SSL_get_error(ssl, n);
             if (err == SSL_ERROR_ZERO_RETURN || err == SSL_ERROR_SYSCALL) break; 
-            log_msg("[HTTP] SSL_read error: %d", err);
             break; 
         }
         total_len += n;
     }
     buf[total_len] = 0;
 
-    log_msg("[HTTP] Received %d bytes. Parsing body...", total_len);
+    log_msg("[HTTP] Read %d bytes.", total_len);
     char* body = strstr(buf, "\r\n\r\n");
     if (body) { 
         body += 4; 
@@ -410,13 +398,9 @@ static char* InternalHttpsGet(const char* url) {
 
 cleanup:
     if (buf) free(buf);
-    if (ssl) { 
-        SSL_shutdown(ssl); 
-        SSL_free(ssl); // 这也会释放 BIO
-    }
+    if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); }
     if (s != INVALID_SOCKET) closesocket(s);
     if (ctx) SSL_CTX_free(ctx); 
-    log_msg("[HTTP] Cleanup finished.");
     return result;
 }
 
@@ -435,7 +419,6 @@ char* GetClipboardText() {
     char* text = _strdup(pszText);
     GlobalUnlock(hData);
     CloseClipboard();
-    log_msg("[Clipboard] Read text (len=%d)", strlen(text));
     return text;
 }
 
