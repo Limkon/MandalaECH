@@ -331,7 +331,7 @@ unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t
     // 构造 DoH 查询 URL
     // 支持 Google/Cloudflare 格式: ?name=DOM&type=HTTPS
     char url[1024];
-    snprintf(url, sizeof(url), "%s?name=%s&type=HTTPS&ct=application/dns-json", doh_server, domain);
+    snprintf(url, sizeof(url), "%s?name=%s&type=HTTPS", doh_server, domain);
 
     log_msg("[ECH] Querying %s for %s", doh_server, domain);
     char* json_str = Utils_HttpGet(url);
@@ -549,11 +549,13 @@ static char* InternalHttpsGet(const char* url) {
     }
 
     // 6. 发送 HTTP GET 请求
+    // [Fix] 添加 Accept: application/dns-json 头，修复 DoH 响应无效问题
     char req[2048];
     snprintf(req, sizeof(req), 
         "GET %s HTTP/1.1\r\n"
         "Host: %s\r\n"
         "User-Agent: Mandala-Client/1.0\r\n"
+        "Accept: application/dns-json\r\n"
         "Connection: close\r\n\r\n", 
         u.path, u.host);
         
