@@ -348,13 +348,17 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
 
     ctx->ssl = SSL_new(g_ssl_ctx);
     if (!ctx->ssl) return -1;
-    SSL_set_fd(ctx->ssl, (int)ctx->sock);
+    
+    // [Fix] 修复 x64 系统下的句柄截断问题
+    // (int)ctx->sock 在 64 位系统下会丢失高 32 位，可能导致 OpenSSL 使用非法句柄
+    // 应先转 intptr_t 确保安全
+    SSL_set_fd(ctx->ssl, (int)(intptr_t)ctx->sock);
     
     // [ECH 处理占位] 生产环境暂建议禁用不稳定 ECH，或需完整实现
     // 此处保留逻辑但建议在 GUI 默认关闭
 
     // 挂载 Fragmentation/Padding BIO
-    BIO *bio = BIO_new_socket(ctx->sock, BIO_NOCLOSE);
+    BIO *bio = BIO_new_socket((int)(intptr_t)ctx->sock, BIO_NOCLOSE);
     if (method_frag) {
         BIO *frag = BIO_new(method_frag);
         if (frag) {
