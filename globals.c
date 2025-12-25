@@ -5,18 +5,11 @@
 ProxyConfig g_proxyConfig;
 volatile BOOL g_proxyRunning = FALSE;
 SOCKET g_listen_sock = INVALID_SOCKET;
-// [Fix] 移除重复定义，保留 crypto.c 中的定义或反之，但为了链接安全，
-// 建议：在 globals.c 定义，crypto.c 中仅 include common.h (extern)
-// 之前构建报错是因为重复定义，这里保留定义，crypto.c 已删除定义。
-// SSL_CTX *g_ssl_ctx = NULL; // (根据之前的修复，这里应该保留吗？)
-// 修正：这是 globals.c，应该保留定义。crypto.c 应该只有声明。
-// 但之前的日志显示 globals.c 和 crypto.c 都有定义。
-// 我们已经在上一步的 crypto.c 中删除了定义。所以这里保留。
-SSL_CTX *g_ssl_ctx = NULL;
+SSL_CTX *g_ssl_ctx = NULL; 
 
 HANDLE hProxyThread = NULL;
 
-CRITICAL_SECTION g_configLock;
+CRITICAL_SECTION g_configLock; 
 
 void InitGlobalLocks() {
     InitializeCriticalSection(&g_configLock);
@@ -26,7 +19,7 @@ void DeleteGlobalLocks() {
     DeleteCriticalSection(&g_configLock);
 }
 
-// GUI 相关
+// GUI 相关句柄
 NOTIFYICONDATAW nid = {0};
 HWND hwnd = NULL;
 HMENU hMenu = NULL;
@@ -35,13 +28,16 @@ HWND hLogViewerWnd = NULL;
 HFONT hLogFont = NULL;
 HFONT hAppFont = NULL;
 
-// 节点管理
+// [修复] 解决链接错误：定义在 gui.h 中 extern 的变量
+HWND hSubList = NULL; 
+
+// 节点管理数据
 wchar_t** nodeTags = NULL;
 int nodeCount = 0;
 wchar_t currentNode[64] = {0};
 wchar_t g_editingTag[256] = {0};
 
-// 系统状态
+// 系统与运行状态
 BOOL g_isIconVisible = TRUE;
 wchar_t g_iniFilePath[MAX_PATH] = {0};
 UINT g_hotkeyModifiers = MOD_CONTROL | MOD_ALT;
@@ -53,7 +49,7 @@ WNDPROC g_oldListBoxProc = NULL;
 int g_nEditScrollPos = 0;
 int g_nEditContentHeight = 0;
 
-// 抗封锁配置
+// 抗封锁配置 (默认值)
 BOOL g_enableChromeCiphers = TRUE;
 BOOL g_enableALPN = TRUE;
 BOOL g_enableFragment = FALSE;
@@ -66,10 +62,7 @@ int g_padSizeMax = 500;
 int g_uaPlatformIndex = 0;
 char g_userAgentStr[512] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
-// [Fix] 修正 ECH 默认配置
-// 1. 默认开启 ECH
-// 2. 默认 DoH 改为 Cloudflare (兼容性更好)
-// 3. 默认 Public Name 改为 cloudflare-ech.com
+// ECH 配置
 BOOL g_enableECH = FALSE; 
 char g_echConfigServer[256] = "https://1.1.1.1/dns-query"; 
 char g_echPublicName[256] = "cloudflare-ech.com"; 
