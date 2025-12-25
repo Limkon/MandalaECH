@@ -887,6 +887,20 @@ void OpenLogViewer(BOOL bShow) {
     if (bShow) ShowWindow(hLogViewerWnd, SW_SHOW); else ShowWindow(hLogViewerWnd, SW_HIDE);
 }
 
+// [修复] 解决链接错误：实现托盘图标切换功能
+void ToggleTrayIcon() {
+    if (g_isIconVisible) {
+        // 隐藏：从托盘移除图标
+        Shell_NotifyIconW(NIM_DELETE, &nid);
+        g_isIconVisible = FALSE;
+    } else {
+        // 显示：添加图标到托盘
+        Shell_NotifyIconW(NIM_ADD, &nid);
+        Shell_NotifyIconW(NIM_SETVERSION, &nid);
+        g_isIconVisible = TRUE;
+    }
+}
+
 // --- 托盘与主窗口消息处理 ---
 
 LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
