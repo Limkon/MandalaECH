@@ -15,7 +15,8 @@
 #define TLSEXT_TYPE_padding 21
 #endif
 
-// SSL_CTX *g_ssl_ctx = NULL; // [Fix] 已在 globals.c 定义，此处删除
+// 引用 globals.c 中的全局变量
+extern SSL_CTX *g_ssl_ctx;
 
 static BIO_METHOD *method_frag = NULL;
 static INIT_ONCE g_crypto_init_once = INIT_ONCE_STATIC_INIT;
@@ -112,11 +113,11 @@ static long frag_ctrl(BIO *b, int cmd, long num, void *ptr) {
 }
 
 // ---------------------- Custom TLS Padding Implementation ----------------------
-// [Refactor] 不依赖 SSL_set_block_padding，手动实现 Padding 扩展
+// [Fix] 适配 BoringSSL 回调签名 (无 context, X509 等参数)
 
 // 回调：构造 Padding 扩展数据
-static int padding_add_cb(SSL *s, unsigned int ext_type, unsigned int context,
-                          const unsigned char **out, size_t *outlen, X509 *x, size_t chainidx,
+static int padding_add_cb(SSL *s, unsigned int ext_type,
+                          const unsigned char **out, size_t *outlen,
                           int *al, void *add_arg) {
     // 1. 获取连接配置 (通过 SSL_set_app_data 传入)
     CryptoSettings* settings = (CryptoSettings*)SSL_get_app_data(s);
@@ -133,24 +134,23 @@ static int padding_add_cb(SSL *s, unsigned int ext_type, unsigned int context,
     
     int pad_len = settings->padMin + (range > 0 ? (rnd_byte % (range + 1)) : 0);
     
-    // 长度检查：虽然 RFC 允许 0 长度，但通常是为了填充大小，太小无意义
     if (pad_len <= 0) return 0;
 
-    // 3. 分配内存 (OpenSSL 会调用 free_cb 释放)
+    // 3. 分配内存 (BoringSSL/OpenSSL 会调用 free_cb 释放)
     unsigned char* data = (unsigned char*)malloc(pad_len);
-    if (!data) return -1; // 内存分配失败，中止握手
+    if (!data) return -1; 
 
-    // 4. 填充 0 (RFC 7685 要求必须填充 0x00)
+    // 4. 填充 0
     memset(data, 0, pad_len);
 
     *out = data;
     *outlen = pad_len;
     
-    return 1; // 成功添加扩展
+    return 1; // 成功
 }
 
 // 回调：释放 Padding 扩展数据
-static void padding_free_cb(SSL *s, unsigned int ext_type, unsigned int context,
+static void padding_free_cb(SSL *s, unsigned int ext_type,
                             const unsigned char *out, void *add_arg) {
     if (out) free((void*)out);
 }
@@ -179,17 +179,16 @@ BOOL CALLBACK InitCryptoCallback(PINIT_ONCE InitOnce, PVOID Parameter, PVOID *Co
     SSL_CTX_set_min_proto_version(g_ssl_ctx, TLS1_2_VERSION);
     SSL_CTX_set_max_proto_version(g_ssl_ctx, TLS1_3_VERSION);
     
-    // 使用 Chrome 常用加密套件列表
     const char *chrome_ciphers = "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-RSA-AES128-SHA";
     SSL_CTX_set_cipher_list(g_ssl_ctx, chrome_ciphers);
     SSL_CTX_set_options(g_ssl_ctx, SSL_OP_NO_COMPRESSION | SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION);
     SSL_CTX_set_session_cache_mode(g_ssl_ctx, SSL_SESS_CACHE_CLIENT);
 
-    // [New] 注册自定义 Padding 扩展 (替换 SSL_set_block_padding)
-    // 兼容 BoringSSL 和标准 OpenSSL，手动控制 ClientHello 大小
-    // SSL_EXT_CLIENT_HELLO 确保仅在 ClientHello 中添加
-    if (!SSL_CTX_add_custom_ext(g_ssl_ctx, TLSEXT_TYPE_padding, SSL_EXT_CLIENT_HELLO,
-                                padding_add_cb, padding_free_cb, NULL, NULL, NULL)) {
+    // [Fix] 使用 BoringSSL 兼容的函数注册自定义扩展
+    // SSL_CTX_add_client_custom_ext 专门用于客户端，不需要 SSL_EXT_CLIENT_HELLO 标志
+    if (!SSL_CTX_add_client_custom_ext(g_ssl_ctx, TLSEXT_TYPE_padding,
+                                       padding_add_cb, padding_free_cb, NULL,
+                                       NULL, NULL)) {
         log_msg("[Warn] Failed to register Padding extension callback");
     }
 
@@ -253,7 +252,7 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
         }
     }
 
-    // [Refactor] 传递配置给回调函数使用，移除旧的 SSL_set_block_padding
+    // [Config] 传递配置给回调函数使用
     if (settings) {
         SSL_set_app_data(ctx->ssl, (void*)settings);
     }
@@ -279,7 +278,7 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
     return 0;
 }
 
-// ... (tls_write, tls_read... 保持不变) ...
+// ... (以下 tls_write, tls_read 保持不变)
 int tls_write(TLSContext *ctx, const char *data, int len) {
     if (!ctx || !ctx->ssl) return -1;
     int written = 0;
