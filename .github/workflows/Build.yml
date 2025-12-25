@@ -32,14 +32,20 @@ jobs:
           path: openssl_dist
           key: openssl-ech-${{ runner.os }}-v1 # 固定版本 Key
 
-      - name: Build OpenSSL with ECH
-        if: steps.cache-openssl.outputs.cache-hit != 'true'
+      - name: Building OpenSSL (This will only run once)
         shell: msys2 {0}
+        if: steps.cache-openssl.outputs.cache-hit != 'true'
         run: |
           echo "Building OpenSSL (This will only run once)..."
           git clone --depth 1 https://github.com/defo-project/openssl.git openssl-ech
           cd openssl-ech
-          ./Configure mingw64 no-shared enable-ech --prefix=${GITHUB_WORKSPACE}/openssl_dist -D__int64="long long"
+          # 1. 還原 Configure 指令 (移除 -D__int64...)
+           ./Configure mingw64 no-shared enable-ech --prefix=${GITHUB_WORKSPACE}/openssl_dist
+        
+          # 2. [新增] 使用 sed 直接修復 e_os2.h 中的類型定義
+          sed -i 's/typedef __int64 ossl_ssize_t;/typedef long long ossl_ssize_t;/g' include/openssl/e_os2.h
+        
+          # 3. 繼續執行編譯
           mingw32-make -j8
           mingw32-make install_sw
 
