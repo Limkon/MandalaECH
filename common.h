@@ -34,8 +34,7 @@
 #include <wininet.h>
 
 // --- 2. 引入资源头文件 (解决重定义警告) ---
-// [Fix] 必须包含此文件以获取 GUI 控件 ID (ID_CHK_FRAG 等)
-// 确保 common.h 中的 ID 与 resource.rc 使用的 ID 一致
+// 必须包含此文件以获取 GUI 控件 ID (ID_CHK_FRAG 等)
 #include "resource.h"
 
 // --- 3. 清理 Windows 宏污染 ---
@@ -90,7 +89,7 @@
 #define WM_LOG_UPDATE (WM_USER + 2)
 #define WM_REFRESH_NODELIST (WM_USER + 50)
 
-// Command IDs (这些通常不在 resource.h 中，保留)
+// Command IDs
 #define ID_TRAY_EXIT 1001
 #define ID_TRAY_AUTORUN 1002
 #define ID_TRAY_SYSTEM_PROXY 1003
@@ -102,15 +101,25 @@
 #define ID_GLOBAL_HOTKEY 9001
 #define ID_TRAY_NODE_BASE 2000
 
-// [Fix] 下面的 ID 已在 resource.h 中定义，此处移除以消除警告
-// ID_LOGVIEWER_EDIT, ID_LOG_CHK, ID_NODEMGR_... 等已由 #include "resource.h" 提供
-
-// ECH 设置控件 ID (如果在 resource.h 中未定义，则保留；如果未来报错重定义，请删除)
+// ECH 设置控件 ID
 #define ID_CHK_ECH         7022
 #define ID_EDIT_ECH_SERVER 7023
 #define ID_EDIT_ECH_DOMAIN 7024
 
 // --- 结构体定义 ---
+
+// [修复] 补充抗封锁配置结构体，解决 proxy.c 和 crypto.c 的编译错误
+typedef struct {
+    BOOL enableFragment;
+    int fragMin;
+    int fragMax;
+    int fragDelay;
+    BOOL enablePadding;
+    int padMin;
+    int padMax;
+    BOOL enableChromeCiphers;
+} CryptoSettings;
+
 typedef struct { 
     SOCKET sock; 
     SSL *ssl; 
@@ -152,7 +161,7 @@ extern WNDPROC g_oldListBoxProc;
 extern int g_nEditScrollPos;
 extern int g_nEditContentHeight;
 
-// 抗封锁配置
+// 抗封锁配置全局变量
 extern BOOL g_enableChromeCiphers;
 extern BOOL g_enableALPN;
 extern BOOL g_enableFragment;
@@ -176,6 +185,12 @@ extern const char* UA_TEMPLATES[];
 extern BOOL g_enableLog;
 
 extern CRITICAL_SECTION g_configLock; 
+
+// --- 函数原型声明 ---
+
+// [修复] 补充 log_msg 声明，解决多处隐式调用错误
+void log_msg(const char* fmt, ...);
+
 void InitGlobalLocks();
 void DeleteGlobalLocks();
 
