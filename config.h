@@ -28,6 +28,7 @@ extern int g_subCount;
 // 新增：订阅更新配置全局变量
 extern int g_subUpdateMode;      // 更新模式: 0=每天, 1=每周, 2=自定义
 extern int g_subUpdateInterval;  // 自定义间隔（单位：小时）
+extern long long g_lastUpdateTime; // 新增：上次更新时间戳
 
 // 函数声明
 void LoadSettings();
