@@ -9,25 +9,24 @@
 #include <wininet.h>
 #include <ctype.h> 
 
-// [BoringSSL] 引入 SSL 头文件
+// 引入 OpenSSL/BoringSSL 头文件
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 
 #include "crypto.h"
 #include "common.h"
 #include "gui.h" 
-#include "cJSON.h" // 必须引用 cJSON 以解析 DoH 响应
+#include "cJSON.h" 
 
-// 链接必要的系统库
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "wininet.lib")
 
-// [优化] 全局复用 SSL_CTX，避免每次请求都初始化，显著降低 CPU 占用
+// 全局 SSL_CTX 复用，避免每次请求都初始化，降低 CPU 占用
 static SSL_CTX* g_utils_ctx = NULL;
 
 // --------------------------------------------------------------------------
-// 辅助函数：系统版本判断
+// 基础工具函数：系统版本判断
 // --------------------------------------------------------------------------
 BOOL IsWindows8OrGreater() {
     HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
@@ -41,7 +40,6 @@ BOOL IsWindows8OrGreater() {
 // --------------------------------------------------------------------------
 // 日志系统实现
 // --------------------------------------------------------------------------
-
 void log_msg(const char *format, ...) {
     // 如果未开启日志且不是致命错误，则直接返回
     if (!g_enableLog && strstr(format, "[Fatal]") == NULL) {
@@ -52,37 +50,29 @@ void log_msg(const char *format, ...) {
     char time_buf[64]; 
     SYSTEMTIME st; 
     
-    // 获取本地时间
     GetLocalTime(&st);
-    
-    // 格式化时间字符串
     snprintf(time_buf, sizeof(time_buf), "[%02d:%02d:%02d] ", st.wHour, st.wMinute, st.wSecond);
     
-    // 格式化日志内容
     va_list args; 
     va_start(args, format); 
     vsnprintf(buf, sizeof(buf) - 64, format, args); 
     va_end(args);
     
-    // 拼接最终日志
     char final_msg[2200]; 
     snprintf(final_msg, sizeof(final_msg), "%s%s\r\n", time_buf, buf);
     
-    // 输出到调试器 (DebugView 等工具可见)
+    // 输出到调试器
     OutputDebugStringA(final_msg);
     
-    // 输出到 GUI 日志窗口 (异步发送消息，防止界面卡顿)
+    // 发送消息给 GUI 日志窗口
     extern HWND hLogViewerWnd; 
-    
     if (hLogViewerWnd && IsWindow(hLogViewerWnd)) {
-        // 转换为宽字符以发送给 Unicode 窗口
         int wLen = MultiByteToWideChar(CP_UTF8, 0, final_msg, -1, NULL, 0);
         wchar_t* wBuf = (wchar_t*)malloc((wLen + 1) * sizeof(wchar_t));
         
         if (wBuf) {
             MultiByteToWideChar(CP_UTF8, 0, final_msg, -1, wBuf, wLen);
             wBuf[wLen] = 0;
-            // 发送自定义消息更新 UI，接收方负责 free(wBuf)
             PostMessageW(hLogViewerWnd, WM_LOG_UPDATE, 0, (LPARAM)wBuf);
         }
     }
@@ -91,32 +81,24 @@ void log_msg(const char *format, ...) {
 // --------------------------------------------------------------------------
 // 文件 IO 操作
 // --------------------------------------------------------------------------
-
 BOOL ReadFileToBuffer(const wchar_t* filename, char** buffer, long* size) {
     FILE* f = _wfopen(filename, L"rb");
-    if (!f) {
-        return FALSE;
-    }
+    if (!f) return FALSE;
     
-    // 获取文件大小
     fseek(f, 0, SEEK_END);
     long fsize = ftell(f);
     fseek(f, 0, SEEK_SET);
     
-    // 分配内存
     *buffer = (char*)malloc(fsize + 1);
     if (!*buffer) { 
         fclose(f); 
         return FALSE; 
     }
     
-    // 读取内容
     fread(*buffer, 1, fsize, f);
-    (*buffer)[fsize] = 0; // 确保字符串结束符
+    (*buffer)[fsize] = 0; 
     
-    if (size) {
-        *size = fsize;
-    }
+    if (size) *size = fsize;
     
     fclose(f);
     return TRUE;
@@ -124,9 +106,7 @@ BOOL ReadFileToBuffer(const wchar_t* filename, char** buffer, long* size) {
 
 BOOL WriteBufferToFile(const wchar_t* filename, const char* buffer) {
     FILE* f = _wfopen(filename, L"wb");
-    if (!f) {
-        return FALSE;
-    }
+    if (!f) return FALSE;
     
     size_t len = strlen(buffer);
     fwrite(buffer, 1, len, f);
@@ -138,14 +118,11 @@ BOOL WriteBufferToFile(const wchar_t* filename, const char* buffer) {
 // --------------------------------------------------------------------------
 // 字符串处理工具
 // --------------------------------------------------------------------------
-
 void TrimString(char* str) {
     if (!str) return;
     
     char* p = str;
-    char* pEnd;
-    
-    // 去除头部空白
+    // 去除头部
     while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
         p++;
     }
@@ -154,14 +131,13 @@ void TrimString(char* str) {
         memmove(str, p, strlen(p) + 1);
     }
     
-    // 去除尾部空白
-    pEnd = str + strlen(str) - 1;
+    // 去除尾部
+    char* pEnd = str + strlen(str) - 1;
     while (pEnd >= str && (*pEnd == ' ' || *pEnd == '\t' || *pEnd == '\r' || *pEnd == '\n')) {
         *pEnd-- = 0;
     }
 }
 
-// URL 解码 (%xx -> char)
 void UrlDecode(char* dst, const char* src) {
     char a, b;
     while (*src) {
@@ -198,19 +174,17 @@ char* GetQueryParam(const char* query, const char* key) {
     const char* p = strstr(query, search);
     if (!p) return NULL;
     
-    // 防止匹配到类似 "abckey=" 的情况，确保是完整单词或开头
+    // 确保匹配完整单词
     if (p != query && *(p-1) != '&' && *(p-1) != '?') {
         return NULL; 
     }
     
     p += strlen(search);
     
-    // 查找值的结束位置：& 或 # 或 字符串结尾
     const char* end_amp = strchr(p, '&');
     const char* end_hash = strchr(p, '#');
     const char* end = NULL;
 
-    // 取最早出现的结束符
     if (end_amp && end_hash) end = (end_amp < end_hash) ? end_amp : end_hash;
     else if (end_amp) end = end_amp;
     else if (end_hash) end = end_hash;
@@ -229,9 +203,8 @@ char* GetQueryParam(const char* query, const char* key) {
 }
 
 // --------------------------------------------------------------------------
-// Base64 解码实现
+// Base64 解码实现 (用于 ECH 解析)
 // --------------------------------------------------------------------------
-
 static const int b64_table[] = {
     -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
     -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
@@ -248,16 +221,11 @@ unsigned char* Base64Decode(const char* input, size_t* out_len) {
     size_t out_size = len / 4 * 3;
     unsigned char* out = (unsigned char*)malloc(out_size + 1);
     
-    if (!out) {
-        return NULL;
-    }
+    if (!out) return NULL;
     
     size_t i = 0, j = 0;
     while (i < len) {
-        if (input[i] == '\r' || input[i] == '\n') { 
-            i++; 
-            continue; 
-        } 
+        if (input[i] == '\r' || input[i] == '\n') { i++; continue; } 
         if (input[i] == '=') break; 
         
         unsigned char a = (unsigned char)input[i];
@@ -285,58 +253,44 @@ unsigned char* Base64Decode(const char* input, size_t* out_len) {
     }
     
     out[j] = 0;
-    if (out_len) {
-        *out_len = j;
-    }
+    if (out_len) *out_len = j;
     return out;
 }
 
 // --------------------------------------------------------------------------
-// ECH (Encrypted Client Hello) 辅助实现 [新增]
+// ECH (Encrypted Client Hello) 解析实现 (最新修复版：支持 Hex 和 ech="...")
 // --------------------------------------------------------------------------
 
-// 辅助：十六进制字符串转二进制
 static int HexToBin(const char* hex, unsigned char* out, int max_len) {
     int len = 0;
     while (*hex && len < max_len) {
         char c = *hex;
         int val = 0;
-        // 跳过非 hex 字符 (如空格, \x 等)
         if (!isxdigit(c)) { hex++; continue; }
-
         if (c >= '0' && c <= '9') val = c - '0';
         else if (c >= 'a' && c <= 'f') val = c - 'a' + 10;
         else if (c >= 'A' && c <= 'F') val = c - 'A' + 10;
-        
-        hex++;
-        if (!*hex) break; // 奇数长度，不完整，停止
-        
-        char c2 = *hex;
-        int val2 = 0;
+        hex++; if (!*hex) break; 
+        char c2 = *hex; int val2 = 0;
         if (c2 >= '0' && c2 <= '9') val2 = c2 - '0';
         else if (c2 >= 'a' && c2 <= 'f') val2 = c2 - 'a' + 10;
         else if (c2 >= 'A' && c2 <= 'F') val2 = c2 - 'A' + 10;
-        
-        out[len++] = (val << 4) | val2;
-        hex++;
+        out[len++] = (val << 4) | val2; hex++;
     }
     return len;
 }
 
-// 通过 DoH 获取 ECH 配置 (Type 65 / HTTPS Record)
-// 依赖 cJSON 解析 DoH 的 JSON 响应
 unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t* out_len) {
     if (!domain || !doh_server) return NULL;
 
-    // 构造 DoH 查询 URL
-    // 支持 Google/Cloudflare 格式: ?name=DOM&type=HTTPS
     char url[1024];
-    snprintf(url, sizeof(url), "%s?name=%s&type=HTTPS", doh_server, domain);
+    // 使用 type=65 查询 HTTPS 记录
+    snprintf(url, sizeof(url), "%s?name=%s&type=65", doh_server, domain);
 
     log_msg("[ECH] Querying %s for %s", doh_server, domain);
     char* json_str = Utils_HttpGet(url);
     if (!json_str) {
-        log_msg("[ECH] DoH request failed.");
+        log_msg("[ECH] DoH request failed (Network error).");
         return NULL;
     }
 
@@ -359,48 +313,65 @@ unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t
             if (type && type->valueint == 65) { 
                 cJSON* data = cJSON_GetObjectItem(record, "data");
                 if (data && data->valuestring) {
-                    // data 格式通常为: "\# <len> <hex string>" 或纯 hex
                     const char* data_str = data->valuestring;
-                    unsigned char rdata[4096];
-                    int rdata_len = HexToBin(data_str, rdata, sizeof(rdata));
-                    
-                    if (rdata_len > 0) {
-                        // 解析 RFC 9460 HTTPS RDATA
-                        // Format: Priority(2) + TargetName(var) + Params(var)
-                        int p = 0;
-                        if (rdata_len < 2) continue;
-                        
-                        // 跳过 Priority
-                        p += 2; 
+                    log_msg("[ECH] Found Type 65: %.64s...", data_str); 
 
-                        // 跳过 TargetName (DNS Wire Format)
-                        // 遇到 0x00 结束，或按照 label length 跳转
-                        while (p < rdata_len) {
-                            int label_len = rdata[p++];
-                            if (label_len == 0) break; // root label
-                            p += label_len;
-                        }
-
-                        // 解析 Params
-                        // Format: Key(2) + Len(2) + Value(Len)
-                        while (p + 4 <= rdata_len) {
-                            int key = (rdata[p] << 8) | rdata[p+1];
-                            int len = (rdata[p+2] << 8) | rdata[p+3];
-                            p += 4;
-
-                            // ECH Config Key = 5
-                            if (key == 5) { 
-                                if (p + len <= rdata_len) {
-                                    ech_config = (unsigned char*)malloc(len);
-                                    if (ech_config) {
-                                        memcpy(ech_config, rdata + p, len);
-                                        *out_len = len;
-                                        log_msg("[ECH] Found config (len=%d)", len);
-                                    }
+                    // 策略 1: [关键] 解析 Presentation Format (ech="...")
+                    // 支持 Cloudflare/AliDNS 返回的格式
+                    const char* ech_pos = strstr(data_str, "ech=\"");
+                    if (ech_pos) {
+                        ech_pos += 5; // 跳过 ech="
+                        const char* end_quote = strchr(ech_pos, '\"');
+                        if (end_quote) {
+                            size_t b64_len = end_quote - ech_pos;
+                            char* b64_str = (char*)malloc(b64_len + 1);
+                            if (b64_str) {
+                                strncpy(b64_str, ech_pos, b64_len);
+                                b64_str[b64_len] = 0;
+                                
+                                // 解码 Base64 得到二进制 Config
+                                ech_config = Base64Decode(b64_str, out_len);
+                                free(b64_str);
+                                
+                                if (ech_config) {
+                                    log_msg("[ECH] Success: Parsed ech=\"...\" (len=%d)", *out_len);
+                                    break; 
                                 }
-                                break; // 找到即停止
                             }
-                            p += len;
+                        }
+                    }
+
+                    // 策略 2: 解析 Hex 格式 (RFC 3597 style)
+                    if (!ech_config) {
+                        unsigned char rdata[4096];
+                        int rdata_len = HexToBin(data_str, rdata, sizeof(rdata));
+                        
+                        if (rdata_len > 5) { 
+                            int p = 2; // Priority
+                            // 跳过 TargetName
+                            while (p < rdata_len) {
+                                int label_len = rdata[p++];
+                                if (label_len == 0) break; 
+                                p += label_len;
+                            }
+                            // 解析 Params
+                            while (p + 4 <= rdata_len) {
+                                int key = (rdata[p] << 8) | rdata[p+1];
+                                int len = (rdata[p+2] << 8) | rdata[p+3];
+                                p += 4;
+                                if (key == 5) { // ECH Config Key
+                                    if (p + len <= rdata_len) {
+                                        ech_config = (unsigned char*)malloc(len);
+                                        if (ech_config) {
+                                            memcpy(ech_config, rdata + p, len);
+                                            *out_len = len;
+                                            log_msg("[ECH] Success: Parsed Hex (len=%d)", len);
+                                        }
+                                    }
+                                    break; 
+                                }
+                                p += len;
+                            }
                         }
                     }
                 }
@@ -419,10 +390,10 @@ unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t
 // 网络请求与 HTTPS 实现
 // --------------------------------------------------------------------------
 
-typedef struct {
-    char host[256];
-    int port;
-    char path[1024];
+typedef struct { 
+    char host[256]; 
+    int port; 
+    char path[1024]; 
 } URL_COMPONENTS_SIMPLE;
 
 static BOOL ParseUrl(const char* url, URL_COMPONENTS_SIMPLE* out) {
@@ -439,15 +410,13 @@ static BOOL ParseUrl(const char* url, URL_COMPONENTS_SIMPLE* out) {
         out->port = 443; 
     }
     else {
-        return FALSE; // 暂不支持其他协议
+        return FALSE; 
     }
     
     const char* slash = strchr(p, '/');
     int hostLen = slash ? (int)(slash - p) : (int)strlen(p);
     
-    if (hostLen >= sizeof(out->host)) {
-        return FALSE;
-    }
+    if (hostLen >= sizeof(out->host)) return FALSE;
     
     strncpy(out->host, p, hostLen);
     out->host[hostLen] = 0;
@@ -459,9 +428,7 @@ static BOOL ParseUrl(const char* url, URL_COMPONENTS_SIMPLE* out) {
     }
     
     if (slash) {
-        if (strlen(slash) >= sizeof(out->path)) {
-            return FALSE;
-        }
+        if (strlen(slash) >= sizeof(out->path)) return FALSE;
         strcpy(out->path, slash);
     } else {
         strcpy(out->path, "/");
@@ -469,23 +436,13 @@ static BOOL ParseUrl(const char* url, URL_COMPONENTS_SIMPLE* out) {
     return TRUE;
 }
 
-// [优化] 内部 HTTPS GET 实现 (使用全局 CTX + SNI)
-// 包含完整的 DNS 解析、Socket 连接、SSL 握手和 HTTP 协议处理
 static char* InternalHttpsGet(const char* url) {
     URL_COMPONENTS_SIMPLE u;
-    if (!ParseUrl(url, &u)) {
-        log_msg("[Utils] Invalid URL format: %s", url);
-        return NULL;
-    }
+    if (!ParseUrl(url, &u)) return NULL;
 
-    // [优化点] 惰性初始化全局工具 CTX
     if (!g_utils_ctx) {
         g_utils_ctx = SSL_CTX_new(TLS_client_method());
-        if (!g_utils_ctx) {
-             log_msg("[Utils] SSL_CTX init failed");
-             return NULL;
-        }
-        // 订阅下载通常不进行严格的证书校验 (兼容自签名或 CDN)
+        if (!g_utils_ctx) return NULL;
         SSL_CTX_set_verify(g_utils_ctx, SSL_VERIFY_NONE, NULL);
     }
 
@@ -495,148 +452,84 @@ static char* InternalHttpsGet(const char* url) {
     struct addrinfo hints, *res = NULL;
     
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC; // 支持 IPv4/IPv6
+    hints.ai_family = AF_UNSPEC; 
     hints.ai_socktype = SOCK_STREAM;
+    char portStr[16]; snprintf(portStr, 16, "%d", u.port);
     
-    char portStr[16]; 
-    snprintf(portStr, 16, "%d", u.port);
-    
-    // 1. DNS 解析
-    if (getaddrinfo(u.host, portStr, &hints, &res) != 0) {
-        log_msg("[Utils] DNS resolution failed: %s", u.host);
-        return NULL;
-    }
-    
-    // 2. 创建 Socket
+    if (getaddrinfo(u.host, portStr, &hints, &res) != 0) return NULL;
     s = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (s == INVALID_SOCKET) {
-        freeaddrinfo(res);
-        log_msg("[Utils] Socket creation failed");
-        return NULL;
-    }
+    if (s == INVALID_SOCKET) { freeaddrinfo(res); return NULL; }
     
-    // 设置超时 (5秒)，防止网络卡死
     DWORD timeout = 5000;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
     setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
 
-    // 3. 建立 TCP 连接
     if (connect(s, res->ai_addr, (int)res->ai_addrlen) != 0) {
-        log_msg("[Utils] Connection failed: %s", u.host);
-        closesocket(s);
-        freeaddrinfo(res);
-        return NULL;
+        closesocket(s); freeaddrinfo(res); return NULL;
     }
     freeaddrinfo(res);
 
-    // 4. 初始化 SSL 对象
     ssl = SSL_new(g_utils_ctx);
-    if (!ssl) { 
-        closesocket(s); 
-        return NULL; 
-    }
-    
+    if (!ssl) { closesocket(s); return NULL; }
     SSL_set_fd(ssl, (int)s);
-    
-    // [关键修复] 设置 SNI (Server Name Indication)
-    // 这是访问 Cloudflare 等 CDN 后端服务的必要条件
     SSL_set_tlsext_host_name(ssl, u.host);
 
-    // 5. 执行 SSL 握手
     if (SSL_connect(ssl) != 1) {
-        log_msg("[Utils] SSL Handshake failed: %s", u.host);
-        goto cleanup;
+        if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); }
+        closesocket(s);
+        return NULL;
     }
 
-    // 6. 发送 HTTP GET 请求
-    // [Fix] 添加 Accept: application/dns-json 头，修复 DoH 响应无效问题
     char req[2048];
+    // [Fix] Accept: application/dns-json 是关键
     snprintf(req, sizeof(req), 
         "GET %s HTTP/1.1\r\n"
         "Host: %s\r\n"
         "User-Agent: Mandala-Client/1.0\r\n"
-        "Accept: application/dns-json\r\n"
+        "Accept: application/dns-json\r\n" 
         "Connection: close\r\n\r\n", 
         u.path, u.host);
         
-    if (SSL_write(ssl, req, strlen(req)) <= 0) {
-        log_msg("[Utils] Failed to send request");
-        goto cleanup;
-    }
+    if (SSL_write(ssl, req, strlen(req)) <= 0) goto cleanup;
 
-    // 7. 读取响应数据
-    int total_cap = 65536; // 初始分配 64KB
+    int total_cap = 65536; 
     int total_len = 0;
     char* buf = (char*)malloc(total_cap);
-    
-    if (!buf) {
-        goto cleanup;
-    }
+    if (!buf) goto cleanup;
 
     while (1) {
-        // 检查缓冲区是否需要扩容
         if (total_len >= total_cap - 1024) {
             total_cap *= 2;
             char* new_buf = (char*)realloc(buf, total_cap);
-            if (!new_buf) { 
-                free(buf); 
-                buf = NULL; 
-                goto cleanup; 
-            }
+            if (!new_buf) { free(buf); buf = NULL; goto cleanup; }
             buf = new_buf;
         }
-        
         int n = SSL_read(ssl, buf + total_len, total_cap - total_len - 1);
-        if (n <= 0) {
-            break; // 读取完毕或出错
-        }
+        if (n <= 0) break;
         total_len += n;
     }
-    
-    if (buf) {
-        buf[total_len] = 0; // 确保以 Null 结尾
-    }
+    if (buf) buf[total_len] = 0;
 
-    // 8. 解析 HTTP Body (跳过 Header)
     char* body = strstr(buf, "\r\n\r\n");
-    if (body) {
-        body += 4;
-        result = strdup(body);
-        free(buf);
-    } else {
-        // 如果没找到头分隔符，可能只有 body 或者数据异常，这里选择返回全部数据
-        result = buf; 
-    }
+    if (body) { body += 4; result = strdup(body); free(buf); } 
+    else { result = buf; }
 
 cleanup:
-    // 清理资源
-    if (ssl) { 
-        SSL_shutdown(ssl); 
-        SSL_free(ssl); 
-    }
-    if (s != INVALID_SOCKET) {
-        closesocket(s);
-    }
-    // [注意] g_utils_ctx 不释放，留给下次复用
-    
+    if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); }
+    if (s != INVALID_SOCKET) closesocket(s);
     return result;
 }
 
 char* Utils_HttpGet(const char* url) {
-    if (!url || strncmp(url, "http", 4) != 0) {
-        return NULL;
-    }
+    if (!url || strncmp(url, "http", 4) != 0) return NULL;
     return InternalHttpsGet(url);
 }
 
 // --------------------------------------------------------------------------
 // 剪贴板操作
 // --------------------------------------------------------------------------
-
 char* GetClipboardText() {
-    if (!OpenClipboard(NULL)) {
-        return NULL;
-    }
+    if (!OpenClipboard(NULL)) return NULL;
     
     HANDLE hData = GetClipboardData(CF_TEXT);
     if (!hData) { 
@@ -659,30 +552,23 @@ char* GetClipboardText() {
 }
 
 // --------------------------------------------------------------------------
-// 系统代理设置 (重写，完全参考 sing.c 逻辑修复 BUG)
+// 系统代理设置 (完整实现)
 // --------------------------------------------------------------------------
-
 void SetSystemProxy(BOOL enable) {
     extern int g_localPort;
-    if (g_localPort <= 0) g_localPort = 1080; // 防止端口未初始化
+    if (g_localPort <= 0) g_localPort = 1080; 
 
     wchar_t proxyServerString[256] = {0};
     wchar_t proxyBypassString[64] = L"<local>";
     
-    // 构造代理字符串
-    if (enable) {
-        swprintf_s(proxyServerString, 256, L"127.0.0.1:%d", g_localPort);
-    }
+    if (enable) swprintf_s(proxyServerString, 256, L"127.0.0.1:%d", g_localPort);
 
-    // 分支 1: Windows 8 或更高版本 (使用注册表)
+    // 分支 1: Windows 8 或更高版本 (使用注册表，更稳定)
     if (IsWindows8OrGreater()) {
         HKEY hKey;
-        // [Fix] 删除已被宏定义的变量声明 REG_PATH_PROXY
-        // const wchar_t* REG_PATH_PROXY = L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
-        
-        // 使用 RegCreateKeyExW 确保键存在且可写 (直接使用 common.h 中的 REG_PATH_PROXY 宏)
+        // 使用 common.h 中的 REG_PATH_PROXY
         if (RegCreateKeyExW(HKEY_CURRENT_USER, REG_PATH_PROXY, 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) != ERROR_SUCCESS) {
-            log_msg("[Proxy] Failed to open registry key for writing.");
+            log_msg("[Proxy] Failed to open registry key.");
             return;
         }
 
@@ -691,12 +577,10 @@ void SetSystemProxy(BOOL enable) {
             RegSetValueExW(hKey, L"ProxyEnable", 0, REG_DWORD, (const BYTE*)&dwEnable, sizeof(dwEnable));
             RegSetValueExW(hKey, L"ProxyOverride", 0, REG_SZ, (const BYTE*)proxyBypassString, (wcslen(proxyBypassString) + 1) * sizeof(wchar_t));
             RegSetValueExW(hKey, L"ProxyServer", 0, REG_SZ, (const BYTE*)proxyServerString, (wcslen(proxyServerString) + 1) * sizeof(wchar_t));
-            // 显式删除 SocksProxyServer 防止冲突
             RegDeleteValueW(hKey, L"SocksProxyServer"); 
         } else {
             DWORD dwEnable = 0;
             RegSetValueExW(hKey, L"ProxyEnable", 0, REG_DWORD, (const BYTE*)&dwEnable, sizeof(dwEnable));
-            // 关闭时显式清空 ProxyServer，防止残留
             RegSetValueExW(hKey, L"ProxyServer", 0, REG_SZ, (const BYTE*)L"", sizeof(wchar_t));
             RegDeleteValueW(hKey, L"SocksProxyServer");
         }
@@ -727,19 +611,13 @@ void SetSystemProxy(BOOL enable) {
         list.dwOptionCount = 3;
         list.dwOptionError = 0;
         list.pOptions = options;
-        
-        if (!InternetSetOptionW(NULL, INTERNET_OPTION_PER_CONNECTION_OPTION, &list, dwBufSize)) {
-            log_msg("[Proxy] InternetSetOptionW (Legacy) failed.");
-        }
+        InternetSetOptionW(NULL, INTERNET_OPTION_PER_CONNECTION_OPTION, &list, dwBufSize);
     }
-
-    // 无论哪个分支，最后都刷新系统设置，确保生效
+    // 刷新系统设置
     InternetSetOptionW(NULL, INTERNET_OPTION_SETTINGS_CHANGED, NULL, 0);
     InternetSetOptionW(NULL, INTERNET_OPTION_REFRESH, NULL, 0);
 }
 
-// [Fix] 修复 IsSystemProxyEnabled 逻辑，增加端口检查
-// 防止因端口变更或外部软件残留设置导致的开启状态误判
 BOOL IsSystemProxyEnabled() {
     extern int g_localPort;
     BOOL isEnabled = FALSE;
@@ -749,22 +627,14 @@ BOOL IsSystemProxyEnabled() {
     wchar_t proxyServer[1024] = {0};
     DWORD dwProxySize = sizeof(proxyServer);
     
-    // [Fix] 使用 common.h 中定义的 REG_PATH_PROXY 宏，保持统一
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_PATH_PROXY, 
-        0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-        
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_PATH_PROXY, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
         if (RegQueryValueExW(hKey, L"ProxyEnable", NULL, NULL, (LPBYTE)&dwEnable, &dwSize) == ERROR_SUCCESS) {
             if (dwEnable == 1) {
-                // 仅当 ProxyEnable=1 时，进一步检查端口是否匹配
+                // 仅当 ProxyEnable=1 时，检查 ProxyServer 是否匹配当前端口
                 if (RegQueryValueExW(hKey, L"ProxyServer", NULL, NULL, (LPBYTE)proxyServer, &dwProxySize) == ERROR_SUCCESS) {
                     wchar_t expected[64];
                     swprintf_s(expected, 64, L"127.0.0.1:%d", g_localPort);
-                    
-                    // 检查注册表中的代理字符串是否包含当前程序的代理地址
-                    // 这样可以避免误识别其他代理软件（如 Clash）的设置，解决“取消后无法开启”的问题
-                    if (wcsstr(proxyServer, expected) != NULL) {
-                        isEnabled = TRUE;
-                    }
+                    if (wcsstr(proxyServer, expected) != NULL) isEnabled = TRUE;
                 }
             }
         }
