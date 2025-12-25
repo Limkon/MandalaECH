@@ -8,7 +8,7 @@
 #define _UNICODE
 #endif
 
-// [Fix] 添加宏定义检查，防止与系统头文件冲突导致的重定义警告
+// 防止旧版 SDK 警告
 #ifndef _WIN32_IE
 #define _WIN32_IE 0x0601
 #endif
@@ -17,29 +17,64 @@
 #define _WIN32_WINNT 0x0601
 #endif
 
+// 减少 Windows 头文件包含的内容
 #define WIN32_LEAN_AND_MEAN
 
-// [Fix] 关键修复：定义 NOCRYPT 禁止 windows.h 包含 wincrypt.h
-// 这解决了与 BoringSSL/OpenSSL 中 X509_NAME, OCSP_RESPONSE 等符号的冲突
+// 尝试阻止 windows.h 包含 wincrypt.h
 #define NOCRYPT 
 
 #define MAX_CONNECTIONS 512
 
+// --- 1. Windows 系统头文件 (必须先包含) ---
 #include <windows.h>
 #include <shellapi.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <commctrl.h>
 #include <shlobj.h>
+#include <wininet.h>
+
+// --- 2. [关键修复] 强制清理 Windows 宏污染 ---
+// 即使定义了 NOCRYPT，某些环境仍可能引入这些与 OpenSSL/BoringSSL 冲突的宏。
+// 必须在包含 OpenSSL 头文件之前手动 undef 它们。
+
+#ifdef X509_NAME
+#undef X509_NAME
+#endif
+
+#ifdef X509_EXTENSIONS
+#undef X509_EXTENSIONS
+#endif
+
+#ifdef X509_CERT_PAIR
+#undef X509_CERT_PAIR
+#endif
+
+#ifdef PKCS7_ISSUER_AND_SERIAL
+#undef PKCS7_ISSUER_AND_SERIAL
+#endif
+
+#ifdef PKCS7_SIGNER_INFO
+#undef PKCS7_SIGNER_INFO
+#endif
+
+#ifdef OCSP_REQUEST
+#undef OCSP_REQUEST
+#endif
+
+#ifdef OCSP_RESPONSE
+#undef OCSP_RESPONSE
+#endif
+
+// --- 3. 标准 C 头文件 ---
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
 #include <time.h>
 #include <ctype.h>
-#include <wininet.h>
 
-// OpenSSL Headers (BoringSSL 兼容 API)
+// --- 4. OpenSSL/BoringSSL 头文件 (现在是安全的) ---
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/bio.h>
@@ -52,10 +87,9 @@
 #define REG_PATH_PROXY L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings"
 #define CONFIG_FILE L"config.json"
 
-// [Refactor] 内存优化：分离 IO 缓冲区和最大帧限制
 // IO_BUFFER_SIZE: 用于 TCP 接收和初始 WebSocket 缓冲区 (16KB)
 #define IO_BUFFER_SIZE 16384 
-// MAX_WS_FRAME_SIZE: WebSocket 最大允许帧大小 (8MB)，用于防止内存耗尽攻击，但允许大文件传输
+// MAX_WS_FRAME_SIZE: WebSocket 最大允许帧大小 (8MB)
 #define MAX_WS_FRAME_SIZE 8388608 
 
 // Windows Messages
@@ -97,7 +131,7 @@
 #define ID_EDIT_PAD_MIN   7020
 #define ID_EDIT_PAD_MAX   7021
 
-// [新增] ECH 设置控件 ID
+// ECH 设置控件 ID
 #define ID_CHK_ECH         7022
 #define ID_EDIT_ECH_SERVER 7023
 #define ID_EDIT_ECH_DOMAIN 7024
@@ -169,10 +203,10 @@ extern int g_padSizeMax;
 extern int g_uaPlatformIndex; 
 extern char g_userAgentStr[512];
 
-// [新增] ECH 全局配置变量
+// ECH 全局配置变量
 extern BOOL g_enableECH;
-extern char g_echConfigServer[256]; // DoH Server
-extern char g_echPublicName[256];   // ECH Public Name (Cover SNI)
+extern char g_echConfigServer[256]; 
+extern char g_echPublicName[256];   
 
 extern const wchar_t* UA_PLATFORMS[];
 extern const char* UA_TEMPLATES[];
