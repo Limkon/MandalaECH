@@ -10,13 +10,17 @@
 #include <openssl/rand.h>
 #include <openssl/bio.h>
 
+// [Def] RFC 7685 Padding Extension Type
+#ifndef TLSEXT_TYPE_padding
+#define TLSEXT_TYPE_padding 21
+#endif
+
 // SSL_CTX *g_ssl_ctx = NULL; // [Fix] 已在 globals.c 定义，此处删除
 
 static BIO_METHOD *method_frag = NULL;
 static INIT_ONCE g_crypto_init_once = INIT_ONCE_STATIC_INIT;
 
 // ---------------------- BIO Fragmentation Implementation ----------------------
-// (保持原样)
 typedef struct {
     int first_packet_sent;
     int frag_min;
@@ -107,8 +111,51 @@ static long frag_ctrl(BIO *b, int cmd, long num, void *ptr) {
     return BIO_ctrl(next, cmd, num, ptr);
 }
 
+// ---------------------- Custom TLS Padding Implementation ----------------------
+// [Refactor] 不依赖 SSL_set_block_padding，手动实现 Padding 扩展
+
+// 回调：构造 Padding 扩展数据
+static int padding_add_cb(SSL *s, unsigned int ext_type, unsigned int context,
+                          const unsigned char **out, size_t *outlen, X509 *x, size_t chainidx,
+                          int *al, void *add_arg) {
+    // 1. 获取连接配置 (通过 SSL_set_app_data 传入)
+    CryptoSettings* settings = (CryptoSettings*)SSL_get_app_data(s);
+    
+    // 如果没有配置或未启用 Padding，则不添加扩展
+    if (!settings || !settings->enablePadding) return 0; 
+
+    // 2. 计算随机长度
+    int range = settings->padMax - settings->padMin;
+    if (range < 0) range = 0;
+    
+    unsigned char rnd_byte;
+    RAND_bytes(&rnd_byte, 1);
+    
+    int pad_len = settings->padMin + (range > 0 ? (rnd_byte % (range + 1)) : 0);
+    
+    // 长度检查：虽然 RFC 允许 0 长度，但通常是为了填充大小，太小无意义
+    if (pad_len <= 0) return 0;
+
+    // 3. 分配内存 (OpenSSL 会调用 free_cb 释放)
+    unsigned char* data = (unsigned char*)malloc(pad_len);
+    if (!data) return -1; // 内存分配失败，中止握手
+
+    // 4. 填充 0 (RFC 7685 要求必须填充 0x00)
+    memset(data, 0, pad_len);
+
+    *out = data;
+    *outlen = pad_len;
+    
+    return 1; // 成功添加扩展
+}
+
+// 回调：释放 Padding 扩展数据
+static void padding_free_cb(SSL *s, unsigned int ext_type, unsigned int context,
+                            const unsigned char *out, void *add_arg) {
+    if (out) free((void*)out);
+}
+
 // ---------------------- Initialization Logic ----------------------
-// (保持原样)
 BOOL CALLBACK InitCryptoCallback(PINIT_ONCE InitOnce, PVOID Parameter, PVOID *Context) {
     SSL_library_init(); 
     OpenSSL_add_all_algorithms(); 
@@ -137,6 +184,14 @@ BOOL CALLBACK InitCryptoCallback(PINIT_ONCE InitOnce, PVOID Parameter, PVOID *Co
     SSL_CTX_set_cipher_list(g_ssl_ctx, chrome_ciphers);
     SSL_CTX_set_options(g_ssl_ctx, SSL_OP_NO_COMPRESSION | SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION);
     SSL_CTX_set_session_cache_mode(g_ssl_ctx, SSL_SESS_CACHE_CLIENT);
+
+    // [New] 注册自定义 Padding 扩展 (替换 SSL_set_block_padding)
+    // 兼容 BoringSSL 和标准 OpenSSL，手动控制 ClientHello 大小
+    // SSL_EXT_CLIENT_HELLO 确保仅在 ClientHello 中添加
+    if (!SSL_CTX_add_custom_ext(g_ssl_ctx, TLSEXT_TYPE_padding, SSL_EXT_CLIENT_HELLO,
+                                padding_add_cb, padding_free_cb, NULL, NULL, NULL)) {
+        log_msg("[Warn] Failed to register Padding extension callback");
+    }
 
     HRSRC hRes = FindResourceW(NULL, MAKEINTRESOURCEW(2), RT_RCDATA);
     if (hRes) {
@@ -181,7 +236,6 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
     
     // [ECH 处理]
     if (g_enableECH) {
-        // [Fix] 优先使用配置的 ECH Public Name 作为查询对象
         const char* query_domain = (g_echPublicName && strlen(g_echPublicName)) ? g_echPublicName : (target_sni ? target_sni : target_host);
         
         size_t ech_len = 0;
@@ -199,22 +253,9 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
         }
     }
 
-    if (settings && settings->enablePadding) {
-        int range = settings->padMax - settings->padMin;
-        if (range < 0) range = 0;
-        unsigned char rnd; RAND_bytes(&rnd, 1);
-        int blockSize = settings->padMin + (range > 0 ? (rnd % (range + 1)) : 0);
-        
-        // [Fix] 仅在非 BoringSSL 环境下启用 Block Padding
-        // BoringSSL 不支持 SSL_set_block_padding，会直接忽略此设置
-        if (blockSize > 0) {
-        #if !defined(OPENSSL_IS_BORINGSSL)
-            SSL_set_block_padding(ctx->ssl, blockSize);
-        #else
-            // BoringSSL 下暂不支持记录层填充
-            (void)blockSize; // 避免未使用变量警告
-        #endif
-        }
+    // [Refactor] 传递配置给回调函数使用，移除旧的 SSL_set_block_padding
+    if (settings) {
+        SSL_set_app_data(ctx->ssl, (void*)settings);
     }
 
     BIO *bio = BIO_new_socket(ctx->sock, BIO_NOCLOSE);
