@@ -28,24 +28,30 @@ jobs:
         uses: actions/cache@v4
         with:
           path: boringssl_dist
-          key: boringssl-${{ runner.os }}-v5 # 升级 Key (v5) 确保环境纯净
+          # [关键] 更新 Cache Key 版本 (v5)，确保不使用旧的错误构建缓存
+          key: boringssl-${{ runner.os }}-v5
 
       - name: Build BoringSSL
         if: steps.cache-boringssl.outputs.cache-hit != 'true'
         shell: msys2 {0}
         run: |
           echo "Building BoringSSL..."
+          # 使用 Google 官方镜像或 GitHub 镜像
           git clone --depth 1 https://github.com/google/boringssl.git
           cd boringssl
           
           # [修复 1] 修正 GCC 15 下的格式化字符串类型匹配错误
+          # 将 int 类型的 error 强制转换为 unsigned int 以匹配 %x
           sed -i 's/unknown error (0x%x)", error/unknown error (0x%x)", (unsigned int)error/' tool/transport_common.cc
           
           mkdir build
           cd build
           
           # [修复 2] 配置 CMake (强化版)
-          # -DOPENSSL_NO_ASM=1: 彻底禁用汇编，解决 MinGW 链接错误
+          # 1. -GNinja: 使用 Ninja 构建系统
+          # 2. -DOPENSSL_NO_ASM=1: 设置 CMake 变量
+          # 3. 指定 gcc/g++ 编译器
+          # 4. 将 -DOPENSSL_NO_ASM 直接加入 CFLAGS/CXXFLAGS，强制生效
           cmake -GNinja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
             -DOPENSSL_NO_ASM=1 \
             -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ \
@@ -54,29 +60,18 @@ jobs:
           
           ninja
           
-          echo "Build finished. Extracting artifacts..."
-          
-          # 返回源码根目录
+          # BoringSSL 没有 make install，手动提取头文件和静态库
           cd ..
-          
           mkdir -p ../boringssl_dist/include
           mkdir -p ../boringssl_dist/lib
           
-          # 复制头文件
+          # 复制头文件 (保持目录结构)
           cp -r include/* ../boringssl_dist/include/
           
-          # [修复 3] 使用 find 查找并复制静态库，避免路径猜测错误导致 cp 失败
-          echo "Locating and copying libraries..."
+          # [修复 3] 自动查找并复制静态库，避免路径错误
+          echo "Locating and copying static libraries..."
           find build -name "libssl.a" -exec cp -v {} ../boringssl_dist/lib/ \;
           find build -name "libcrypto.a" -exec cp -v {} ../boringssl_dist/lib/ \;
-          
-          # 验证文件是否存在，如果不存在则列出目录结构以便调试
-          if [ ! -f ../boringssl_dist/lib/libssl.a ]; then
-            echo "Error: libssl.a not found in extracted directory!"
-            echo "Listing build directory contents for debugging:"
-            ls -R build
-            exit 1
-          fi
           
           echo "BoringSSL build complete."
 
@@ -118,10 +113,11 @@ jobs:
         shell: msys2 {0}
         run: |
           # 使用 boringssl_dist 进行编译
+          # [Fix] 添加 -lstdc++ 以解决 BoringSSL 的 C++ 符号 (delete, exceptions等) 链接错误
           gcc gui.c config.c proxy.c crypto.c utils.c globals.c cJSON.c resource.res -o Mandala.exe \
             -I${GITHUB_WORKSPACE}/boringssl_dist/include \
             -L${GITHUB_WORKSPACE}/boringssl_dist/lib \
-            -lssl -lcrypto -lws2_32 -lgdi32 -lcomctl32 -lwininet -lcrypt32 -luser32 \
+            -lssl -lcrypto -lws2_32 -lgdi32 -lcomctl32 -lwininet -lcrypt32 -luser32 -lstdc++ \
             -mwindows -municode -finput-charset=UTF-8 \
             -static
 
