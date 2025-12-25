@@ -537,24 +537,44 @@ int ImportFromClipboard() {
     return successCount;
 }
 
-// [修复] 解决订阅更新时的线程冲突与 Runtime 错误
+// [重构] 解决订阅更新时的线程冲突与 Runtime 错误 (重点修改函数)
 int UpdateAllSubscriptions(BOOL forceMsg) {
-    char subUrls[MAX_SUBS][512]; int count = 0;
+    // 1. 使用 malloc 替代大数组栈分配，防止 Stack Overflow
+    // char subUrls[MAX_SUBS][512]; -> 移至堆
+    char (*subUrls)[512] = (char (*)[512])malloc(MAX_SUBS * 512);
+    if (!subUrls) {
+        log_msg("[Error] 内存分配失败 (UpdateAllSubscriptions)");
+        return 0;
+    }
+
+    int count = 0;
     EnterCriticalSection(&g_configLock);
     for (int i = 0; i < g_subCount; i++) {
         if (g_subs[i].enabled && strlen(g_subs[i].url) > 4) {
-            strncpy(subUrls[count], g_subs[i].url, 511); subUrls[count][511]=0;
+            strncpy(subUrls[count], g_subs[i].url, 511); 
+            subUrls[count][511] = 0; // 确保 0 结尾
             count++;
         }
     }
     LeaveCriticalSection(&g_configLock);
-    if (count == 0) return 0;
+    
+    if (count == 0) {
+        free(subUrls);
+        return 0;
+    }
 
     char* rawData[MAX_SUBS] = {0}; 
     for (int i = 0; i < count; i++) {
         log_msg("[Sub] 正在下载 (%d/%d): %s", i+1, count, subUrls[i]);
+        // 增加对 Utils_HttpGet 返回值的保护
         rawData[i] = Utils_HttpGet(subUrls[i]);
+        if (!rawData[i]) {
+            log_msg("[Warn] 下载失败: %s", subUrls[i]);
+        }
     }
+    
+    // 释放 URL 缓存
+    free(subUrls);
 
     // 关键区：处理配置文件
     EnterCriticalSection(&g_configLock);
@@ -566,14 +586,22 @@ int UpdateAllSubscriptions(BOOL forceMsg) {
     if (!root) root = cJSON_CreateObject();
     
     // 彻底清除旧节点
-    cJSON_DeleteItemFromObject(root, "outbounds");
+    if (cJSON_HasObjectItem(root, "outbounds")) {
+        cJSON_DeleteItemFromObject(root, "outbounds");
+    }
     cJSON* outbounds = cJSON_CreateArray(); 
     cJSON_AddItemToObject(root, "outbounds", outbounds);
     
     int totalNewNodes = 0;
     for (int i = 0; i < count; i++) {
         if (rawData[i]) { 
-            totalNewNodes += Internal_BatchAddNodesFromText(rawData[i], outbounds); 
+            // 增加 try-catch 保护解析过程 (防止 Base64/JSON 解析崩溃)
+            __try {
+                totalNewNodes += Internal_BatchAddNodesFromText(rawData[i], outbounds); 
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) {
+                log_msg("[Error] 解析订阅内容时发生异常 (Index: %d)", i);
+            }
             free(rawData[i]); rawData[i] = NULL;
         }
     }
