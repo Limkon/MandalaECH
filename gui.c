@@ -12,7 +12,17 @@
 
 #pragma comment(lib, "comctl32.lib")
 
-// 单例窗口句柄
+// --- 全局变量声明 ---
+HWND hwnd = NULL;             // 主窗口句柄
+NOTIFYICONDATA nid = {0};     // 托盘图标
+HMENU hMenu = NULL;           // 托盘菜单
+HMENU hNodeSubMenu = NULL;    // 节点子菜单
+HFONT hAppFont = NULL;        // 应用程序字体
+HFONT hLogFont = NULL;        // 日志字体
+HWND hLogViewerWnd = NULL;    // 日志窗口句柄
+HWND hSubList = NULL;         // 订阅列表句柄
+
+// 静态变量 (仅本文件可见)
 static HWND hSettingsWnd = NULL;
 static HWND hSubWnd = NULL;
 
@@ -27,10 +37,27 @@ static HWND hSubWnd = NULL;
 // 自定义消息
 #define WM_UPDATE_FINISH (WM_USER + 200)
 
-// 辅助：设置字体回调
+// --- 函数原型声明 (修复链接错误的关键) ---
+void OpenSettingsWindow();
+void OpenSubWindow();
+void OpenNodeManager();
+void OpenNodeEditWindow(const wchar_t* tag);
+void OpenLogViewer(BOOL bShow);
+void RefreshSubList();
+void UpdateSubUIState(HWND hDlg);
+void LoadNodeToEdit(HWND hWnd, const wchar_t* tag);
+void SaveEditedNode(HWND hWnd);
+void ToggleTrayIcon();
+
+// --- 辅助函数 ---
 BOOL CALLBACK EnumSetFont(HWND hWnd, LPARAM lParam) {
     SendMessageW(hWnd, WM_SETFONT, (WPARAM)lParam, TRUE);
     return TRUE;
+}
+
+void AddComboItem(HWND hCombo, const wchar_t* text, BOOL select) {
+    int idx = SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)text);
+    if (select) SendMessage(hCombo, CB_SETCURSEL, idx, 0);
 }
 
 // --- 线程逻辑 ---
@@ -40,7 +67,6 @@ DWORD WINAPI AutoUpdateThread(LPVOID lpParam) {
     log_msg("[AutoUpdate] Thread started. Waiting 3s...");
     Sleep(3000); 
     
-    // [Lock] 读取更新配置
     EnterCriticalSection(&g_configLock);
     int subCount = g_subCount;
     int mode = g_subUpdateMode;
@@ -48,7 +74,7 @@ DWORD WINAPI AutoUpdateThread(LPVOID lpParam) {
     long long lastTime = g_lastUpdateTime;
     LeaveCriticalSection(&g_configLock);
 
-    log_msg("[AutoUpdate] Config loaded. subCount=%d, mode=%d, interval=%d", subCount, mode, intervalHours);
+    log_msg("[AutoUpdate] Config: count=%d, mode=%d, interval=%d", subCount, mode, intervalHours);
 
     if (subCount > 0) {
         long long now = (long long)time(NULL);
@@ -58,88 +84,57 @@ DWORD WINAPI AutoUpdateThread(LPVOID lpParam) {
         else if (mode == 1) intervalSeconds = 7 * 24 * 3600; // 每周
         else intervalSeconds = intervalHours * 3600;    // 自定义
 
-        // 检查是否达到更新时间
         if (lastTime > 0 && (now - lastTime) < intervalSeconds) {
-            log_msg("[AutoUpdate] Update skipped. Not due yet. (Remaining: %llds)", intervalSeconds - (now - lastTime));
+            log_msg("[AutoUpdate] Not due yet. Skipping.");
             return 0;
         }
 
-        log_msg("[AutoUpdate] Triggering background update...");
-        // 执行更新 (FALSE=静默模式)
+        log_msg("[AutoUpdate] Starting update...");
         int count = UpdateAllSubscriptions(FALSE);
-        log_msg("[AutoUpdate] Update finished. New nodes: %d", count);
+        log_msg("[AutoUpdate] Finished. New nodes: %d", count);
         
-        // 如果有更新，通知 UI 刷新
         if (count > 0) {
             HWND hMgr = FindWindowW(L"NodeMgr", NULL);
             if (hMgr && IsWindow(hMgr)) {
-                log_msg("[AutoUpdate] Sending refresh signal to NodeMgr.");
                 PostMessage(hMgr, WM_REFRESH_NODELIST, 0, 0);
             }
         }
-    } else {
-        log_msg("[AutoUpdate] No subscriptions found.");
     }
-    log_msg("[AutoUpdate] Thread exiting.");
     return 0;
 }
 
-// [修复] 手动更新线程：增加安全性校验
+// 手动更新线程
 DWORD WINAPI ManualUpdateThread(LPVOID param) {
     log_msg("[ManualUpdate] Thread started.");
     HWND hWnd = (HWND)param;
     if (!IsWindow(hWnd)) {
-        log_msg("[ManualUpdate] Error: Window handle is invalid on start.");
+        log_msg("[ManualUpdate] Invalid window handle.");
         return 0;
     }
 
-    log_msg("[ManualUpdate] Calling UpdateAllSubscriptions(TRUE)...");
-    
-    // 执行更新逻辑
+    log_msg("[ManualUpdate] Updating...");
     int count = UpdateAllSubscriptions(TRUE);
+    log_msg("[ManualUpdate] Done. Count: %d", count);
     
-    log_msg("[ManualUpdate] UpdateAllSubscriptions returned: %d", count);
-    
-    // 确保窗口依然存在再发送完成消息
     if (IsWindow(hWnd)) {
-        log_msg("[ManualUpdate] Posting WM_UPDATE_FINISH to window.");
         PostMessage(hWnd, WM_UPDATE_FINISH, (WPARAM)count, 0);
     } else {
-        log_msg("[ManualUpdate] Window closed during update.");
-        // 如果订阅窗口已关闭，尝试通知节点管理器刷新
         if (count > 0) {
             HWND hMgr = FindWindowW(L"NodeMgr", NULL);
-            if (hMgr) {
-                log_msg("[ManualUpdate] Notifying NodeMgr instead.");
-                PostMessage(hMgr, WM_REFRESH_NODELIST, 0, 0);
-            }
+            if (hMgr) PostMessage(hMgr, WM_REFRESH_NODELIST, 0, 0);
         }
     }
-    log_msg("[ManualUpdate] Thread exiting.");
     return 0;
-}
-
-// --- 通用 UI 辅助 ---
-
-void AddComboItem(HWND hCombo, const wchar_t* text, BOOL select) {
-    int idx = SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)text);
-    if (select) SendMessage(hCombo, CB_SETCURSEL, idx, 0);
 }
 
 // --- 节点编辑逻辑 ---
 
 void LoadNodeToEdit(HWND hWnd, const wchar_t* tag) {
-    log_msg("[NodeEdit] Loading node config for tag: %ls", tag);
+    log_msg("[NodeEdit] Loading: %ls", tag);
     char* buffer = NULL; long size = 0;
-    if (!ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) {
-        log_msg("[NodeEdit] Failed to read config file.");
-        return;
-    }
+    if (!ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) return;
     cJSON* root = cJSON_Parse(buffer); free(buffer);
-    if (!root) {
-        log_msg("[NodeEdit] Failed to parse config JSON.");
-        return;
-    }
+    if (!root) return;
     
     char tagUtf8[256];
     WideCharToMultiByte(CP_UTF8, 0, tag, -1, tagUtf8, 256, NULL, NULL);
@@ -151,7 +146,6 @@ void LoadNodeToEdit(HWND hWnd, const wchar_t* tag) {
         if (t && strcmp(t->valuestring, tagUtf8) == 0) { target = node; break; }
     }
     if (target) {
-        log_msg("[NodeEdit] Node found. Populating UI fields...");
         SetDlgItemTextW(hWnd, ID_EDIT_TAG, tag);
         cJSON* server = cJSON_GetObjectItem(target, "server");
         if(server) SetDlgItemTextA(hWnd, ID_EDIT_ADDR, server->valuestring);
@@ -167,7 +161,7 @@ void LoadNodeToEdit(HWND hWnd, const wchar_t* tag) {
         if (!trans) trans = cJSON_GetObjectItem(target, "streamSettings");
         
         HWND hNet = GetDlgItem(hWnd, ID_EDIT_NET);
-        SendMessage(hNet, CB_SETCURSEL, 0, 0); // Default TCP
+        SendMessage(hNet, CB_SETCURSEL, 0, 0); 
 
         cJSON* netType = NULL;
         if (trans) netType = cJSON_GetObjectItem(trans, "type");
@@ -199,20 +193,17 @@ void LoadNodeToEdit(HWND hWnd, const wchar_t* tag) {
              if (tls) sni = cJSON_GetObjectItem(tls, "server_name");
              if (sni) SetDlgItemTextA(hWnd, ID_EDIT_HOST, sni->valuestring);
         }
-    } else {
-        log_msg("[NodeEdit] Node not found in config.");
     }
     cJSON_Delete(root);
 }
 
 void SaveEditedNode(HWND hWnd) {
-    log_msg("[NodeEdit] Saving node configuration...");
+    log_msg("[NodeEdit] Saving node...");
     wchar_t wTag[256], wAddr[256], wUser[256], wPass[256], wHost[256], wPath[256];
     char tag[256], addr[256], user[256], pass[256], host[256], path[256];
     
     int port = GetDlgItemInt(hWnd, ID_EDIT_PORT, NULL, FALSE);
     if (port <= 0 || port > 65535) {
-        log_msg("[NodeEdit] Invalid port: %d", port);
         MessageBoxW(hWnd, L"端口必须在 1-65535 之间", L"参数错误", MB_OK | MB_ICONERROR);
         return;
     }
@@ -321,7 +312,6 @@ void SaveEditedNode(HWND hWnd) {
             free(out); cJSON_Delete(root);
         } else cJSON_Delete(newNode);
     } else cJSON_Delete(newNode);
-    log_msg("[NodeEdit] Node saved successfully.");
 }
 
 // --- ListBox 消息处理 ---
@@ -342,7 +332,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
     static HWND hHotkey, hPortEdit;
     switch(msg) {
         case WM_CREATE: {
-            log_msg("[Settings] Creating Settings window...");
+            log_msg("[Settings] Creating window...");
             EnterCriticalSection(&g_configLock);
             int localPort = g_localPort;
             int modifiers = g_hotkeyModifiers;
@@ -458,7 +448,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
                 if (idx >= 0 && idx < 5) SetDlgItemTextA(hWnd, ID_EDIT_UA_STR, UA_TEMPLATES[idx]);
             }
             if (LOWORD(wParam) == IDOK) {
-                log_msg("[Settings] User clicked OK. Saving...");
+                log_msg("[Settings] Saving...");
                 int fMin = GetDlgItemInt(hWnd, ID_EDIT_FRAG_MIN, NULL, FALSE);
                 int fMax = GetDlgItemInt(hWnd, ID_EDIT_FRAG_MAX, NULL, FALSE);
                 int fDly = GetDlgItemInt(hWnd, ID_EDIT_FRAG_DLY, NULL, FALSE);
@@ -508,7 +498,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 
                 SaveSettings(); 
                 if (g_proxyRunning) { 
-                    log_msg("[Settings] Restarting proxy to apply settings...");
+                    log_msg("[Settings] Restarting proxy...");
                     StopProxyCore(); 
                     StartProxyCore(); 
                 }
@@ -519,6 +509,28 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
         case WM_DESTROY: hSettingsWnd = NULL; break;
     }
     return DefWindowProcW(hWnd, msg, wParam, lParam);
+}
+
+// 关键修复：确保此函数定义在被调用之前，或已有原型
+void OpenSettingsWindow() {
+    if (hSettingsWnd && IsWindow(hSettingsWnd)) {
+        ShowWindow(hSettingsWnd, SW_RESTORE);
+        SetForegroundWindow(hSettingsWnd);
+        return;
+    }
+    WNDCLASSW wc = {0}; 
+    wc.lpfnWndProc=SettingsWndProc; 
+    wc.hInstance=GetModuleHandle(NULL); 
+    wc.lpszClassName=L"Settings"; 
+    wc.hbrBackground=(HBRUSH)(COLOR_BTNFACE+1);
+    
+    WNDCLASSW temp; 
+    if (!GetClassInfoW(GetModuleHandle(NULL), L"Settings", &temp)) {
+        RegisterClassW(&wc);
+    }
+    
+    hSettingsWnd = CreateWindowW(L"Settings", L"软件设置", WS_VISIBLE|WS_CAPTION|WS_SYSMENU, CW_USEDEFAULT,0,480,660, hwnd,NULL,wc.hInstance,NULL);
+    ShowWindow(hSettingsWnd, SW_SHOW);
 }
 
 // --- 订阅设置窗口消息处理 ---
@@ -549,7 +561,7 @@ void UpdateSubUIState(HWND hDlg) {
 LRESULT CALLBACK SubWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch(msg) {
         case WM_CREATE: {
-            log_msg("[SubWnd] Creating Subscription window...");
+            log_msg("[SubWnd] Created.");
             hSubList = CreateWindowExW(0, WC_LISTVIEWW, NULL, 
                 WS_CHILD|WS_VISIBLE|WS_BORDER|LVS_REPORT|LVS_NOCOLUMNHEADER|LVS_SHOWSELALWAYS|LVS_SINGLESEL, 
                 10, 10, 460, 150, hWnd, (HMENU)ID_SUB_LIST, GetModuleHandle(NULL), NULL);
@@ -654,7 +666,6 @@ LRESULT CALLBACK SubWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 } else {
                     SetWindowTextW(hWnd, L"正在更新 (后台进行中)...");
                     EnableWindow(GetDlgItem(hWnd, ID_SUB_UPD_BTN), FALSE); 
-                    log_msg("[SubWnd] Spawning ManualUpdateThread...");
                     CreateThread(NULL, 0, ManualUpdateThread, (LPVOID)hWnd, 0, NULL);
                 }
             }
@@ -662,7 +673,7 @@ LRESULT CALLBACK SubWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         case WM_UPDATE_FINISH: { 
             int count = (int)wParam;
-            log_msg("[SubWnd] Update finished event received. Count: %d", count);
+            log_msg("[SubWnd] Update finished. Count: %d", count);
             EnableWindow(GetDlgItem(hWnd, ID_SUB_UPD_BTN), TRUE);
             SetWindowTextW(hWnd, L"订阅设置");
             
@@ -683,18 +694,6 @@ LRESULT CALLBACK SubWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
 
-void OpenSubWindow() {
-    if (hSubWnd && IsWindow(hSubWnd)) { ShowWindow(hSubWnd, SW_RESTORE); SetForegroundWindow(hSubWnd); return; }
-    WNDCLASSW wc = {0};
-    if (!GetClassInfoW(GetModuleHandle(NULL), L"SubWnd", &wc)) {
-        wc.lpfnWndProc = SubWndProc; wc.hInstance = GetModuleHandle(NULL); 
-        wc.lpszClassName = L"SubWnd"; wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE+1);
-        wc.hCursor = LoadCursor(NULL, IDC_ARROW); RegisterClassW(&wc);
-    }
-    hSubWnd = CreateWindowW(L"SubWnd", L"订阅设置", WS_VISIBLE|WS_CAPTION|WS_SYSMENU, CW_USEDEFAULT,0,500,360, NULL,NULL,GetModuleHandle(NULL),NULL);
-    ShowWindow(hSubWnd, SW_SHOW); UpdateWindow(hSubWnd);
-}
-
 // --- 节点管理窗口消息处理 ---
 
 LRESULT CALLBACK NodeMgrWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -703,6 +702,7 @@ LRESULT CALLBACK NodeMgrWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     switch(msg) {
         case WM_CREATE:
+            log_msg("[NodeMgr] Created.");
             hList = CreateWindowW(L"LISTBOX", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|WS_VSCROLL|LBS_NOTIFY|LBS_EXTENDEDSEL, 10, 10, 410, 170, hWnd, (HMENU)ID_NODEMGR_LIST, NULL, NULL);
             g_oldListBoxProc = (WNDPROC)SetWindowLongPtr(hList, GWLP_WNDPROC, (LONG_PTR)ListBox_Proc);
             
@@ -921,7 +921,6 @@ void OpenLogViewer(BOOL bShow) {
     if (bShow) ShowWindow(hLogViewerWnd, SW_SHOW); else ShowWindow(hLogViewerWnd, SW_HIDE);
 }
 
-// 补全 ToggleTrayIcon 函数
 void ToggleTrayIcon() {
     if (g_isIconVisible) {
         Shell_NotifyIconW(NIM_DELETE, &nid);
@@ -970,7 +969,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         int id = LOWORD(wParam);
         
         if (id == ID_TRAY_EXIT) { 
-            log_msg("[System] User clicked Exit. Shutting down...");
+            log_msg("[System] User clicked Exit.");
             Shell_NotifyIconW(NIM_DELETE, &nid); 
             if (IsSystemProxyEnabled()) SetSystemProxy(FALSE); 
             StopProxyCore(); 
@@ -980,14 +979,16 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         else if (id == ID_TRAY_SYSTEM_PROXY) SetSystemProxy(!IsSystemProxyEnabled());
         else if (id == ID_TRAY_SHOW_CONSOLE) OpenLogViewer(TRUE);
         else if (id == ID_TRAY_MANAGE_NODES) OpenNodeManager();
-        else if (id == ID_TRAY_SETTINGS) OpenSettingsWindow();
+        else if (id == ID_TRAY_SETTINGS) {
+            log_msg("[Menu] Opening Settings Window...");
+            OpenSettingsWindow();
+        }
         else if (id == ID_TRAY_HIDE_ICON) ToggleTrayIcon();
         else if (id == ID_TRAY_AUTORUN) SetAutorun(!IsAutorun());
         else if (id == ID_TRAY_IMPORT_CLIPBOARD) {
-            log_msg("[Import] Import from clipboard clicked.");
+            log_msg("[Import] Import from clipboard.");
             int count = ImportFromClipboard(); 
             if (count > 0) {
-                log_msg("[Import] Success: %d nodes.", count);
                 ParseTags();
                 HWND hMgr = FindWindowW(L"NodeMgr", NULL);
                 if (hMgr && IsWindow(hMgr)) SendMessage(hMgr, WM_REFRESH_NODELIST, 0, 0);
@@ -1004,10 +1005,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 } else {
                     LeaveCriticalSection(&g_configLock);
                 }
-            } else {
-                log_msg("[Import] Failed: No valid links found.");
-                MessageBoxW(hWnd, L"剪贴板中未发现支持的链接 (vmess/vless/ss/trojan)", L"导入失败", MB_OK|MB_ICONWARNING);
-            }
+            } else MessageBoxW(hWnd, L"剪贴板中未发现支持的链接 (vmess/vless/ss/trojan)", L"导入失败", MB_OK|MB_ICONWARNING);
         }
         else if (id >= ID_TRAY_NODE_BASE && id < ID_TRAY_NODE_BASE + 1000) {
             int idx = id - ID_TRAY_NODE_BASE;
@@ -1017,7 +1015,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 wchar_t* tagCopy = _wcsdup(nodeTags[idx]);
                 LeaveCriticalSection(&g_configLock);
                 
-                log_msg("[Menu] Switching to node index: %d", idx);
                 SwitchNode(tagCopy);
                 free(tagCopy);
             } else {
@@ -1033,20 +1030,16 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 // --- 主程序入口 ---
 
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nShow) {
-    // 确保日志文件首行
-    log_msg("=== Application Started ===");
-    
+    log_msg("=== Application Startup ===");
     srand((unsigned)time(NULL));
 
     InitGlobalLocks();
 
     wchar_t exePath[MAX_PATH]; GetModuleFileNameW(NULL, exePath, MAX_PATH);
     wchar_t* pDir = wcsrchr(exePath, L'\\'); if (pDir) { *pDir = 0; SetCurrentDirectoryW(exePath); }
-    log_msg("[Main] Working directory: %ls", exePath);
 
     WSADATA wsa; WSAStartup(MAKEWORD(2,2), &wsa);
     
-    log_msg("[Main] Initializing Crypto...");
     init_crypto_global(); 
 
     INITCOMMONCONTROLSEX ic = {sizeof(INITCOMMONCONTROLSEX), ICC_HOTKEY_CLASS}; InitCommonControlsEx(&ic);
@@ -1059,7 +1052,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nSho
     GetModuleFileNameW(NULL, g_iniFilePath, MAX_PATH);
     wchar_t* p = wcsrchr(g_iniFilePath, L'\\'); if (p) { *p = 0; wcscat(g_iniFilePath, L"\\set.ini"); } else wcscpy(g_iniFilePath, L"set.ini");
     
-    log_msg("[Main] Loading settings from: %ls", g_iniFilePath);
     LoadSettings();
     CreateThread(NULL, 0, AutoUpdateThread, NULL, 0, NULL);
     
@@ -1077,11 +1069,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nSho
     ParseTags(); 
 
     if (wcslen(currentNode) > 0) {
-        log_msg("[Main] Auto-switching to last node: %ls", currentNode);
         SwitchNode(currentNode);
     }
     else if (nodeCount > 0) {
-        log_msg("[Main] No last node, switching to first available.");
         EnterCriticalSection(&g_configLock);
         wchar_t* firstNode = _wcsdup(nodeTags[0]);
         LeaveCriticalSection(&g_configLock);
@@ -1090,10 +1080,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nSho
         free(firstNode);
     }
     
-    log_msg("[Main] Entering message loop.");
     MSG msg; while(GetMessage(&msg, NULL, 0, 0)) { TranslateMessage(&msg); DispatchMessage(&msg); }
     
-    log_msg("[Main] Application exiting.");
     cleanup_crypto_global();
     DeleteGlobalLocks(); 
     
