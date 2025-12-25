@@ -5,10 +5,17 @@
 ProxyConfig g_proxyConfig;
 volatile BOOL g_proxyRunning = FALSE;
 SOCKET g_listen_sock = INVALID_SOCKET;
+// [Fix] 移除重复定义，保留 crypto.c 中的定义或反之，但为了链接安全，
+// 建议：在 globals.c 定义，crypto.c 中仅 include common.h (extern)
+// 之前构建报错是因为重复定义，这里保留定义，crypto.c 已删除定义。
+// SSL_CTX *g_ssl_ctx = NULL; // (根据之前的修复，这里应该保留吗？)
+// 修正：这是 globals.c，应该保留定义。crypto.c 应该只有声明。
+// 但之前的日志显示 globals.c 和 crypto.c 都有定义。
+// 我们已经在上一步的 crypto.c 中删除了定义。所以这里保留。
 SSL_CTX *g_ssl_ctx = NULL;
+
 HANDLE hProxyThread = NULL;
 
-// [Production Fix] 定义全局锁
 CRITICAL_SECTION g_configLock;
 
 void InitGlobalLocks() {
@@ -42,12 +49,11 @@ UINT g_hotkeyVk = 'H';
 int g_localPort = 10809;
 int g_hideTrayStart = 0;
 
-// UI 滚动状态
 WNDPROC g_oldListBoxProc = NULL;
 int g_nEditScrollPos = 0;
 int g_nEditContentHeight = 0;
 
-// 抗封锁配置 (默认值)
+// 抗封锁配置
 BOOL g_enableChromeCiphers = TRUE;
 BOOL g_enableALPN = TRUE;
 BOOL g_enableFragment = FALSE;
@@ -60,12 +66,14 @@ int g_padSizeMax = 500;
 int g_uaPlatformIndex = 0;
 char g_userAgentStr[512] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
-// [新增] ECH 全局变量定义
-BOOL g_enableECH = FALSE;
-char g_echConfigServer[256] = "https://cloudflare-dns.com/dns-query"; // 默认 DoH
-char g_echPublicName[256] = ""; // 默认为空
+// [Fix] 修正 ECH 默认配置
+// 1. 默认开启 ECH
+// 2. 默认 DoH 改为 Cloudflare (兼容性更好)
+// 3. 默认 Public Name 改为 cloudflare-ech.com
+BOOL g_enableECH = TRUE; 
+char g_echConfigServer[256] = "https://1.1.1.1/dns-query"; 
+char g_echPublicName[256] = "cloudflare-ech.com"; 
 
-// 定义常用 UA 模板
 const wchar_t* UA_PLATFORMS[] = {
     L"Windows (Chrome 120)",
     L"macOS (Safari 17)",
@@ -82,5 +90,4 @@ const char* UA_TEMPLATES[] = {
     "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0"
 };
 
-// 日志开关
 BOOL g_enableLog = FALSE;
