@@ -3,16 +3,8 @@
 
 #include "common.h"
 
-// 托盘图标 ID
-#define ID_TRAY_EXIT            9001
-#define ID_TRAY_SYSTEM_PROXY    9002
-#define ID_TRAY_SHOW_CONSOLE    9003
-#define ID_TRAY_MANAGE_NODES    9004
-#define ID_TRAY_HIDE_ICON       9005
-#define ID_TRAY_SETTINGS        9006
-#define ID_TRAY_AUTORUN         9007
-#define ID_TRAY_IMPORT_CLIPBOARD 9008
-#define ID_TRAY_NODE_BASE       10000
+// [修复] 删除了 ID_TRAY_EXIT 等重复宏定义
+// 这些 ID 已在 common.h 中统一管理，此处保留原有的函数声明
 
 // 窗口管理
 void OpenLogViewer(BOOL bShow);
@@ -31,4 +23,3 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 extern HWND hSubList;
 
 #endif // GUI_H
-
