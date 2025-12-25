@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h> // [新增] 引入时间函数
 
 // --- 全局变量声明 ---
 Subscription g_subs[MAX_SUBS];
@@ -12,6 +13,7 @@ int g_subCount = 0;
 // 新增：订阅更新配置默认值
 int g_subUpdateMode = 0;      // 0=每天 (默认)
 int g_subUpdateInterval = 24; // 24小时 (默认)
+long long g_lastUpdateTime = 0; // [新增] 上次更新时间戳
 
 // --- 内部辅助函数声明 ---
 int Internal_BatchAddNodesFromText(const char* text, cJSON* outbounds);
@@ -113,6 +115,11 @@ void LoadSettings() {
     int upMode = GetPrivateProfileIntW(L"Subscriptions", L"UpdateMode", 0, g_iniFilePath);
     int upInterval = GetPrivateProfileIntW(L"Subscriptions", L"UpdateInterval", 24, g_iniFilePath);
 
+    // [新增] 读取上次更新时间
+    wchar_t wTimeBuf[64] = {0};
+    GetPrivateProfileStringW(L"Subscriptions", L"LastUpdateTime", L"0", wTimeBuf, 64, g_iniFilePath);
+    g_lastUpdateTime = _wtoll(wTimeBuf);
+
     EnterCriticalSection(&g_configLock);
 
     g_hotkeyModifiers = modifiers;
@@ -203,6 +210,11 @@ void SaveSettings() {
 
     WritePrivateProfileStringW(L"Subscriptions", NULL, NULL, g_iniFilePath);
     
+    // [新增] 保存上次更新时间
+    wchar_t wTimeBuf[64];
+    _i64tow(g_lastUpdateTime, wTimeBuf, 10);
+    WritePrivateProfileStringW(L"Subscriptions", L"LastUpdateTime", wTimeBuf, g_iniFilePath);
+
     _snwprintf(buffer, 16, L"%d", g_subUpdateMode); WritePrivateProfileStringW(L"Subscriptions", L"UpdateMode", buffer, g_iniFilePath);
     _snwprintf(buffer, 16, L"%d", g_subUpdateInterval); WritePrivateProfileStringW(L"Subscriptions", L"UpdateInterval", buffer, g_iniFilePath);
 
@@ -540,6 +552,13 @@ int UpdateAllSubscriptions(BOOL forceMsg) {
     log_msg("[Sub] Total nodes parsed: %d. Saving config...", totalNewNodes);
     char* out = cJSON_Print(root); WriteBufferToFile(CONFIG_FILE, out); free(out); cJSON_Delete(root);
     ParseTags(); 
+    
+    // [Modified] Update timestamp if success
+    if (downloadSuccess > 0) {
+        g_lastUpdateTime = (long long)time(NULL);
+        SaveSettings();
+    }
+    
     log_msg("[Sub] Update complete.");
     return totalNewNodes;
 }
