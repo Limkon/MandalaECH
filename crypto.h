@@ -5,8 +5,8 @@
 #include <openssl/ssl.h>
 #include <openssl/bio.h>
 
-// [修复] 删除原有的 typedef struct CryptoSettings CryptoSettings;
-// 直接使用 common.h 中定义的 CryptoSettings 类型即可
+// [修复] 删除了导致冲突的 typedef CryptoSettings
+// 类型已由 common.h 统一提供
 
 // 全局加密环境初始化
 void init_crypto_global();
@@ -15,20 +15,10 @@ void init_crypto_global();
 void cleanup_crypto_global();
 
 // --- TLS 连接封装 ---
-
-// 初始化并建立 TLS 连接
 int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target_host, const CryptoSettings* settings);
-
-// 通用 TLS 写
 int tls_write(TLSContext *ctx, const char *data, int len);
-
-// 通用 TLS 读
 int tls_read(TLSContext *ctx, char *out, int max);
-
-// 精确读取指定长度
 int tls_read_exact(TLSContext *ctx, char *buf, int len);
-
-// 关闭 TLS 连接
 void tls_close(TLSContext *ctx);
 
 // --- WebSocket 协议封装 ---
