@@ -1,4 +1,4 @@
-#define WIN32_LEAN_AND_MEAN // [Fix] 防止头文件冲突
+#define WIN32_LEAN_AND_MEAN
 #include "utils.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -56,21 +56,7 @@ void log_msg(const char *format, ...) {
     
     OutputDebugStringA(final_msg);
     
-    extern HWND hLogViewerWnd; 
-    if (hLogViewerWnd && IsWindow(hLogViewerWnd)) {
-        char gui_msg[4200];
-        snprintf(gui_msg, sizeof(gui_msg), "%s%s\r\n", time_buf, buf);
-        int wLen = MultiByteToWideChar(CP_UTF8, 0, gui_msg, -1, NULL, 0);
-        if (wLen > 0) {
-            wchar_t* wBuf = (wchar_t*)malloc((wLen + 1) * sizeof(wchar_t));
-            if (wBuf) {
-                MultiByteToWideChar(CP_UTF8, 0, gui_msg, -1, wBuf, wLen);
-                wBuf[wLen] = 0;
-                PostMessageW(hLogViewerWnd, WM_LOG_UPDATE, 0, (LPARAM)wBuf);
-            }
-        }
-    }
-
+    // 写入文件
     EnterCriticalSection(&g_logLock);
     FILE* fp = fopen("log.txt", "a+"); 
     if (fp) {
@@ -83,49 +69,27 @@ void log_msg(const char *format, ...) {
 
 // --- 文件 IO ---
 BOOL ReadFileToBuffer(const wchar_t* filename, char** buffer, long* size) {
-    log_msg("[FileIO] Reading file: %ls", filename);
     FILE* f = _wfopen(filename, L"rb");
-    if (!f) {
-        log_msg("[FileIO] Failed to open file: %ls", filename);
-        return FALSE;
-    }
-    
+    if (!f) return FALSE;
     fseek(f, 0, SEEK_END);
     long fsize = ftell(f);
     fseek(f, 0, SEEK_SET);
-    
     if (fsize < 0) { fclose(f); return FALSE; }
-
     *buffer = (char*)malloc(fsize + 1);
-    if (!*buffer) { 
-        log_msg("[Fatal] Memory allocation failed for file buffer!");
-        fclose(f); 
-        return FALSE; 
-    }
-    
+    if (!*buffer) { fclose(f); return FALSE; }
     size_t read_bytes = fread(*buffer, 1, fsize, f);
     (*buffer)[read_bytes] = 0; 
-    
     if (size) *size = (long)read_bytes;
-    
     fclose(f);
-    log_msg("[FileIO] File read successfully.");
     return TRUE;
 }
 
 BOOL WriteBufferToFile(const wchar_t* filename, const char* buffer) {
-    log_msg("[FileIO] Writing to file: %ls", filename);
     FILE* f = _wfopen(filename, L"wb");
-    if (!f) {
-        log_msg("[Err] Failed to open file for writing: %ls", filename);
-        return FALSE;
-    }
-    
+    if (!f) return FALSE;
     size_t len = strlen(buffer);
-    size_t written = fwrite(buffer, 1, len, f);
-    
+    fwrite(buffer, 1, len, f);
     fclose(f);
-    log_msg("[FileIO] Wrote %zu bytes.", written);
     return TRUE;
 }
 
@@ -258,7 +222,7 @@ static BOOL ParseUrl(const char* url, URL_COMPONENTS_SIMPLE* out) {
     return TRUE;
 }
 
-// --- [CRITICAL FIX] 安全的 HTTPS GET 请求 ---
+// --- 安全的 HTTPS GET 请求 (Win7 兼容版) ---
 static char* InternalHttpsGet(const char* url) {
     log_msg("[HTTP] Fetching URL: %s", url);
     URL_COMPONENTS_SIMPLE u;
@@ -267,12 +231,16 @@ static char* InternalHttpsGet(const char* url) {
         return NULL;
     }
 
+    // [Win7 Compat] 初始化 SSL 上下文时使用通用方法
     const SSL_METHOD* method = TLS_client_method();
     SSL_CTX* ctx = SSL_CTX_new(method);
     if (!ctx) {
         log_msg("[HTTP] SSL_CTX_new failed.");
         return NULL;
     }
+    // [Win7 Compat] 禁用 TLS 1.3 (可能不被 Win7 旧协议栈支持)，强制 TLS 1.2
+    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+    SSL_CTX_set_max_proto_version(ctx, TLS1_2_VERSION); 
     SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
 
     SOCKET s = INVALID_SOCKET;
@@ -293,7 +261,7 @@ static char* InternalHttpsGet(const char* url) {
         return NULL;
     }
     
-    // [Fix] 遍历所有 IP 地址进行连接
+    // [Fix] 遍历尝试所有 IP 地址
     for (ptr = res; ptr != NULL; ptr = ptr->ai_next) {
         s = socket(ptr->ai_family, ptr->ai_socktype, ptr->ai_protocol);
         if (s == INVALID_SOCKET) continue;
@@ -305,16 +273,15 @@ static char* InternalHttpsGet(const char* url) {
         log_msg("[HTTP] Trying connect...");
         if (connect(s, ptr->ai_addr, (int)ptr->ai_addrlen) == 0) {
             log_msg("[HTTP] TCP Connected!");
-            break; // 连接成功
+            break; 
         }
         closesocket(s);
         s = INVALID_SOCKET;
     }
-    
     freeaddrinfo(res);
 
     if (s == INVALID_SOCKET) {
-        log_msg("[HTTP] Failed to connect to any resolved address.");
+        log_msg("[HTTP] Failed to connect.");
         SSL_CTX_free(ctx);
         return NULL;
     }
@@ -327,8 +294,9 @@ static char* InternalHttpsGet(const char* url) {
         return NULL; 
     }
     
-    // [CRITICAL] 使用 BIO_new_socket 防止句柄截断问题
-    BIO* bio = BIO_new_socket((int)(intptr_t)s, BIO_NOCLOSE);
+    // [Win7 Compat] 将 64位 Socket 转换为 int (在 Windows 上通常是安全的，但可能触发警告)
+    // 关键：BIO_new_socket 在 OpenSSL 中是处理 Windows socket 的正确方式
+    BIO* bio = BIO_new_socket((int)s, BIO_NOCLOSE);
     if (!bio) {
         log_msg("[HTTP] BIO creation failed.");
         SSL_free(ssl); closesocket(s); SSL_CTX_free(ctx);
@@ -336,13 +304,17 @@ static char* InternalHttpsGet(const char* url) {
     }
     SSL_set_bio(ssl, bio, bio);
     
-    SSL_set_tlsext_host_name(ssl, u.host);
+    if (u.host && strlen(u.host) > 0) {
+        SSL_set_tlsext_host_name(ssl, u.host);
+    }
 
-    log_msg("[HTTP] SSL Handshake...");
+    log_msg("[HTTP] SSL Handshake (TLS 1.2)...");
     if (SSL_connect(ssl) != 1) {
-        log_msg("[HTTP] SSL_connect failed.");
+        unsigned long err = ERR_get_error();
+        log_msg("[HTTP] SSL_connect failed. ERR: %lu", err);
         goto cleanup;
     }
+    log_msg("[HTTP] SSL Handshake success.");
 
     char req[2048];
     snprintf(req, sizeof(req), 
@@ -354,17 +326,14 @@ static char* InternalHttpsGet(const char* url) {
         u.path, u.host);
         
     if (SSL_write(ssl, req, (int)strlen(req)) <= 0) {
-        log_msg("[HTTP] Failed to send request.");
+        log_msg("[HTTP] Send failed.");
         goto cleanup;
     }
 
     int total_cap = 65536; 
     int total_len = 0;
     buf = (char*)malloc(total_cap);
-    if (!buf) {
-        log_msg("[HTTP] OOM.");
-        goto cleanup;
-    }
+    if (!buf) goto cleanup;
 
     while (1) {
         if (total_len >= total_cap - 1024) {
@@ -379,6 +348,7 @@ static char* InternalHttpsGet(const char* url) {
         if (n <= 0) {
             int err = SSL_get_error(ssl, n);
             if (err == SSL_ERROR_ZERO_RETURN || err == SSL_ERROR_SYSCALL) break; 
+            log_msg("[HTTP] SSL_read error: %d", err);
             break; 
         }
         total_len += n;
@@ -401,6 +371,7 @@ cleanup:
     if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); }
     if (s != INVALID_SOCKET) closesocket(s);
     if (ctx) SSL_CTX_free(ctx); 
+    log_msg("[HTTP] Done.");
     return result;
 }
 
@@ -419,6 +390,7 @@ char* GetClipboardText() {
     char* text = _strdup(pszText);
     GlobalUnlock(hData);
     CloseClipboard();
+    log_msg("[Clipboard] Read text (len=%d)", strlen(text));
     return text;
 }
 
