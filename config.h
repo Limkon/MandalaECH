@@ -4,57 +4,53 @@
 #include "common.h"
 #include "cJSON.h"
 
-// 订阅更新模式常量
-#define UPDATE_MODE_DAILY  0
-#define UPDATE_MODE_WEEKLY 1
-#define UPDATE_MODE_CUSTOM 2
+// 注意：原有的全局变量 (g_localPort, g_proxyConfig 等) 已在 common.h 中声明
+// 我们直接使用它们，不再重复声明
 
-// 订阅结构体
+// --- 新增：订阅管理系统 ---
+#define MAX_SUBS 20
+
+// 定义更新模式枚举
+enum UpdateMode {
+    UPDATE_MODE_DAILY = 0,
+    UPDATE_MODE_WEEKLY,
+    UPDATE_MODE_CUSTOM
+};
+
 typedef struct {
-    BOOL enabled;
-    char url[512];
+    BOOL enabled;   // 是否启用
+    char url[512];  // 订阅地址
 } Subscription;
 
-#define MAX_SUBS 20
 extern Subscription g_subs[MAX_SUBS];
 extern int g_subCount;
 
-// 自动更新配置
-extern int g_subUpdateMode;
-extern int g_subUpdateInterval;
-extern long long g_lastUpdateTime;
+// 新增：订阅更新配置全局变量
+extern int g_subUpdateMode;      // 更新模式: 0=每天, 1=每周, 2=自定义
+extern int g_subUpdateInterval;  // 自定义间隔（单位：小时）
+extern long long g_lastUpdateTime; // 新增：上次更新时间戳
 
-// --- 配置加载与保存 ---
+// 函数声明
 void LoadSettings();
 void SaveSettings();
-
-// --- 节点操作 ---
-// 切换当前使用的节点
-void SwitchNode(const wchar_t* tag);
-// 将新节点添加到配置文件
-BOOL AddNodeToConfig(cJSON* newNode);
-// 删除指定节点
-void DeleteNode(const wchar_t* tag);
-// 解析配置文件中的所有 Tag (用于填充列表)
+void SetAutorun(BOOL enable);
+BOOL IsAutorun();
 void ParseTags();
-// 解析单个节点配置到全局变量 (用于连接)
+void SwitchNode(const wchar_t* tag);
 void ParseNodeConfigToGlobal(cJSON *node);
+void DeleteNode(const wchar_t* tag);
+BOOL AddNodeToConfig(cJSON* newNode);
 
-// --- 导入与更新 ---
-// 从剪贴板导入节点
-int ImportFromClipboard();
-// 更新所有订阅 (forceMsg=TRUE 时弹出提示框，否则静默)
-int UpdateAllSubscriptions(BOOL forceMsg);
-
-// --- 协议解析器 (内部使用，但也暴露以备测试) ---
+// 协议解析辅助函数
 cJSON* ParseVmess(const char* link);
 cJSON* ParseShadowsocks(const char* link);
 cJSON* ParseVlessOrTrojan(const char* link);
 cJSON* ParseSocks(const char* link);
-cJSON* ParseMandala(const char* link);
 
-// --- 系统设置 ---
-void SetAutorun(BOOL enable);
-BOOL IsAutorun();
+int ImportFromClipboard();
+void ToggleTrayIcon();
+
+// --- 新增：更新所有订阅 ---
+int UpdateAllSubscriptions(BOOL forceMsg);
 
 #endif // CONFIG_H

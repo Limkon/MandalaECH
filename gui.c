@@ -4,15 +4,16 @@
 #include "utils.h"
 #include "crypto.h"
 #include "common.h" 
-#include "resource.h"
+#include "resource.h" // 引入资源ID定义
 #include <commctrl.h>
 #include <stdio.h>
 #include <wchar.h> 
-#include <time.h> 
+#include <time.h> // [新增] 引入时间函数
 
+// 链接 comctl32 库以支持高级控件
 #pragma comment(lib, "comctl32.lib")
 
-// 单例窗口句柄
+// 用于追踪窗口句柄，实现单例模式
 static HWND hSettingsWnd = NULL;
 static HWND hSubWnd = NULL;
 
@@ -24,47 +25,53 @@ static HWND hSubWnd = NULL;
 #define ID_SUB_URL_EDIT 3004
 #define ID_SUB_SAVE_BTN 3005
 
-// 自定义消息
+// 定义更新完成消息
 #define WM_UPDATE_FINISH (WM_USER + 200)
 
-// 辅助：设置字体回调
+// --- 辅助函数：字体设置回调 ---
 BOOL CALLBACK EnumSetFont(HWND hWnd, LPARAM lParam) {
     SendMessageW(hWnd, WM_SETFONT, (WPARAM)lParam, TRUE);
     return TRUE;
 }
 
-// --- 线程逻辑 ---
-
-// 自动更新线程
+// --- 自动更新线程 (已修改：增加时间间隔检查) ---
 DWORD WINAPI AutoUpdateThread(LPVOID lpParam) {
-    // 等待主界面初始化
+    // 延时 3 秒，等待主程序初始化完毕且界面显示出来
     Sleep(3000); 
     
-    // [Lock] 读取更新配置
-    EnterCriticalSection(&g_configLock);
-    int subCount = g_subCount;
-    int mode = g_subUpdateMode;
-    int intervalHours = g_subUpdateInterval;
-    long long lastTime = g_lastUpdateTime;
-    LeaveCriticalSection(&g_configLock);
-
-    if (subCount > 0) {
+    // 如果有启用的订阅
+    if (g_subCount > 0) {
+        // [新增] 检查是否达到更新间隔
         long long now = (long long)time(NULL);
         long long intervalSeconds = 0;
         
-        if (mode == 0) intervalSeconds = 24 * 3600;      // 每天
-        else if (mode == 1) intervalSeconds = 7 * 24 * 3600; // 每周
-        else intervalSeconds = intervalHours * 3600;    // 自定义
+        // 获取配置 (简单读取无需加锁，或使用局部锁)
+        EnterCriticalSection(&g_configLock);
+        int mode = g_subUpdateMode;
+        int intervalHours = g_subUpdateInterval;
+        long long lastTime = g_lastUpdateTime;
+        LeaveCriticalSection(&g_configLock);
 
-        // 检查是否达到更新时间
+        // 计算所需的间隔秒数
+        if (mode == UPDATE_MODE_DAILY) {
+            intervalSeconds = 24 * 3600;     // 每天
+        } else if (mode == UPDATE_MODE_WEEKLY) {
+            intervalSeconds = 7 * 24 * 3600; // 每周
+        } else {
+            intervalSeconds = intervalHours * 3600; // 自定义小时
+        }
+
+        // 如果未达到更新时间，且不是从未更新过(lastTime > 0)，则跳过
         if (lastTime > 0 && (now - lastTime) < intervalSeconds) {
+            log_msg("[Sub] AutoUpdate skipped. Next update in %.1f hours.", 
+                (double)(intervalSeconds - (now - lastTime)) / 3600.0);
             return 0;
         }
 
-        // 执行更新 (FALSE=静默模式)
-        int count = UpdateAllSubscriptions(FALSE);
+        // 执行更新 (FALSE = 不弹窗，只写日志)
+        int count = UpdateAllSubscriptions(FALSE); // 内部已加锁
         
-        // 如果有更新，通知 UI 刷新
+        // 如果更新到了节点，仅通知界面刷新，不进行危险的 SwitchNode 操作
         if (count > 0) {
             HWND hMgr = FindWindowW(L"NodeMgr", NULL);
             if (hMgr && IsWindow(hMgr)) {
@@ -75,35 +82,20 @@ DWORD WINAPI AutoUpdateThread(LPVOID lpParam) {
     return 0;
 }
 
-// [修复] 手动更新线程：增加安全性校验，防止窗口销毁后 PostMessage 导致的 Runtime 错误
+// --- 手动更新线程 (解决 UI 卡死) ---
 DWORD WINAPI ManualUpdateThread(LPVOID param) {
     HWND hWnd = (HWND)param;
-    if (!IsWindow(hWnd)) return 0;
-
-    log_msg("[Thread] 手动更新订阅开始...");
-    
-    // 执行更新逻辑 (UpdateAllSubscriptions 内部已由文件锁保护)
-    int count = UpdateAllSubscriptions(TRUE);
-    
-    // 确保窗口依然存在再发送完成消息
-    if (IsWindow(hWnd)) {
-        PostMessage(hWnd, WM_UPDATE_FINISH, (WPARAM)count, 0);
-    } else {
-        // 如果订阅窗口已关闭，尝试通知节点管理器刷新
-        HWND hMgr = FindWindowW(L"NodeMgr", NULL);
-        if (hMgr) PostMessage(hMgr, WM_REFRESH_NODELIST, 0, 0);
-    }
+    // 执行更新 (TRUE = 强制记录日志)
+    int count = UpdateAllSubscriptions(TRUE); // 内部已加锁
+    // 发送自定义消息通知 UI 线程更新完成
+    PostMessage(hWnd, WM_UPDATE_FINISH, (WPARAM)count, 0);
     return 0;
 }
-
-// --- 通用 UI 辅助 ---
 
 void AddComboItem(HWND hCombo, const wchar_t* text, BOOL select) {
     int idx = SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)text);
     if (select) SendMessage(hCombo, CB_SETCURSEL, idx, 0);
 }
-
-// --- 节点编辑逻辑 ---
 
 void LoadNodeToEdit(HWND hWnd, const wchar_t* tag) {
     char* buffer = NULL; long size = 0;
@@ -131,23 +123,17 @@ void LoadNodeToEdit(HWND hWnd, const wchar_t* tag) {
         if(user) SetDlgItemTextA(hWnd, ID_EDIT_USER, user->valuestring);
         cJSON* pass = cJSON_GetObjectItem(target, "password");
         if(pass) SetDlgItemTextA(hWnd, ID_EDIT_PASS, pass->valuestring);
-        
         cJSON* trans = cJSON_GetObjectItem(target, "transport"); 
         if (!trans) trans = cJSON_GetObjectItem(target, "streamSettings");
-        
         HWND hNet = GetDlgItem(hWnd, ID_EDIT_NET);
-        SendMessage(hNet, CB_SETCURSEL, 0, 0); // Default TCP
-
+        SendMessage(hNet, CB_SETCURSEL, 0, 0); 
         cJSON* netType = NULL;
         if (trans) netType = cJSON_GetObjectItem(trans, "type");
         if (!netType) netType = cJSON_GetObjectItem(target, "network");
-        
         if (netType && strcmp(netType->valuestring, "ws") == 0) SendMessage(hNet, CB_SETCURSEL, 1, 0);
-
         cJSON* wsSettings = NULL;
         if (trans) wsSettings = cJSON_GetObjectItem(trans, "wsSettings");
         if (!wsSettings && trans && netType && strcmp(netType->valuestring, "ws") == 0) wsSettings = trans;
-        
         if (wsSettings) {
              cJSON* path = cJSON_GetObjectItem(wsSettings, "path");
              if (path) SetDlgItemTextA(hWnd, ID_EDIT_PATH, path->valuestring);
@@ -157,7 +143,6 @@ void LoadNodeToEdit(HWND hWnd, const wchar_t* tag) {
                  if (host) SetDlgItemTextA(hWnd, ID_EDIT_HOST, host->valuestring);
              }
         }
-
         HWND hTls = GetDlgItem(hWnd, ID_EDIT_TLS);
         SendMessage(hTls, CB_SETCURSEL, 0, 0); 
         cJSON* tls = cJSON_GetObjectItem(target, "tls");
@@ -172,6 +157,7 @@ void LoadNodeToEdit(HWND hWnd, const wchar_t* tag) {
     cJSON_Delete(root);
 }
 
+// [修复] 保存节点时保留原始协议类型 (vless/trojan)，防止被误判为 vmess
 void SaveEditedNode(HWND hWnd) {
     wchar_t wTag[256], wAddr[256], wUser[256], wPass[256], wHost[256], wPath[256];
     char tag[256], addr[256], user[256], pass[256], host[256], path[256];
@@ -199,10 +185,12 @@ void SaveEditedNode(HWND hWnd) {
     int netIdx = SendMessage(GetDlgItem(hWnd, ID_EDIT_NET), CB_GETCURSEL, 0, 0);
     int tlsIdx = SendMessage(GetDlgItem(hWnd, ID_EDIT_TLS), CB_GETCURSEL, 0, 0);
 
+    // 1. 读取配置文件，查找原始节点的类型
     char originalType[64] = {0};
     char* buffer = NULL; long size = 0;
     if (ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) {
-        cJSON* root = cJSON_Parse(buffer); free(buffer);
+        cJSON* root = cJSON_Parse(buffer); 
+        free(buffer);
         if (root) {
             cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
             char oldTagUtf8[256];
@@ -212,6 +200,7 @@ void SaveEditedNode(HWND hWnd) {
                 cJSON* t = cJSON_GetObjectItem(node, "tag");
                 if (t && strcmp(t->valuestring, oldTagUtf8) == 0) {
                     cJSON* type = cJSON_GetObjectItem(node, "type");
+                    // [Security] 限制复制长度
                     if (type && type->valuestring) snprintf(originalType, sizeof(originalType), "%s", type->valuestring);
                     break;
                 }
@@ -220,13 +209,16 @@ void SaveEditedNode(HWND hWnd) {
         }
     }
 
+    // 2. 构建新节点
     cJSON* newNode = cJSON_CreateObject();
     cJSON_AddStringToObject(newNode, "tag", tag);
     cJSON_AddStringToObject(newNode, "server", addr);
     cJSON_AddNumberToObject(newNode, "server_port", port);
 
+    // 3. 智能设置类型 (优先使用原始类型)
     if (strlen(originalType) > 0) {
         cJSON_AddStringToObject(newNode, "type", originalType);
+        // 根据类型决定字段名
         if (strcmp(originalType, "vless") == 0 || strcmp(originalType, "vmess") == 0) {
              cJSON_AddStringToObject(newNode, "uuid", user);
         } else {
@@ -234,6 +226,7 @@ void SaveEditedNode(HWND hWnd) {
              if (strlen(pass)>0) cJSON_AddStringToObject(newNode, "password", pass);
         }
     } else {
+        // 如果没有原始类型 (可能是新节点或读取失败)，则尝试推断
         if (strlen(user) > 20) {
             cJSON_AddStringToObject(newNode, "type", "vmess");
             cJSON_AddStringToObject(newNode, "uuid", user);
@@ -263,6 +256,7 @@ void SaveEditedNode(HWND hWnd) {
         cJSON_AddItemToObject(newNode, "tls", tlsObj);
     }
 
+    // 4. 写入文件
     if (ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) {
         cJSON* root = cJSON_Parse(buffer); free(buffer);
         if (root) {
@@ -280,7 +274,6 @@ void SaveEditedNode(HWND hWnd) {
             }
             if (idxToReplace != -1) cJSON_ReplaceItemInArray(outbounds, idxToReplace, newNode);
             else cJSON_AddItemToArray(outbounds, newNode);
-            
             char* out = cJSON_Print(root);
             WriteBufferToFile(CONFIG_FILE, out);
             free(out); cJSON_Delete(root);
@@ -288,7 +281,7 @@ void SaveEditedNode(HWND hWnd) {
     } else cJSON_Delete(newNode);
 }
 
-// --- ListBox 消息处理 ---
+// --- ListBox 与 Settings 窗口逻辑 ---
 
 LRESULT CALLBACK ListBox_Proc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == WM_KEYDOWN) {
@@ -300,12 +293,11 @@ LRESULT CALLBACK ListBox_Proc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
     return CallWindowProc(g_oldListBoxProc, hWnd, msg, wParam, lParam);
 }
 
-// --- 设置窗口消息处理 ---
-
 LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     static HWND hHotkey, hPortEdit;
     switch(msg) {
         case WM_CREATE: {
+            // [Lock] 保护读取，确保 UI 显示的是一致的全局配置
             EnterCriticalSection(&g_configLock);
             int localPort = g_localPort;
             int modifiers = g_hotkeyModifiers;
@@ -321,12 +313,16 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             int pMax = g_padSizeMax;
             int uaIdx = g_uaPlatformIndex;
             char uaStr[512]; strcpy(uaStr, g_userAgentStr);
+            
+            // [新增] ECH 全局变量读取
             BOOL ech = g_enableECH;
             char echServer[256]; strcpy(echServer, g_echConfigServer);
             char echPub[256]; strcpy(echPub, g_echPublicName);
+            
             LeaveCriticalSection(&g_configLock);
 
             int y = 25;
+            // 基础设置区域
             CreateWindowW(L"STATIC", L"全局快捷键:", WS_CHILD|WS_VISIBLE, 25, y, 140, 20, hWnd, NULL,NULL,NULL);
             hHotkey = CreateWindowExW(0, HOTKEY_CLASSW, NULL, WS_CHILD|WS_VISIBLE|WS_BORDER, 160, y-3, 270, 25, hWnd, (HMENU)ID_HOTKEY_CTRL, NULL,NULL);
             UINT hkMod = 0; if (modifiers & MOD_SHIFT) hkMod |= HOTKEYF_SHIFT;
@@ -339,6 +335,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             hPortEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", NULL, WS_CHILD|WS_VISIBLE|ES_NUMBER, 160, y-3, 100, 25, hWnd, (HMENU)ID_PORT_EDIT, NULL,NULL);
             SetDlgItemInt(hWnd, ID_PORT_EDIT, localPort, FALSE);
 
+            // 抗封锁设置 GroupBox (增加高度以容纳 ECH)
             y += 50;
             CreateWindowW(L"BUTTON", L"抗封锁策略配置", WS_CHILD|WS_VISIBLE|BS_GROUPBOX, 20, y, 420, 440, hWnd, NULL, NULL, NULL);
             
@@ -347,6 +344,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             y += 30;
             HWND hChk2 = CreateWindowW(L"BUTTON", L"启用 ALPN 协议伪装 (http/1.1)", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 35, y, 380, 22, hWnd, (HMENU)ID_CHK_ALPN, NULL, NULL);
             
+            // --- 分片设置 ---
             y += 35;
             HWND hChk3 = CreateWindowW(L"BUTTON", L"启用 TCP 随机分片 (对抗 SNI 阻断)", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 35, y, 380, 22, hWnd, (HMENU)ID_CHK_FRAG, NULL, NULL);
             
@@ -359,6 +357,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             CreateWindowW(L"STATIC", L"延迟(ms):", WS_CHILD|WS_VISIBLE, 290, y+2, 60, 20, hWnd, NULL,NULL,NULL);
             HWND hDly = CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER|ES_CENTER, 355, y, 40, 22, hWnd, (HMENU)ID_EDIT_FRAG_DLY, NULL, NULL);
 
+            // --- Padding 设置 ---
             y += 40;
             HWND hChkPad = CreateWindowW(L"BUTTON", L"启用 TLS 流量填充 (随机包长度)", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 35, y, 380, 22, hWnd, (HMENU)ID_CHK_PADDING, NULL, NULL);
             
@@ -368,6 +367,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             CreateWindowW(L"STATIC", L"-", WS_CHILD|WS_VISIBLE, 215, y+2, 10, 20, hWnd, NULL,NULL,NULL);
             HWND hPMax = CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER|ES_CENTER, 230, y, 40, 22, hWnd, (HMENU)ID_EDIT_PAD_MAX, NULL, NULL);
 
+            // --- [新增] ECH 设置 ---
             y += 40;
             HWND hChkECH = CreateWindowW(L"BUTTON", L"启用 ECH (Encrypted Client Hello)", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 35, y, 380, 22, hWnd, (HMENU)ID_CHK_ECH, NULL, NULL);
             
@@ -379,6 +379,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             CreateWindowW(L"STATIC", L"ECH域名:", WS_CHILD|WS_VISIBLE, 55, y+2, 80, 20, hWnd, NULL,NULL,NULL);
             HWND hEchPub = CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_AUTOHSCROLL, 140, y, 255, 22, hWnd, (HMENU)ID_EDIT_ECH_DOMAIN, NULL, NULL);
 
+            // --- UA 设置 ---
             y += 45;
             CreateWindowW(L"STATIC", L"伪装平台:", WS_CHILD|WS_VISIBLE, 35, y+3, 80, 20, hWnd, NULL,NULL,NULL);
             HWND hCombo = CreateWindowW(L"COMBOBOX", NULL, WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL, 120, y, 280, 200, hWnd, (HMENU)ID_COMBO_PLATFORM, NULL, NULL);
@@ -386,6 +387,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             y += 30;
             HWND hEditUA = CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_AUTOHSCROLL, 35, y, 365, 25, hWnd, (HMENU)ID_EDIT_UA_STR, NULL, NULL);
 
+            // 按钮区域
             y += 60;
             CreateWindowW(L"BUTTON", L"确定", WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON, 110, y, 100, 32, hWnd, (HMENU)IDOK, NULL,NULL);
             CreateWindowW(L"BUTTON", L"取消", WS_CHILD|WS_VISIBLE, 250, y, 100, 32, hWnd, (HMENU)IDCANCEL, NULL,NULL);
@@ -394,8 +396,9 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             SendMessage(hChk2, BM_SETCHECK, alpn ? BST_CHECKED : BST_UNCHECKED, 0);
             SendMessage(hChk3, BM_SETCHECK, frag ? BST_CHECKED : BST_UNCHECKED, 0);
             SendMessage(hChkPad, BM_SETCHECK, pad ? BST_CHECKED : BST_UNCHECKED, 0);
+            
+            // [新增] ECH 初始化控件状态
             SendMessage(hChkECH, BM_SETCHECK, ech ? BST_CHECKED : BST_UNCHECKED, 0);
-
             wchar_t wEchSrv[256]; MultiByteToWideChar(CP_UTF8, 0, echServer, -1, wEchSrv, 256);
             SetWindowTextW(hEchSrv, wEchSrv);
             wchar_t wEchPub[256]; MultiByteToWideChar(CP_UTF8, 0, echPub, -1, wEchPub, 256);
@@ -404,6 +407,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             SetDlgItemInt(hWnd, ID_EDIT_FRAG_MIN, fMin, FALSE);
             SetDlgItemInt(hWnd, ID_EDIT_FRAG_MAX, fMax, FALSE);
             SetDlgItemInt(hWnd, ID_EDIT_FRAG_DLY, fDly, FALSE);
+            
             SetDlgItemInt(hWnd, ID_EDIT_PAD_MIN, pMin, FALSE);
             SetDlgItemInt(hWnd, ID_EDIT_PAD_MAX, pMax, FALSE);
 
@@ -421,6 +425,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
                 if (idx >= 0 && idx < 5) SetDlgItemTextA(hWnd, ID_EDIT_UA_STR, UA_TEMPLATES[idx]);
             }
             if (LOWORD(wParam) == IDOK) {
+                // 读取 UI 状态
                 int fMin = GetDlgItemInt(hWnd, ID_EDIT_FRAG_MIN, NULL, FALSE);
                 int fMax = GetDlgItemInt(hWnd, ID_EDIT_FRAG_MAX, NULL, FALSE);
                 int fDly = GetDlgItemInt(hWnd, ID_EDIT_FRAG_DLY, NULL, FALSE);
@@ -438,6 +443,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
                 
                 int port = GetDlgItemInt(hWnd, ID_PORT_EDIT, NULL, FALSE);
 
+                // [Lock] 保护写入，确保全局配置的一致性
                 EnterCriticalSection(&g_configLock);
 
                 g_fragSizeMin = fMin; g_fragSizeMax = fMax; g_fragDelayMs = fDly;
@@ -447,6 +453,8 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
                 g_enableALPN = (IsDlgButtonChecked(hWnd, ID_CHK_ALPN) == BST_CHECKED);
                 g_enableFragment = (IsDlgButtonChecked(hWnd, ID_CHK_FRAG) == BST_CHECKED);
                 g_enablePadding = (IsDlgButtonChecked(hWnd, ID_CHK_PADDING) == BST_CHECKED);
+                
+                // [新增] 保存 ECH 设置
                 g_enableECH = (IsDlgButtonChecked(hWnd, ID_CHK_ECH) == BST_CHECKED);
                 
                 wchar_t wBuf[256];
@@ -468,7 +476,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 
                 LeaveCriticalSection(&g_configLock);
 
-                SaveSettings(); 
+                SaveSettings(); // 内部已加锁
                 if (g_proxyRunning) { StopProxyCore(); StartProxyCore(); }
                 DestroyWindow(hWnd);
             } else if (LOWORD(wParam) == IDCANCEL) DestroyWindow(hWnd);
@@ -487,15 +495,20 @@ void OpenSettingsWindow() {
     }
     WNDCLASSW wc = {0}; wc.lpfnWndProc=SettingsWndProc; wc.hInstance=GetModuleHandle(NULL); wc.lpszClassName=L"Settings"; wc.hbrBackground=(HBRUSH)(COLOR_BTNFACE+1);
     WNDCLASSW temp; if (!GetClassInfoW(GetModuleHandle(NULL), L"Settings", &temp)) RegisterClassW(&wc);
+    // [Fix] 增加窗口高度到 660 以容纳新增的 ECH 控件
     hSettingsWnd = CreateWindowW(L"Settings", L"软件设置", WS_VISIBLE|WS_CAPTION|WS_SYSMENU, CW_USEDEFAULT,0,480,660, hwnd,NULL,wc.hInstance,NULL);
     ShowWindow(hSettingsWnd, SW_SHOW);
 }
 
-// --- 订阅设置窗口消息处理 ---
+// --- 订阅设置窗口逻辑 ---
+
+static HWND hSubList;
 
 void RefreshSubList() {
     if (!hSubList) return;
     ListView_DeleteAllItems(hSubList);
+    
+    // [Lock] 保护 g_subs 遍历，防止后台更新线程同时修改
     EnterCriticalSection(&g_configLock);
     for (int i = 0; i < g_subCount; i++) {
         LVITEMW li = {0};
@@ -511,6 +524,7 @@ void RefreshSubList() {
     LeaveCriticalSection(&g_configLock);
 }
 
+// 辅助：更新自定义时间编辑框的启用状态
 void UpdateSubUIState(HWND hDlg) {
     BOOL isCustom = (SendMessage(GetDlgItem(hDlg, IDC_RADIO_CUSTOM), BM_GETCHECK, 0, 0) == BST_CHECKED);
     EnableWindow(GetDlgItem(hDlg, IDC_EDIT_CUSTOM_TIME), isCustom);
@@ -534,6 +548,7 @@ LRESULT CALLBACK SubWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             CreateWindowW(L"BUTTON", L"保存设置", WS_CHILD|WS_VISIBLE, 280, 210, 80, 28, hWnd, (HMENU)ID_SUB_SAVE_BTN, NULL,NULL);
             CreateWindowW(L"BUTTON", L"立即更新", WS_CHILD|WS_VISIBLE, 370, 210, 100, 28, hWnd, (HMENU)ID_SUB_UPD_BTN, NULL,NULL);
             
+            // --- 新增：更新周期设置区域 ---
             int yGrp = 250;
             CreateWindowW(L"BUTTON", L"自动更新周期", WS_CHILD|WS_VISIBLE|BS_GROUPBOX, 10, yGrp, 460, 60, hWnd, (HMENU)IDC_GROUP_SUB_UPDATE, NULL, NULL);
             
@@ -544,6 +559,7 @@ LRESULT CALLBACK SubWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             HWND hTime = CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER|ES_CENTER, 260, yGrp+23, 50, 22, hWnd, (HMENU)IDC_EDIT_CUSTOM_TIME, NULL, NULL);
             CreateWindowW(L"STATIC", L"小时", WS_CHILD|WS_VISIBLE, 315, yGrp+25, 40, 20, hWnd, (HMENU)IDC_STATIC_CUSTOM_UNIT, NULL, NULL);
 
+            // 初始化控件状态
             EnterCriticalSection(&g_configLock);
             int mode = g_subUpdateMode;
             int interval = g_subUpdateInterval;
@@ -568,7 +584,7 @@ LRESULT CALLBACK SubWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 UpdateSubUIState(hWnd);
             }
             else if (id == ID_SUB_ADD_BTN) {
-                EnterCriticalSection(&g_configLock); 
+                EnterCriticalSection(&g_configLock); // [Lock]
                 if (g_subCount >= MAX_SUBS) { 
                     LeaveCriticalSection(&g_configLock);
                     MessageBoxW(hWnd, L"已达最大订阅数限制(20个)", L"提示", MB_OK); 
@@ -583,22 +599,22 @@ LRESULT CALLBACK SubWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 }
                 strncpy(g_subs[g_subCount].url, newUrl, 511); g_subs[g_subCount].url[511] = 0;
                 g_subs[g_subCount].enabled = TRUE; g_subCount++;
-                LeaveCriticalSection(&g_configLock);
+                LeaveCriticalSection(&g_configLock); // [Unlock]
                 
                 RefreshSubList(); SetDlgItemTextA(hWnd, ID_SUB_URL_EDIT, "");
             }
             else if (id == ID_SUB_DEL_BTN) {
                 int sel = ListView_GetNextItem(hSubList, -1, LVNI_SELECTED);
                 if (sel != -1) {
-                    EnterCriticalSection(&g_configLock);
+                    EnterCriticalSection(&g_configLock); // [Lock]
                     for (int i = sel; i < g_subCount - 1; i++) g_subs[i] = g_subs[i+1];
                     g_subCount--; 
-                    LeaveCriticalSection(&g_configLock);
+                    LeaveCriticalSection(&g_configLock); // [Unlock]
                     RefreshSubList();
                 } else MessageBoxW(hWnd, L"请先在列表中选中一项", L"提示", MB_OK);
             }
             else if (id == ID_SUB_SAVE_BTN || id == ID_SUB_UPD_BTN) {
-                EnterCriticalSection(&g_configLock);
+                EnterCriticalSection(&g_configLock); // [Lock]
                 
                 for(int i=0; i<g_subCount; i++) g_subs[i].enabled = ListView_GetCheckState(hSubList, i);
                 
@@ -613,7 +629,7 @@ LRESULT CALLBACK SubWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 int interval = GetDlgItemInt(hWnd, IDC_EDIT_CUSTOM_TIME, NULL, FALSE);
                 if (interval > 0) g_subUpdateInterval = interval;
                 
-                LeaveCriticalSection(&g_configLock);
+                LeaveCriticalSection(&g_configLock); // [Unlock]
                 
                 SaveSettings(); 
 
@@ -656,7 +672,7 @@ void OpenSubWindow() {
     ShowWindow(hSubWnd, SW_SHOW); UpdateWindow(hSubWnd);
 }
 
-// --- 节点管理窗口消息处理 ---
+// --- 节点管理窗口 ---
 
 LRESULT CALLBACK NodeMgrWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     static HWND hList;
@@ -677,11 +693,16 @@ LRESULT CALLBACK NodeMgrWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             break;
         case WM_REFRESH_NODELIST:
             SendMessage(hList, LB_RESETCONTENT, 0, 0);
+            
+            // [Lock] 保护节点列表更新和遍历
+            // ParseTags 内部虽然有锁，但我们需要确保 ParseTags 之后到遍历结束期间 nodeTags 不被释放
             EnterCriticalSection(&g_configLock); 
-            ParseTags(); 
+            
+            ParseTags(); // 内部有锁，递归锁是安全的
             for(int i = 0; i < nodeCount; i++) {
                 SendMessageW(hList, LB_ADDSTRING, 0, (LPARAM)nodeTags[i]);
             }
+            
             LeaveCriticalSection(&g_configLock); 
             break;
         case WM_COMMAND:
@@ -705,20 +726,16 @@ LRESULT CALLBACK NodeMgrWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                 wchar_t confirmMsg[64]; 
                 swprintf_s(confirmMsg, 64, L"确定要删除选中的 %d 个节点吗？", selCount);
                 if (MessageBoxW(hWnd, confirmMsg, L"确认删除", MB_YESNO | MB_ICONQUESTION) != IDYES) break;
-                
                 int* selIndices = (int*)malloc(selCount * sizeof(int));
                 if (!selIndices) break;
                 SendMessage(hList, LB_GETSELITEMS, (WPARAM)selCount, (LPARAM)selIndices);
-                
                 wchar_t** tagsToDelete = (wchar_t**)malloc(selCount * sizeof(wchar_t*));
                 for (int i = 0; i < selCount; i++) {
                     int len = SendMessage(hList, LB_GETTEXTLEN, selIndices[i], 0);
                     tagsToDelete[i] = (wchar_t*)malloc((len + 1) * sizeof(wchar_t));
                     SendMessageW(hList, LB_GETTEXT, selIndices[i], (LPARAM)tagsToDelete[i]);
                 }
-                
                 for (int i = 0; i < selCount; i++) { DeleteNode(tagsToDelete[i]); free(tagsToDelete[i]); }
-                
                 free(tagsToDelete); free(selIndices);
                 SendMessage(hWnd, WM_REFRESH_NODELIST, 0, 0); MessageBoxW(hWnd, L"删除完成", L"提示", MB_OK);
             }
@@ -741,8 +758,6 @@ void OpenNodeManager() {
     hMgr = CreateWindowW(L"NodeMgr", L"节点管理 (支持 Ctrl+A 全选/多选)", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT, 0, 450, 270, NULL, NULL, GetModuleHandle(NULL), NULL);
     ShowWindow(hMgr, SW_SHOW);
 }
-
-// --- 节点编辑窗口消息处理 ---
 
 LRESULT CALLBACK NodeEditWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch(msg) {
@@ -824,8 +839,6 @@ void OpenNodeEditWindow(const wchar_t* tag) {
     if(h) { ShowWindow(h, SW_SHOW); UpdateWindow(h); }
 }
 
-// --- 日志窗口消息处理 ---
-
 LRESULT CALLBACK LogWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     static HWND hEdit;
     static HWND hChk;
@@ -849,7 +862,10 @@ LRESULT CALLBACK LogWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_COMMAND:
             if (LOWORD(wParam) == ID_LOG_CHK) {
                 g_enableLog = (IsDlgButtonChecked(hWnd, ID_LOG_CHK) == BST_CHECKED);
-                if (g_enableLog) log_msg("[System] 日志记录已开启。");
+                // [Fix] 切换开关时增加日志提示，给用户反馈
+                if (g_enableLog) {
+                    log_msg("[System] 日志记录已开启。");
+                }
             }
             break;
 
@@ -869,12 +885,14 @@ void OpenLogViewer(BOOL bShow) {
         return;
     }
     
+    // [Fix] 明确指定背景画刷为 COLOR_BTNFACE+1 (标准灰色背景)
+    // 防止背景未绘制导致的黑色或透明视觉残留，以及解决与复选框控件背景色的差异
     WNDCLASSW wc = {0}; 
     if (!GetClassInfoW(GetModuleHandle(NULL), L"LogWnd", &wc)) {
         wc.lpfnWndProc = LogWndProc; 
         wc.hInstance = GetModuleHandle(NULL); 
         wc.lpszClassName = L"LogWnd"; 
-        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1); 
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1); // 修复：设置背景色
         RegisterClassW(&wc);
     }
     
@@ -882,24 +900,11 @@ void OpenLogViewer(BOOL bShow) {
     if (bShow) ShowWindow(hLogViewerWnd, SW_SHOW); else ShowWindow(hLogViewerWnd, SW_HIDE);
 }
 
-// [补全] ToggleTrayIcon 函数实现
-void ToggleTrayIcon() {
-    if (g_isIconVisible) {
-        Shell_NotifyIconW(NIM_DELETE, &nid);
-        g_isIconVisible = FALSE;
-    } else {
-        Shell_NotifyIconW(NIM_ADD, &nid);
-        Shell_NotifyIconW(NIM_SETVERSION, &nid);
-        g_isIconVisible = TRUE;
-    }
-}
-
-// --- 托盘与主窗口消息处理 ---
-
 LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == WM_TRAY && LOWORD(lParam) == WM_RBUTTONUP) {
         POINT pt; GetCursorPos(&pt); SetForegroundWindow(hWnd);
         
+        // [Lock] 保护 Tray 菜单的生成，防止 nodeTags 变动
         EnterCriticalSection(&g_configLock);
         ParseTags(); 
         
@@ -929,14 +934,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
     else if (msg == WM_COMMAND) {
         int id = LOWORD(wParam);
-        // [修复] 优化退出流程
         if (id == ID_TRAY_EXIT) { 
-            log_msg("[System] 正在安全退出程序...");
-            Shell_NotifyIconW(NIM_DELETE, &nid); 
-            if (IsSystemProxyEnabled()) SetSystemProxy(FALSE); 
-            StopProxyCore(); 
-            Sleep(200);
-            PostQuitMessage(0); 
+            Shell_NotifyIconW(NIM_DELETE, &nid); if (IsSystemProxyEnabled()) SetSystemProxy(FALSE); StopProxyCore(); ExitProcess(0); 
         }
         else if (id == ID_TRAY_SYSTEM_PROXY) SetSystemProxy(!IsSystemProxyEnabled());
         else if (id == ID_TRAY_SHOW_CONSOLE) OpenLogViewer(TRUE);
@@ -948,7 +947,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             int count = ImportFromClipboard(); 
             if (count > 0) {
                 ParseTags();
-                HWND hMgr = FindWindowW(L"NodeMgr", NULL);
+                HWND hMgr = FindWindowW(L"NodeMgr", L"节点管理 (支持 Ctrl+A 全选/多选)");
                 if (hMgr && IsWindow(hMgr)) SendMessage(hMgr, WM_REFRESH_NODELIST, 0, 0);
                 wchar_t msgBuf[128]; 
                 swprintf_s(msgBuf, 128, L"成功导入 %d 个节点！", count);
@@ -956,10 +955,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 
                 EnterCriticalSection(&g_configLock);
                 if (wcslen(currentNode) == 0 && nodeCount > 0) {
-                    wchar_t* tagCopy = _wcsdup(nodeTags[0]);
                     LeaveCriticalSection(&g_configLock);
-                    SwitchNode(tagCopy);
-                    free(tagCopy);
+                    SwitchNode(nodeTags[0]); // SwitchNode 内部会加锁
                 } else {
                     LeaveCriticalSection(&g_configLock);
                 }
@@ -968,9 +965,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         else if (id >= ID_TRAY_NODE_BASE && id < ID_TRAY_NODE_BASE + 1000) {
             int idx = id - ID_TRAY_NODE_BASE;
             
+            // [Lock] 保护 nodeTags 访问
             EnterCriticalSection(&g_configLock);
             if (idx >= 0 && idx < nodeCount) {
-                wchar_t* tagCopy = _wcsdup(nodeTags[idx]);
+                // 复制 tag，避免 SwitchNode 内部锁与外部锁冲突（SwitchNode 是高层逻辑）
+                // 更好的做法是 Copy tag -> Unlock -> SwitchNode
+                int len = wcslen(nodeTags[idx]);
+                wchar_t* tagCopy = (wchar_t*)malloc((len + 1) * sizeof(wchar_t));
+                wcscpy(tagCopy, nodeTags[idx]);
                 LeaveCriticalSection(&g_configLock);
                 
                 SwitchNode(tagCopy);
@@ -981,15 +983,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
     }
     else if (msg == WM_HOTKEY && wParam == ID_GLOBAL_HOTKEY) ToggleTrayIcon();
-    else if (msg == WM_DESTROY) PostQuitMessage(0);
     return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
-
-// --- 主程序入口 ---
 
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nShow) {
     srand((unsigned)time(NULL));
 
+    // [Fix] 初始化全局锁 (最早调用)
     InitGlobalLocks();
 
     wchar_t exePath[MAX_PATH]; GetModuleFileNameW(NULL, exePath, MAX_PATH);
@@ -997,6 +997,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nSho
 
     WSADATA wsa; WSAStartup(MAKEWORD(2,2), &wsa);
     
+    // 必须在主线程最开始初始化 OpenSSL 全局表
     init_crypto_global(); 
 
     INITCOMMONCONTROLSEX ic = {sizeof(INITCOMMONCONTROLSEX), ICC_HOTKEY_CLASS}; InitCommonControlsEx(&ic);
@@ -1023,14 +1024,16 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nSho
     nid.uCallbackMessage = WM_TRAY; nid.hIcon = wc.hIcon; wcscpy(nid.szTip, L"Mandala Client");
     if (g_hideTrayStart == 1) { g_isIconVisible = FALSE; } else { Shell_NotifyIconW(NIM_ADD, &nid); g_isIconVisible = TRUE; }
     
-    ParseTags(); 
+    ParseTags(); // 内部已加锁
 
+    // [修复] 启动时优先使用上次保存的节点
     if (wcslen(currentNode) > 0) {
         SwitchNode(currentNode);
     }
     else if (nodeCount > 0) {
+        // [Lock] 保护 nodeTags 访问
         EnterCriticalSection(&g_configLock);
-        wchar_t* firstNode = _wcsdup(nodeTags[0]);
+        wchar_t* firstNode = _wcsdup(nodeTags[0]); // 复制一份出来
         LeaveCriticalSection(&g_configLock);
         
         SwitchNode(firstNode);
@@ -1039,8 +1042,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nSho
     
     MSG msg; while(GetMessage(&msg, NULL, 0, 0)) { TranslateMessage(&msg); DispatchMessage(&msg); }
     
+    // 程序退出前清理
     cleanup_crypto_global();
-    DeleteGlobalLocks(); 
+    DeleteGlobalLocks(); // [Fix] 销毁锁
     
     return 0;
 }
