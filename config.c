@@ -19,6 +19,7 @@ long long g_lastUpdateTime = 0;
 // --- 内部辅助函数声明 ---
 int Internal_BatchAddNodesFromText(const char* text, cJSON* outbounds);
 char* GetUniqueTagName(cJSON* outbounds, const char* type, const char* base_name);
+void ParseTags_NoLock(); // 新增：内部使用的不加锁版本
 cJSON* ParseVmess(const char* link);
 cJSON* ParseShadowsocks(const char* link);
 cJSON* ParseVlessOrTrojan(const char* link);
@@ -252,23 +253,14 @@ BOOL IsAutorun() {
 
 // --- 节点 Tag 管理 ---
 
-void ParseTags() {
-    EnterCriticalSection(&g_configLock);
-
+void ParseTags_NoLock() {
     if (nodeTags) { for(int i=0; i<nodeCount; i++) free(nodeTags[i]); free(nodeTags); }
     nodeCount = 0; nodeTags = NULL;
     char* buffer = NULL; long size = 0;
     
-    if (!ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) {
-        LeaveCriticalSection(&g_configLock);
-        return;
-    }
-
+    if (!ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) return;
     cJSON* root = cJSON_Parse(buffer); free(buffer);
-    if (!root) {
-        LeaveCriticalSection(&g_configLock);
-        return;
-    }
+    if (!root) return;
 
     cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
     if (outbounds) {
@@ -286,6 +278,11 @@ void ParseTags() {
         }
     }
     cJSON_Delete(root);
+}
+
+void ParseTags() {
+    EnterCriticalSection(&g_configLock);
+    ParseTags_NoLock();
     LeaveCriticalSection(&g_configLock);
 }
 
@@ -534,7 +531,7 @@ int ImportFromClipboard() {
         if (out) { WriteBufferToFile(CONFIG_FILE, out); free(out); }
     }
     cJSON_Delete(root); 
-    ParseTags();
+    ParseTags_NoLock();
     LeaveCriticalSection(&g_configLock);
     free(text); 
     return successCount;
@@ -555,16 +552,20 @@ int UpdateAllSubscriptions(BOOL forceMsg) {
 
     char* rawData[MAX_SUBS] = {0}; 
     for (int i = 0; i < count; i++) {
-        log_msg("[Sub] Downloading (%d/%d): %s", i+1, count, subUrls[i]);
+        log_msg("[Sub] 正在下载 (%d/%d): %s", i+1, count, subUrls[i]);
         rawData[i] = Utils_HttpGet(subUrls[i]);
     }
 
-    // 必须在加锁状态下操作配置文件
+    // 关键区：处理配置文件
     EnterCriticalSection(&g_configLock);
     char* buffer = NULL; long size = 0; cJSON* root = NULL;
-    if (ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) { root = cJSON_Parse(buffer); free(buffer); }
+    if (ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) { 
+        root = cJSON_Parse(buffer); 
+        free(buffer); 
+    }
     if (!root) root = cJSON_CreateObject();
     
+    // 彻底清除旧节点
     cJSON_DeleteItemFromObject(root, "outbounds");
     cJSON* outbounds = cJSON_CreateArray(); 
     cJSON_AddItemToObject(root, "outbounds", outbounds);
@@ -577,19 +578,26 @@ int UpdateAllSubscriptions(BOOL forceMsg) {
         }
     }
     
+    // 原子化操作：先转字符串再写入，最后释放锁
     char* out = cJSON_Print(root); 
-    if (out) { WriteBufferToFile(CONFIG_FILE, out); free(out); }
     cJSON_Delete(root);
+    
+    if (out) { 
+        WriteBufferToFile(CONFIG_FILE, out); 
+        free(out); 
+    }
+    
     g_lastUpdateTime = (long long)time(NULL);
-    SaveSettings(); 
-    ParseTags(); 
+    ParseTags_NoLock(); // 使用不带锁的版本更新缓存
     LeaveCriticalSection(&g_configLock);
     
-    log_msg("[Sub] Update complete. New nodes: %d", totalNewNodes);
+    SaveSettings(); // 内部带锁
+    
+    log_msg("[Sub] 更新完成。新增节点: %d", totalNewNodes);
     return totalNewNodes;
 }
 
-// --- 协议解析 (保持原有逻辑并修复内存泄漏) ---
+// --- 协议解析 ---
 
 cJSON* ParseVlessOrTrojan(const char* link) {
     char protocol[16] = {0};
