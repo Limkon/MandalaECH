@@ -12,15 +12,15 @@
 
 #pragma comment(lib, "comctl32.lib")
 
-// --- 全局变量声明 ---
-HWND hwnd = NULL;             // 主窗口句柄
-NOTIFYICONDATA nid = {0};     // 托盘图标
-HMENU hMenu = NULL;           // 托盘菜单
-HMENU hNodeSubMenu = NULL;    // 节点子菜单
-HFONT hAppFont = NULL;        // 应用程序字体
-HFONT hLogFont = NULL;        // 日志字体
-HWND hLogViewerWnd = NULL;    // 日志窗口句柄
-HWND hSubList = NULL;         // 订阅列表句柄
+// --- 全局变量声明 (使用 extern 引用 globals.c 中的定义) ---
+extern HWND hwnd;             
+extern NOTIFYICONDATA nid;    
+extern HMENU hMenu;           
+extern HMENU hNodeSubMenu;    
+extern HFONT hAppFont;        
+extern HFONT hLogFont;        
+extern HWND hLogViewerWnd;    
+extern HWND hSubList;         
 
 // 静态变量 (仅本文件可见)
 static HWND hSettingsWnd = NULL;
@@ -37,7 +37,7 @@ static HWND hSubWnd = NULL;
 // 自定义消息
 #define WM_UPDATE_FINISH (WM_USER + 200)
 
-// --- 函数原型声明 (修复链接错误的关键) ---
+// --- 函数原型声明 ---
 void OpenSettingsWindow();
 void OpenSubWindow();
 void OpenNodeManager();
@@ -511,7 +511,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
     return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
 
-// 关键修复：确保此函数定义在被调用之前，或已有原型
+// 确保函数定义在调用之前
 void OpenSettingsWindow() {
     if (hSettingsWnd && IsWindow(hSettingsWnd)) {
         ShowWindow(hSettingsWnd, SW_RESTORE);
@@ -692,6 +692,18 @@ LRESULT CALLBACK SubWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_DESTROY: hSubWnd = NULL; break;
     }
     return DefWindowProcW(hWnd, msg, wParam, lParam);
+}
+
+void OpenSubWindow() {
+    if (hSubWnd && IsWindow(hSubWnd)) { ShowWindow(hSubWnd, SW_RESTORE); SetForegroundWindow(hSubWnd); return; }
+    WNDCLASSW wc = {0};
+    if (!GetClassInfoW(GetModuleHandle(NULL), L"SubWnd", &wc)) {
+        wc.lpfnWndProc = SubWndProc; wc.hInstance = GetModuleHandle(NULL); 
+        wc.lpszClassName = L"SubWnd"; wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE+1);
+        wc.hCursor = LoadCursor(NULL, IDC_ARROW); RegisterClassW(&wc);
+    }
+    hSubWnd = CreateWindowW(L"SubWnd", L"订阅设置", WS_VISIBLE|WS_CAPTION|WS_SYSMENU, CW_USEDEFAULT,0,500,360, NULL,NULL,GetModuleHandle(NULL),NULL);
+    ShowWindow(hSubWnd, SW_SHOW); UpdateWindow(hSubWnd);
 }
 
 // --- 节点管理窗口消息处理 ---
