@@ -10,12 +10,10 @@
 #include <openssl/rand.h>
 #include <openssl/bio.h>
 
-// [Fix] BoringSSL 不支持 SSL_ctrl，无法手动实现 SSL_set_block_padding
-// 因此删除之前的宏定义，直接在代码中禁用该功能
+// [Fix] 删除 g_ssl_ctx 的重复定义
+// 它已经在 globals.c 中定义，这里通过 common.h 的 extern 声明引用即可
+// SSL_CTX *g_ssl_ctx = NULL; 
 
-// ---------------------- Global Variables ----------------------
-
-SSL_CTX *g_ssl_ctx = NULL;
 static BIO_METHOD *method_frag = NULL;
 static INIT_ONCE g_crypto_init_once = INIT_ONCE_STATIC_INIT;
 
@@ -134,9 +132,6 @@ BOOL CALLBACK InitCryptoCallback(PINIT_ONCE InitOnce, PVOID Parameter, PVOID *Co
         return FALSE;
     }
 
-    // [Fix] 禁用 ECH GREASE，因为当前 BoringSSL 版本不支持 SSL_CTX 级别的设置
-    // SSL_CTX_set_enable_ech_grease(g_ssl_ctx, 1);
-
     SSL_CTX_set_min_proto_version(g_ssl_ctx, TLS1_2_VERSION);
     SSL_CTX_set_max_proto_version(g_ssl_ctx, TLS1_3_VERSION);
     
@@ -204,7 +199,6 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
         }
     }
 
-    // [Fix] 彻底禁用 Padding，因为 SSL_set_block_padding 不可用
     if (settings && settings->enablePadding) {
         int range = settings->padMax - settings->padMin;
         if (range < 0) range = 0;
