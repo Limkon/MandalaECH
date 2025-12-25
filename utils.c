@@ -8,6 +8,7 @@
 #include <windows.h>
 #include <wininet.h>
 #include <ctype.h> 
+#include <excpt.h> // 用于 SEH 异常捕获
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
@@ -21,9 +22,6 @@
 #pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "wininet.lib")
 
-// [Fix] 移除不安全的全局静态 SSL_CTX，改为局部创建以支持多线程
-// static SSL_CTX* g_utils_ctx = NULL;
-
 BOOL IsWindows8OrGreater() {
     HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
     if (hKernel32 == NULL) return FALSE;
@@ -31,7 +29,7 @@ BOOL IsWindows8OrGreater() {
     return (pFunc != NULL);
 }
 
-// [Robustness] 改进日志函数，防止过长消息溢出
+// [Robustness] 改进日志函数
 void log_msg(const char *format, ...) {
     if (!g_enableLog && strstr(format, "[Fatal]") == NULL) return;
 
@@ -44,12 +42,10 @@ void log_msg(const char *format, ...) {
     
     va_list args; 
     va_start(args, format); 
-    // 使用 vsnprintf 保证不越界
     vsnprintf(buf, sizeof(buf) - 2, format, args); 
     va_end(args);
-    buf[sizeof(buf) - 1] = 0; // 确保截断
+    buf[sizeof(buf) - 1] = 0; 
     
-    // 拼接时间戳
     char final_msg[2200]; 
     snprintf(final_msg, sizeof(final_msg), "%s%s\r\n", time_buf, buf);
     
@@ -148,6 +144,7 @@ char* GetQueryParam(const char* query, const char* key) {
 }
 
 // --- Base64 ---
+// 注意：该表只有 128 个元素，处理扩展 ASCII 或中文时必须检查索引
 static const int b64_table[] = {
     -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
     -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
@@ -171,21 +168,30 @@ unsigned char* Base64Decode(const char* input, size_t* out_len) {
         if (input[i] == '\r' || input[i] == '\n') { i++; continue; } 
         if (input[i] == '=') break; 
         
+        // [Crash Fix] 关键修复：防止中文字符导致的数组越界
         unsigned char a = (unsigned char)input[i];
+        if (a >= 128) { i++; continue; } // 跳过非法字符
+
+        if (i+1 >= len) break;
         unsigned char b = (unsigned char)input[i+1];
-        if (i+1 >= len || b64_table[a] == -1 || b64_table[b] == -1) break;
+        if (b >= 128) { i+=2; continue; }
+
+        if (b64_table[a] == -1 || b64_table[b] == -1) {
+             // 遇到非法字符中断或跳过
+             break;
+        }
         
         uint32_t n = (b64_table[a] << 18) | (b64_table[b] << 12);
         out[j++] = (n >> 16) & 0xFF;
         
         if (i + 2 < len) {
             unsigned char c = (unsigned char)input[i+2];
-            if (c != '=' && b64_table[c] != -1) {
+            if (c < 128 && c != '=' && b64_table[c] != -1) {
                 n |= (b64_table[c] << 6);
                 out[j++] = (n >> 8) & 0xFF;
                 if (i + 3 < len) {
                     unsigned char d = (unsigned char)input[i+3];
-                    if (d != '=' && b64_table[d] != -1) {
+                    if (d < 128 && d != '=' && b64_table[d] != -1) {
                         n |= b64_table[d];
                         out[j++] = n & 0xFF;
                     }
@@ -330,11 +336,12 @@ static BOOL ParseUrl(const char* url, URL_COMPONENTS_SIMPLE* out) {
     return TRUE;
 }
 
-static char* InternalHttpsGet(const char* url) {
+// [Safety] 内部实际执行 HTTP 请求的函数，包裹在 SEH 中调用
+static char* SafeInternalHttpsGet(const char* url) {
     URL_COMPONENTS_SIMPLE u;
     if (!ParseUrl(url, &u)) return NULL;
 
-    // [Fix] 使用局部变量 SSL_CTX，避免多线程竞争导致的 Runtime Error
+    // 创建局部 SSL_CTX，避免多线程干扰
     SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
     if (!ctx) return NULL;
     SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
@@ -362,7 +369,7 @@ static char* InternalHttpsGet(const char* url) {
         return NULL; 
     }
     
-    DWORD timeout = 5000;
+    DWORD timeout = 8000; // 稍微增加超时
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
     setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
 
@@ -421,8 +428,23 @@ cleanup:
     if (buf) free(buf);
     if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); }
     if (s != INVALID_SOCKET) closesocket(s);
-    if (ctx) SSL_CTX_free(ctx); // [Fix] 释放局部 Context
+    if (ctx) SSL_CTX_free(ctx); 
     return result;
+}
+
+// [Safety] 封装的入口，处理 Runtime 异常
+static char* InternalHttpsGet(const char* url) {
+    char* res = NULL;
+    // 使用 Windows SEH (Structured Exception Handling) 捕获底层崩溃
+    // 这能有效防止程序退出时因 OpenSSL 资源释放顺序导致的 Runtime Error
+    __try {
+        res = SafeInternalHttpsGet(url);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        log_msg("[Fatal] Exception caught during HTTPS request to %s", url);
+        res = NULL;
+    }
+    return res;
 }
 
 char* Utils_HttpGet(const char* url) {
