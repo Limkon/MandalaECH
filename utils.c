@@ -8,7 +8,7 @@
 #include <windows.h>
 #include <wininet.h>
 #include <ctype.h> 
-#include <stdarg.h> // 必须包含用于 va_list
+#include <stdarg.h> 
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
@@ -22,7 +22,6 @@
 #pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "wininet.lib")
 
-// 全局日志锁，防止多线程写文件冲突
 static CRITICAL_SECTION g_logLock;
 static int g_logLockInit = 0;
 
@@ -33,21 +32,17 @@ BOOL IsWindows8OrGreater() {
     return (pFunc != NULL);
 }
 
-// [Debug] 增强版日志函数：输出到 DebugView + log.txt 文件
 void log_msg(const char *format, ...) {
-    // 初始化锁
     if (!g_logLockInit) {
         InitializeCriticalSection(&g_logLock);
         g_logLockInit = 1;
     }
 
-    // 格式化时间
     char time_buf[64]; 
     SYSTEMTIME st; 
     GetLocalTime(&st);
     snprintf(time_buf, sizeof(time_buf), "[%02d:%02d:%02d.%03d] ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
     
-    // 格式化消息
     char buf[4096]; 
     va_list args; 
     va_start(args, format); 
@@ -55,17 +50,13 @@ void log_msg(const char *format, ...) {
     va_end(args);
     buf[sizeof(buf) - 1] = 0; 
     
-    // 组合最终字符串
     char final_msg[4200]; 
-    snprintf(final_msg, sizeof(final_msg), "%s%s\n", time_buf, buf); // 使用 \n 方便文件阅读
+    snprintf(final_msg, sizeof(final_msg), "%s%s\n", time_buf, buf); 
     
-    // 1. 输出到调试器 (DebugView)
     OutputDebugStringA(final_msg);
     
-    // 2. 输出到 GUI 日志窗口 (如果有)
     extern HWND hLogViewerWnd; 
     if (hLogViewerWnd && IsWindow(hLogViewerWnd)) {
-        // GUI 需要 \r\n 换行
         char gui_msg[4200];
         snprintf(gui_msg, sizeof(gui_msg), "%s%s\r\n", time_buf, buf);
         int wLen = MultiByteToWideChar(CP_UTF8, 0, gui_msg, -1, NULL, 0);
@@ -79,12 +70,11 @@ void log_msg(const char *format, ...) {
         }
     }
 
-    // 3. [关键] 输出到 log.txt 文件
     EnterCriticalSection(&g_logLock);
-    FILE* fp = fopen("log.txt", "a+"); // 追加模式
+    FILE* fp = fopen("log.txt", "a+"); 
     if (fp) {
         fprintf(fp, "%s", final_msg);
-        fflush(fp); // 强制刷新缓冲区，确保崩溃前写入
+        fflush(fp); 
         fclose(fp);
     }
     LeaveCriticalSection(&g_logLock);
@@ -105,7 +95,6 @@ BOOL ReadFileToBuffer(const wchar_t* filename, char** buffer, long* size) {
     
     if (fsize < 0) { fclose(f); return FALSE; }
 
-    log_msg("[FileIO] File size: %ld bytes. Allocating memory...", fsize);
     *buffer = (char*)malloc(fsize + 1);
     if (!*buffer) { 
         log_msg("[Fatal] Memory allocation failed for file buffer!");
@@ -238,109 +227,7 @@ unsigned char* Base64Decode(const char* input, size_t* out_len) {
     return out;
 }
 
-// --- ECH Helper ---
-static int HexToBin(const char* hex, unsigned char* out, int max_len) {
-    int len = 0;
-    while (*hex && len < max_len) {
-        char c = *hex;
-        int val = 0;
-        if (!isxdigit(c)) { hex++; continue; }
-        if (c >= '0' && c <= '9') val = c - '0';
-        else if (c >= 'a' && c <= 'f') val = c - 'a' + 10;
-        else if (c >= 'A' && c <= 'F') val = c - 'A' + 10;
-        hex++; if (!*hex) break; 
-        char c2 = *hex; int val2 = 0;
-        if (c2 >= '0' && c2 <= '9') val2 = c2 - '0';
-        else if (c2 >= 'a' && c2 <= 'f') val2 = c2 - 'a' + 10;
-        else if (c2 >= 'A' && c2 <= 'F') val2 = c2 - 'A' + 10;
-        out[len++] = (val << 4) | val2; hex++;
-    }
-    return len;
-}
-
-unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t* out_len) {
-    log_msg("[ECH] Fetching config for %s from %s", domain, doh_server);
-    if (!domain || !doh_server) return NULL;
-    char url[1024];
-    snprintf(url, sizeof(url), "%s?name=%s&type=65", doh_server, domain);
-
-    char* json_str = Utils_HttpGet(url);
-    if (!json_str) {
-        log_msg("[ECH] Failed to get DoH response.");
-        return NULL;
-    }
-
-    cJSON* root = cJSON_Parse(json_str);
-    free(json_str);
-    if (!root) {
-        log_msg("[ECH] JSON Parse failed.");
-        return NULL;
-    }
-
-    unsigned char* ech_config = NULL;
-    *out_len = 0;
-
-    cJSON* answer = cJSON_GetObjectItem(root, "Answer");
-    if (cJSON_IsArray(answer)) {
-        cJSON* record = NULL;
-        cJSON_ArrayForEach(record, answer) {
-            cJSON* type = cJSON_GetObjectItem(record, "type");
-            if (type && type->valueint == 65) { 
-                cJSON* data = cJSON_GetObjectItem(record, "data");
-                if (data && data->valuestring) {
-                    const char* data_str = data->valuestring;
-                    const char* ech_pos = strstr(data_str, "ech=\"");
-                    if (ech_pos) {
-                        ech_pos += 5; 
-                        const char* end_quote = strchr(ech_pos, '\"');
-                        if (end_quote) {
-                            size_t b64_len = end_quote - ech_pos;
-                            char* b64_str = (char*)malloc(b64_len + 1);
-                            if (b64_str) {
-                                strncpy(b64_str, ech_pos, b64_len); b64_str[b64_len] = 0;
-                                ech_config = Base64Decode(b64_str, out_len);
-                                free(b64_str);
-                                if (ech_config) break; 
-                            }
-                        }
-                    }
-                    if (!ech_config) {
-                        unsigned char rdata[4096];
-                        int rdata_len = HexToBin(data_str, rdata, sizeof(rdata));
-                        if (rdata_len > 5) { 
-                            int p = 2; // Priority
-                            while (p < rdata_len) {
-                                int label_len = rdata[p++];
-                                if (label_len == 0) break; 
-                                p += label_len;
-                            }
-                            while (p + 4 <= rdata_len) {
-                                int key = (rdata[p] << 8) | rdata[p+1];
-                                int len = (rdata[p+2] << 8) | rdata[p+3];
-                                p += 4;
-                                if (key == 5) { 
-                                    if (p + len <= rdata_len) {
-                                        ech_config = (unsigned char*)malloc(len);
-                                        if (ech_config) {
-                                            memcpy(ech_config, rdata + p, len);
-                                            *out_len = len;
-                                        }
-                                    }
-                                    break; 
-                                }
-                                p += len;
-                            }
-                        }
-                    }
-                }
-            }
-            if (ech_config) break; 
-        }
-    }
-    cJSON_Delete(root);
-    return ech_config;
-}
-
+// --- URL Parsing ---
 typedef struct { 
     char host[256]; 
     int port; 
@@ -370,6 +257,7 @@ static BOOL ParseUrl(const char* url, URL_COMPONENTS_SIMPLE* out) {
     return TRUE;
 }
 
+// --- [CRITICAL FIX] 安全的 HTTPS GET 请求 ---
 static char* InternalHttpsGet(const char* url) {
     log_msg("[HTTP] Fetching URL: %s", url);
     URL_COMPONENTS_SIMPLE u;
@@ -378,10 +266,11 @@ static char* InternalHttpsGet(const char* url) {
         return NULL;
     }
 
+    log_msg("[HTTP] Creating SSL Context...");
     const SSL_METHOD* method = TLS_client_method();
     SSL_CTX* ctx = SSL_CTX_new(method);
     if (!ctx) {
-        log_msg("[HTTP] SSL_CTX_new failed.");
+        log_msg("[HTTP] SSL_CTX_new failed. Check OpenSSL libs.");
         return NULL;
     }
     SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
@@ -397,6 +286,7 @@ static char* InternalHttpsGet(const char* url) {
     hints.ai_socktype = SOCK_STREAM;
     char portStr[16]; snprintf(portStr, 16, "%d", u.port);
     
+    log_msg("[HTTP] Resolving DNS for %s...", u.host);
     if (getaddrinfo(u.host, portStr, &hints, &res) != 0) {
         log_msg("[HTTP] getaddrinfo failed for %s", u.host);
         SSL_CTX_free(ctx); 
@@ -422,24 +312,41 @@ static char* InternalHttpsGet(const char* url) {
         SSL_CTX_free(ctx);
         return NULL;
     }
+    log_msg("[HTTP] TCP Connected. Freeing addrinfo...");
     freeaddrinfo(res);
 
+    log_msg("[HTTP] Creating SSL structure...");
     ssl = SSL_new(ctx);
     if (!ssl) { 
+        log_msg("[HTTP] SSL_new failed.");
         closesocket(s); 
         SSL_CTX_free(ctx);
         return NULL; 
     }
     
-    // [Fix] 64-bit safe cast
-    SSL_set_fd(ssl, (int)(intptr_t)s);
+    // [CRITICAL] 使用 BIO_new_socket 替代 SSL_set_fd
+    // 这种方式在 Windows x64 下更安全，避免了 (int)SOCKET 的截断风险
+    log_msg("[HTTP] Setting up SSL BIO...");
+    BIO* bio = BIO_new_socket((int)(intptr_t)s, BIO_NOCLOSE);
+    if (!bio) {
+        log_msg("[HTTP] BIO_new_socket failed.");
+        SSL_free(ssl);
+        closesocket(s);
+        SSL_CTX_free(ctx);
+        return NULL;
+    }
+    SSL_set_bio(ssl, bio, bio);
+    
     SSL_set_tlsext_host_name(ssl, u.host);
 
-    log_msg("[HTTP] Doing SSL handshake...");
+    log_msg("[HTTP] Performing SSL handshake...");
     if (SSL_connect(ssl) != 1) {
-        log_msg("[HTTP] SSL_connect failed. ERR: %lu", ERR_get_error());
+        long err = ERR_get_error();
+        log_msg("[HTTP] SSL_connect failed. ERR: %lx (%s)", err, ERR_error_string(err, NULL));
+        // 注意：不要在此处 free(bio)，SSL_free 会处理它
         goto cleanup;
     }
+    log_msg("[HTTP] SSL Handshake success.");
 
     char req[2048];
     snprintf(req, sizeof(req), 
@@ -450,6 +357,7 @@ static char* InternalHttpsGet(const char* url) {
         "Connection: close\r\n\r\n", 
         u.path, u.host);
         
+    log_msg("[HTTP] Sending Request...");
     if (SSL_write(ssl, req, (int)strlen(req)) <= 0) {
         log_msg("[HTTP] Failed to send request header.");
         goto cleanup;
@@ -457,6 +365,7 @@ static char* InternalHttpsGet(const char* url) {
 
     int total_cap = 65536; 
     int total_len = 0;
+    log_msg("[HTTP] Allocating buffer (%d bytes)...", total_cap);
     buf = (char*)malloc(total_cap);
     if (!buf) {
         log_msg("[HTTP] OOM allocating receive buffer.");
@@ -467,6 +376,7 @@ static char* InternalHttpsGet(const char* url) {
     while (1) {
         if (total_len >= total_cap - 1024) {
             int new_cap = total_cap * 2;
+            log_msg("[HTTP] Expanding buffer to %d...", new_cap);
             char* new_buf = (char*)realloc(buf, new_cap);
             if (!new_buf) { 
                 log_msg("[HTTP] OOM reallocating buffer.");
@@ -487,7 +397,7 @@ static char* InternalHttpsGet(const char* url) {
     }
     buf[total_len] = 0;
 
-    log_msg("[HTTP] Received %d bytes.", total_len);
+    log_msg("[HTTP] Received %d bytes. Parsing body...", total_len);
     char* body = strstr(buf, "\r\n\r\n");
     if (body) { 
         body += 4; 
@@ -500,9 +410,13 @@ static char* InternalHttpsGet(const char* url) {
 
 cleanup:
     if (buf) free(buf);
-    if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); }
+    if (ssl) { 
+        SSL_shutdown(ssl); 
+        SSL_free(ssl); // 这也会释放 BIO
+    }
     if (s != INVALID_SOCKET) closesocket(s);
     if (ctx) SSL_CTX_free(ctx); 
+    log_msg("[HTTP] Cleanup finished.");
     return result;
 }
 
@@ -570,6 +484,7 @@ void SetSystemProxy(BOOL enable) {
         
         list.dwSize = sizeof(list);
         list.pszConnection = NULL;
+        list.dwOptionCount = 3;
         list.dwOptionCount = 3;
         list.dwOptionError = 0;
         list.pOptions = options;
