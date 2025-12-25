@@ -8,6 +8,7 @@
 #include <commctrl.h>
 #include <stdio.h>
 #include <wchar.h> 
+#include <time.h> // [新增] 引入时间函数
 
 // 链接 comctl32 库以支持高级控件
 #pragma comment(lib, "comctl32.lib")
@@ -33,14 +34,41 @@ BOOL CALLBACK EnumSetFont(HWND hWnd, LPARAM lParam) {
     return TRUE;
 }
 
-// --- 自动更新线程 ---
+// --- 自动更新线程 (已修改：增加时间间隔检查) ---
 DWORD WINAPI AutoUpdateThread(LPVOID lpParam) {
     // 延时 3 秒，等待主程序初始化完毕且界面显示出来
     Sleep(3000); 
     
-    // 如果有启用的订阅，执行更新 (FALSE = 不弹窗，只写日志)
-    // g_subCount 的读取虽理论上需加锁，但原子整数读取风险极低，此处从略以避免长锁
+    // 如果有启用的订阅
     if (g_subCount > 0) {
+        // [新增] 检查是否达到更新间隔
+        long long now = (long long)time(NULL);
+        long long intervalSeconds = 0;
+        
+        // 获取配置 (简单读取无需加锁，或使用局部锁)
+        EnterCriticalSection(&g_configLock);
+        int mode = g_subUpdateMode;
+        int intervalHours = g_subUpdateInterval;
+        long long lastTime = g_lastUpdateTime;
+        LeaveCriticalSection(&g_configLock);
+
+        // 计算所需的间隔秒数
+        if (mode == UPDATE_MODE_DAILY) {
+            intervalSeconds = 24 * 3600;     // 每天
+        } else if (mode == UPDATE_MODE_WEEKLY) {
+            intervalSeconds = 7 * 24 * 3600; // 每周
+        } else {
+            intervalSeconds = intervalHours * 3600; // 自定义小时
+        }
+
+        // 如果未达到更新时间，且不是从未更新过(lastTime > 0)，则跳过
+        if (lastTime > 0 && (now - lastTime) < intervalSeconds) {
+            log_msg("[Sub] AutoUpdate skipped. Next update in %.1f hours.", 
+                (double)(intervalSeconds - (now - lastTime)) / 3600.0);
+            return 0;
+        }
+
+        // 执行更新 (FALSE = 不弹窗，只写日志)
         int count = UpdateAllSubscriptions(FALSE); // 内部已加锁
         
         // 如果更新到了节点，仅通知界面刷新，不进行危险的 SwitchNode 操作
@@ -1020,4 +1048,3 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nSho
     
     return 0;
 }
-
