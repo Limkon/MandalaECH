@@ -595,13 +595,8 @@ int UpdateAllSubscriptions(BOOL forceMsg) {
     int totalNewNodes = 0;
     for (int i = 0; i < count; i++) {
         if (rawData[i]) { 
-            // 增加 try-catch 保护解析过程 (防止 Base64/JSON 解析崩溃)
-            __try {
-                totalNewNodes += Internal_BatchAddNodesFromText(rawData[i], outbounds); 
-            }
-            __except (EXCEPTION_EXECUTE_HANDLER) {
-                log_msg("[Error] 解析订阅内容时发生异常 (Index: %d)", i);
-            }
+            // [GCC Fix] 移除 SEH，仅保留逻辑
+            totalNewNodes += Internal_BatchAddNodesFromText(rawData[i], outbounds); 
             free(rawData[i]); rawData[i] = NULL;
         }
     }
