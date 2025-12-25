@@ -1,0 +1,102 @@
+name:  OpenSSL Windows Manual Build
+on:
+  workflow_dispatch:
+
+jobs:
+  # --- 任務 1：專門負責編譯 OpenSSL ---
+  build-openssl:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          cache: true
+          install: git
+          path-type: minimal
+
+      - name: Install Dependencies
+        shell: msys2 {0}
+        run: |
+          sed -i 's/^SigLevel.*/SigLevel = Never/' /etc/pacman.conf
+          pacman -Sy --noconfirm mingw-w64-x86_64-gcc mingw-w64-x86_64-make
+
+      - name: Cache OpenSSL
+        id: cache-openssl
+        uses: actions/cache@v4
+        with:
+          path: openssl_dist
+          key: openssl-ech-${{ runner.os }}-v1 # 固定版本 Key
+
+      - name: Building OpenSSL (This will only run once)
+        shell: msys2 {0}
+        if: steps.cache-openssl.outputs.cache-hit != 'true'
+        run: |
+          echo "Building OpenSSL (This will only run once)..."
+          git clone --depth 1 https://github.com/defo-project/openssl.git openssl-ech
+          cd openssl-ech
+          # 1. 還原 Configure 指令 (移除 -D__int64...)
+           ./Configure mingw64 no-shared enable-ech --prefix=${GITHUB_WORKSPACE}/openssl_dist
+        
+          # 2. [新增] 使用 sed 直接修復 e_os2.h 中的類型定義
+          sed -i 's/typedef __int64 ossl_ssize_t;/typedef long long ossl_ssize_t;/g' include/openssl/e_os2.h
+        
+          # 3. 繼續執行編譯
+          mingw32-make -j8
+          mingw32-make install_sw
+
+  # --- 任務 2：編譯 Mandala 主程序 ---
+  build-app:
+    needs: build-openssl # 確保 OpenSSL 任務先完成
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          cache: true
+          install: git
+          path-type: minimal
+
+      - name: Install Build Tools
+        shell: msys2 {0}
+        run: |
+          sed -i 's/^SigLevel.*/SigLevel = Never/' /etc/pacman.conf
+          pacman -Sy --noconfirm mingw-w64-x86_64-gcc mingw-w64-x86_64-make
+
+      - name: Restore OpenSSL Cache
+        id: cache-openssl
+        uses: actions/cache@v4
+        with:
+          path: openssl_dist
+          key: openssl-ech-${{ runner.os }}-v1 # 必須與任務 1 的 Key 完全一致
+
+      - name: Compile Resources
+        shell: msys2 {0}
+        run: windres -i resource.rc -o resource.res --target=pe-x86-64 -O coff
+
+      - name: Compile Executable
+        shell: msys2 {0}
+        run: |
+          # 這裡現在會直接使用任務 1 緩存好的 openssl_dist
+          gcc gui.c config.c proxy.c crypto.c utils.c globals.c cJSON.c resource.res -o Mandala.exe \
+            -I${GITHUB_WORKSPACE}/openssl_dist/include \
+            -L${GITHUB_WORKSPACE}/openssl_dist/lib \
+            -L${GITHUB_WORKSPACE}/openssl_dist/lib64 \
+            -lssl -lcrypto -lws2_32 -lgdi32 -lcomctl32 -lwininet -lcrypt32 -luser32 \
+            -mwindows -municode -finput-charset=UTF-8 \
+            -static
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mandala-Windows-x64-ECH
+          path: Mandala.exe
