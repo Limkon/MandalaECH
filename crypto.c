@@ -18,6 +18,29 @@
 // 引用 globals.c 中的全局变量
 extern SSL_CTX *g_ssl_ctx;
 
+// --------------------------------------------------------------------------
+// [Fix] 手动声明 BoringSSL 扩展函数原型 (解决 implicit declaration 错误)
+// --------------------------------------------------------------------------
+// 即使是 OpenSSL 1.0.2 环境，重新声明也是安全的
+typedef int (*custom_ext_add_cb)(SSL *ssl, unsigned ext_type,
+                                 const unsigned char **out, size_t *outlen,
+                                 int *al, void *add_arg);
+
+typedef void (*custom_ext_free_cb)(SSL *ssl, unsigned ext_type,
+                                   const unsigned char *out, void *add_arg);
+
+typedef int (*custom_ext_parse_cb)(SSL *ssl, unsigned ext_type,
+                                   const unsigned char *in, size_t inlen,
+                                   int *al, void *parse_arg);
+
+// 强制声明该函数，确保编译器能找到它
+extern int SSL_CTX_add_client_custom_ext(SSL_CTX *ctx, unsigned ext_type,
+                                         custom_ext_add_cb add_cb,
+                                         custom_ext_free_cb free_cb, void *add_arg,
+                                         custom_ext_parse_cb parse_cb, void *parse_arg);
+
+// --------------------------------------------------------------------------
+
 static BIO_METHOD *method_frag = NULL;
 static INIT_ONCE g_crypto_init_once = INIT_ONCE_STATIC_INIT;
 
@@ -113,14 +136,14 @@ static long frag_ctrl(BIO *b, int cmd, long num, void *ptr) {
 }
 
 // ---------------------- Custom TLS Padding Implementation ----------------------
-// [Fix] 适配 BoringSSL 回调签名 (无 context, X509 等参数)
 
 // 回调：构造 Padding 扩展数据
-static int padding_add_cb(SSL *s, unsigned int ext_type,
+// [Fix] 参数类型匹配 BoringSSL/OpenSSL 1.0.2 风格
+static int padding_add_cb(SSL *ssl, unsigned int ext_type,
                           const unsigned char **out, size_t *outlen,
                           int *al, void *add_arg) {
     // 1. 获取连接配置 (通过 SSL_set_app_data 传入)
-    CryptoSettings* settings = (CryptoSettings*)SSL_get_app_data(s);
+    CryptoSettings* settings = (CryptoSettings*)SSL_get_app_data(ssl);
     
     // 如果没有配置或未启用 Padding，则不添加扩展
     if (!settings || !settings->enablePadding) return 0; 
@@ -150,7 +173,7 @@ static int padding_add_cb(SSL *s, unsigned int ext_type,
 }
 
 // 回调：释放 Padding 扩展数据
-static void padding_free_cb(SSL *s, unsigned int ext_type,
+static void padding_free_cb(SSL *ssl, unsigned int ext_type,
                             const unsigned char *out, void *add_arg) {
     if (out) free((void*)out);
 }
@@ -184,8 +207,8 @@ BOOL CALLBACK InitCryptoCallback(PINIT_ONCE InitOnce, PVOID Parameter, PVOID *Co
     SSL_CTX_set_options(g_ssl_ctx, SSL_OP_NO_COMPRESSION | SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION);
     SSL_CTX_set_session_cache_mode(g_ssl_ctx, SSL_SESS_CACHE_CLIENT);
 
-    // [Fix] 使用 BoringSSL 兼容的函数注册自定义扩展
-    // SSL_CTX_add_client_custom_ext 专门用于客户端，不需要 SSL_EXT_CLIENT_HELLO 标志
+    // [Fix] 使用手动声明的 SSL_CTX_add_client_custom_ext 进行注册
+    // 这种方式兼容性最好，适用于 BoringSSL 和 OpenSSL 1.0.2+
     if (!SSL_CTX_add_client_custom_ext(g_ssl_ctx, TLSEXT_TYPE_padding,
                                        padding_add_cb, padding_free_cb, NULL,
                                        NULL, NULL)) {
