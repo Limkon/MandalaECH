@@ -11,6 +11,11 @@
 #include <openssl/rand.h>
 #include <openssl/bio.h>
 
+// [Fix] 补充定义 SSL_set_block_padding 宏，防止编译错误
+#ifndef SSL_set_block_padding
+#define SSL_set_block_padding(ssl, size) SSL_ctrl(ssl, SSL_CTRL_SET_BLOCK_PADDING, size, NULL)
+#endif
+
 // ---------------------- Global Variables ----------------------
 
 // 全局 SSL 上下文 (用于代理连接)
@@ -481,4 +486,5 @@ int ws_read_payload_exact(TLSContext *tls, char *out_buf, int expected_len) {
     
     return payload_len;
 }
+
 
