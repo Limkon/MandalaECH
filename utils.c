@@ -143,7 +143,6 @@ char* GetQueryParam(const char* query, const char* key) {
 }
 
 // --- Base64 ---
-// 注意：该表只有 128 个元素，处理扩展 ASCII 或中文时必须检查索引
 static const int b64_table[] = {
     -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
     -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
@@ -167,9 +166,9 @@ unsigned char* Base64Decode(const char* input, size_t* out_len) {
         if (input[i] == '\r' || input[i] == '\n') { i++; continue; } 
         if (input[i] == '=') break; 
         
-        // [Crash Fix] 关键修复：防止中文字符或非法字符导致的数组越界
+        // [Safety] 防止非法字符/中文导致数组越界访问
         unsigned char a = (unsigned char)input[i];
-        if (a >= 128 || b64_table[a] == -1) { i++; continue; } // 跳过非法字符
+        if (a >= 128 || b64_table[a] == -1) { i++; continue; } 
 
         if (i+1 >= len) break;
         unsigned char b = (unsigned char)input[i+1];
@@ -219,7 +218,6 @@ static int HexToBin(const char* hex, unsigned char* out, int max_len) {
     return len;
 }
 
-// [Security] FetchECHConfig 实现
 unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t* out_len) {
     if (!domain || !doh_server) return NULL;
     char url[1024];
@@ -300,7 +298,6 @@ unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t
     return ech_config;
 }
 
-// --- HTTPS Request ---
 typedef struct { 
     char host[256]; 
     int port; 
@@ -330,7 +327,7 @@ static BOOL ParseUrl(const char* url, URL_COMPONENTS_SIMPLE* out) {
     return TRUE;
 }
 
-// [Fix] 移除 SEH 异常处理，改为标准的资源清理逻辑
+// [Safety] 移除了 GCC 不支持的 __try，使用标准的检查
 static char* InternalHttpsGet(const char* url) {
     URL_COMPONENTS_SIMPLE u;
     if (!ParseUrl(url, &u)) return NULL;
