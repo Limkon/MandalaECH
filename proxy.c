@@ -3,26 +3,26 @@
 #include "utils.h"
 #include "common.h"
 #include <openssl/sha.h>
-#include <openssl/rand.h> // 使用 OpenSSL 随机数替代 rand()
+#include <openssl/rand.h> 
 
 // [Safety] 全局活跃连接计数器
 static volatile LONG g_active_connections = 0;
 
 // [Optimization] 内存池配置
-#define MEM_POOL_SIZE 512 // 缓存 512 个 buffer
+#define MEM_POOL_SIZE 512 
 static char* g_buffer_pool[MEM_POOL_SIZE];
-static volatile LONG g_pool_idx = -1; // 栈顶索引
-static CRITICAL_SECTION g_pool_lock;  // 内存池锁
+static volatile LONG g_pool_idx = -1; 
+static CRITICAL_SECTION g_pool_lock;  
 
 // 初始化内存池锁
 void init_buffer_pool() {
+    log_msg("[MemPool] Initializing buffer pool...");
     InitializeCriticalSection(&g_pool_lock);
     g_pool_idx = -1;
 }
 
 // 从池中获取 Buffer
 char* pool_alloc_buffer(int size) {
-    // 仅针对标准 IO_BUFFER_SIZE 进行池化
     if (size != IO_BUFFER_SIZE) return (char*)malloc(size);
 
     char* ptr = NULL;
@@ -56,7 +56,7 @@ void pool_free_buffer(char* ptr, int size) {
     }
     LeaveCriticalSection(&g_pool_lock);
 
-    if (!freed) free(ptr); // 池满了，直接释放
+    if (!freed) free(ptr); 
 }
 
 // 客户端线程上下文
@@ -67,7 +67,7 @@ typedef struct {
     CryptoSettings cryptoSettings;
 } ClientContext;
 
-// --- 辅助函数：解析 UUID ---
+// --- 辅助函数 ---
 void parse_uuid(const char* uuid_str, unsigned char* out) {
     const char* p = uuid_str;
     int i = 0;
@@ -85,7 +85,6 @@ void parse_uuid(const char* uuid_str, unsigned char* out) {
     }
 }
 
-// --- 辅助函数：Trojan 密码哈希 (SHA224) ---
 void trojan_password_hash(const char* password, char* out_hex) {
     unsigned char digest[SHA224_DIGEST_LENGTH];
     SHA224((unsigned char*)password, strlen(password), digest);
@@ -95,13 +94,11 @@ void trojan_password_hash(const char* password, char* out_hex) {
     out_hex[SHA224_DIGEST_LENGTH * 2] = 0;
 }
 
-// 设置 Socket KeepAlive (防止死连接)
 void set_keepalive(SOCKET s) {
     BOOL opt = TRUE;
     setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, (const char*)&opt, sizeof(BOOL));
 }
 
-// 接收超时辅助函数
 int recv_timeout(SOCKET s, char *buf, int len, int timeout_sec) {
     fd_set fds; 
     FD_ZERO(&fds); 
@@ -116,7 +113,6 @@ int recv_timeout(SOCKET s, char *buf, int len, int timeout_sec) {
     return recv(s, buf, len, 0);
 }
 
-// 健壮的头部读取函数
 int read_header_robust(SOCKET s, char* buf, int max_len, int timeout_sec) {
     int total_read = 0;
     int remaining_time = timeout_sec;
@@ -145,7 +141,6 @@ int read_header_robust(SOCKET s, char* buf, int max_len, int timeout_sec) {
     return total_read > 0 ? total_read : -1;
 }
 
-// 发送全部数据辅助函数
 int send_all(SOCKET s, const char *buf, int len) {
     int total = 0; 
     int bytesleft = len; 
@@ -156,11 +151,8 @@ int send_all(SOCKET s, const char *buf, int len) {
         if (n == -1) {
             int err = WSAGetLastError();
             if (err == WSAEWOULDBLOCK) { 
-                fd_set wfd; 
-                FD_ZERO(&wfd); 
-                FD_SET(s, &wfd);
+                fd_set wfd; FD_ZERO(&wfd); FD_SET(s, &wfd);
                 struct timeval tv = { 1, 0 }; 
-                
                 int res = select(0, NULL, &wfd, NULL, &tv);
                 if (res > 0) continue; 
                 if (res == 0) continue; 
@@ -185,7 +177,6 @@ void log_hex_simple(const char* tag, unsigned char* data, int len) {
     log_msg("%s %d bytes: %s...", tag, len, buf);
 }
 
-// --- Base64 编码 ---
 void base64_encode_key(const unsigned char* src, char* dst) {
     const char* table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     for(int i=0; i<16; i+=3) {
@@ -202,17 +193,17 @@ void base64_encode_key(const unsigned char* src, char* dst) {
 
 // --- 客户端处理线程 (核心逻辑) ---
 DWORD WINAPI client_handler(LPVOID p) {
-    InterlockedIncrement(&g_active_connections);
+    LONG active = InterlockedIncrement(&g_active_connections);
+    log_msg("[Client] New connection handler. Active: %ld", active);
 
     ClientContext* ctx = (ClientContext*)p;
     if (!ctx) {
+        log_msg("[Client] Error: NULL context passed to thread.");
         InterlockedDecrement(&g_active_connections);
         return 0;
     }
 
-    // [GCC Fix] 移除 SEH，仅保留逻辑
     SOCKET c = ctx->clientSock;
-    
     ProxyConfig localConfig = ctx->config; 
     CryptoSettings localCrypto = ctx->cryptoSettings;
     char localUserAgent[512];
@@ -271,26 +262,29 @@ DWORD WINAPI client_handler(LPVOID p) {
     
     // [Optimization] 使用内存池分配 c_buf
     c_buf = pool_alloc_buffer(IO_BUFFER_SIZE); 
-    // ws_read_buf 需要动态扩容，不使用固定池
     ws_read_buf = (char*)malloc(ws_read_buf_cap); 
-    // ws_send_buf 较大，也不使用固定池
     ws_send_buf = (char*)malloc(IO_BUFFER_SIZE + 4096); 
 
     if (!c_buf || !ws_read_buf || !ws_send_buf) {
-        log_msg("[Err] OOM Allocating buffers");
+        log_msg("[Client] Error: OOM Allocating buffers");
         goto cl_end; 
     }
     
     setsockopt(c, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
-    set_keepalive(c); // [Reliability] 开启 KeepAlive
+    set_keepalive(c); 
     
     // 1. 读取浏览器首包
+    log_msg("[Client] Reading browser header...");
     browser_len = read_header_robust(c, c_buf, IO_BUFFER_SIZE, 10);
-    if (browser_len <= 0) goto cl_end; 
+    if (browser_len <= 0) {
+        log_msg("[Client] Failed to read browser header.");
+        goto cl_end; 
+    }
     c_buf[browser_len] = 0;
     
     // 协议判断
     if (c_buf[0] == 0x05) { 
+        log_msg("[Client] Detected SOCKS5 handshake.");
         send(c, "\x05\x00", 2, 0); 
         is_socks5 = 1;
         
@@ -309,6 +303,7 @@ DWORD WINAPI client_handler(LPVOID p) {
                 host[dlen] = 0;
                 port = ntohs(*(unsigned short*)&c_buf[5+dlen]);
             } else {
+                log_msg("[Client] Unsupported SOCKS5 address type.");
                 goto cl_end;
             }
             strcpy(method, "SOCKS5");
@@ -330,14 +325,13 @@ DWORD WINAPI client_handler(LPVOID p) {
             } else {
                 header_len = browser_len; 
             }
-        } else { goto cl_end; }
+        } else { 
+            log_msg("[Client] Unknown protocol header.");
+            goto cl_end; 
+        }
     }
     
-    if (is_socks5) {
-        log_msg("[Proxy] SOCKS5 Request to %s:%d", host, port);
-    } else {
-        log_msg("[Proxy] %s Request to %s:%d", method, host, port);
-    }
+    log_msg("[Client] Request: %s %s:%d", method, host, port);
     
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC; 
@@ -346,8 +340,9 @@ DWORD WINAPI client_handler(LPVOID p) {
 
     snprintf(port_str, sizeof(port_str), "%d", localConfig.port);
 
+    log_msg("[Client] Resolving proxy: %s:%s", localConfig.host, port_str);
     if (getaddrinfo(localConfig.host, port_str, &hints, &res) != 0) {
-        log_msg("[Err] DNS Fail: %s", localConfig.host);
+        log_msg("[Client] DNS Fail: %s", localConfig.host);
         goto cl_end;
     }
 
@@ -358,7 +353,7 @@ DWORD WINAPI client_handler(LPVOID p) {
             if (r == INVALID_SOCKET) continue;
 
             setsockopt(r, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
-            set_keepalive(r); // [Reliability] 开启 KeepAlive
+            set_keepalive(r); 
 
             int timeout_ms = 5000;
             setsockopt(r, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout_ms, sizeof(int));
@@ -366,9 +361,11 @@ DWORD WINAPI client_handler(LPVOID p) {
 
             if (connect(r, ptr->ai_addr, (int)ptr->ai_addrlen) == 0) {
                 tls.sock = r;
+                log_msg("[Client] TCP connected. Handshaking TLS (SNI: %s)...", localConfig.sni);
                 if (tls_init_connect(&tls, localConfig.sni, localConfig.host, &localCrypto) == 0) {
                     break;
                 } else {
+                    log_msg("[Client] TLS Handshake failed.");
                     tls_close(&tls);
                     closesocket(r);
                     r = INVALID_SOCKET;
@@ -380,18 +377,23 @@ DWORD WINAPI client_handler(LPVOID p) {
         }
         
         if (r != INVALID_SOCKET && tls.ssl != NULL) break;
+        log_msg("[Client] Connection retry %d...", retry_count + 1);
         Sleep(200); 
     }
     
-    if (r == INVALID_SOCKET || tls.ssl == NULL) goto cl_end;
+    if (r == INVALID_SOCKET || tls.ssl == NULL) {
+        log_msg("[Client] Failed to connect to proxy server after retries.");
+        goto cl_end;
+    }
     
     // 3. WebSocket 握手
+    log_msg("[Client] Sending WS Upgrade...");
     sni_val = (strlen(localConfig.sni) > 0) ? localConfig.sni : localConfig.host;
     req_path = (strlen(localConfig.path) > 0) ? localConfig.path : "/";
     
     unsigned char rnd_key[16];
     char ws_key_str[32];
-    RAND_bytes(rnd_key, 16); // [Security] 使用 OpenSSL RAND
+    RAND_bytes(rnd_key, 16); 
     base64_encode_key(rnd_key, ws_key_str);
 
     offset = snprintf(ws_send_buf, IO_BUFFER_SIZE, 
@@ -407,11 +409,14 @@ DWORD WINAPI client_handler(LPVOID p) {
     tls_write(&tls, ws_send_buf, offset);
 
     len = tls_read(&tls, ws_read_buf, ws_read_buf_cap - 1);
-    if (len <= 0) goto cl_end;
+    if (len <= 0) {
+        log_msg("[Client] WS Response empty.");
+        goto cl_end;
+    }
     ws_read_buf[len] = 0;
     
     if (!strstr(ws_read_buf, "101")) { 
-        log_msg("[Err] WS Handshake Fail: %.50s", ws_read_buf);
+        log_msg("[Client] WS Handshake Fail. Server replied: %.50s", ws_read_buf);
         goto cl_end; 
     }
     
@@ -421,19 +426,23 @@ DWORD WINAPI client_handler(LPVOID p) {
         body_start += 4; 
         int header_bytes = (int)(body_start - ws_read_buf);
         int remaining = len - header_bytes;
-        
         if (remaining > 0) {
             memmove(ws_read_buf, body_start, remaining);
             ws_buf_len = remaining;
         }
     }
     
+    log_msg("[Client] WS Handshake OK. Sending Protocol Header (%s)...", localConfig.type);
+
     // 4. 发送代理协议头
     is_vless = (_stricmp(localConfig.type, "vless") == 0);
     is_trojan = (_stricmp(localConfig.type, "trojan") == 0);
     is_shadowsocks = (_stricmp(localConfig.type, "shadowsocks") == 0);
     is_mandala = (_stricmp(localConfig.type, "mandala") == 0);
 
+    // (协议构造逻辑保持不变，为节省字符数，不再重复打印内部的 if/else 块，它们与之前相同)
+    // ... [Protocol Construction Block] ...
+    // 为确保完整性，此处简写，实际请保留原构造逻辑
     if (is_vless) {
         proto_buf[proto_len++] = 0x00; 
         parse_uuid(localConfig.user, proto_buf + proto_len); proto_len += 16; 
@@ -450,7 +459,11 @@ DWORD WINAPI client_handler(LPVOID p) {
         }
         flen = build_ws_frame((char*)proto_buf, proto_len, ws_send_buf);
         tls_write(&tls, ws_send_buf, flen);
-    } else if (is_trojan) {
+    } 
+    // ... (其他协议的 if/else 请直接使用上一个代码块的内容，逻辑完全一致) ...
+    // 为避免用户混淆，这里只放 vless 示例。
+    // 请务必将上一个回复中从 is_trojan 到 else SOCKS5 的代码完整保留在这里。
+    else if (is_trojan) {
         char hex_pass[56 + 1]; trojan_password_hash(localConfig.pass, hex_pass);
         memcpy(proto_buf, hex_pass, 56); proto_len = 56;
         proto_buf[proto_len++] = 0x0D; proto_buf[proto_len++] = 0x0A;
@@ -469,42 +482,29 @@ DWORD WINAPI client_handler(LPVOID p) {
         tls_write(&tls, ws_send_buf, flen);
     } else if (is_mandala) { 
         unsigned char salt[4];
-        RAND_bytes(salt, 4); // [Security]
-
+        RAND_bytes(salt, 4); 
         unsigned char plaintext[2048]; 
         int p_len = 0;
-
         char hex_pass[57]; 
         trojan_password_hash(localConfig.pass, hex_pass);
         memcpy(plaintext + p_len, hex_pass, 56); p_len += 56;
-
         unsigned char pad_len_c;
         RAND_bytes(&pad_len_c, 1);
         int pad_len = pad_len_c % 16; 
-        
         plaintext[p_len++] = (unsigned char)pad_len;
         if (pad_len > 0) RAND_bytes(plaintext + p_len, pad_len);
         p_len += pad_len;
-
         plaintext[p_len++] = 0x01;
-
         if (inet_pton(AF_INET, host, &ip4) == 1) {
-            plaintext[p_len++] = 0x01; 
-            memcpy(plaintext + p_len, &ip4, 4); p_len += 4;
+            plaintext[p_len++] = 0x01; memcpy(plaintext + p_len, &ip4, 4); p_len += 4;
         } else if (inet_pton(AF_INET6, host, &ip6) == 1) {
-            plaintext[p_len++] = 0x04; 
-            memcpy(plaintext + p_len, &ip6, 16); p_len += 16;
+            plaintext[p_len++] = 0x04; memcpy(plaintext + p_len, &ip6, 16); p_len += 16;
         } else {
-            plaintext[p_len++] = 0x03; 
-            plaintext[p_len++] = (unsigned char)strlen(host);
+            plaintext[p_len++] = 0x03; plaintext[p_len++] = (unsigned char)strlen(host);
             memcpy(plaintext + p_len, host, strlen(host)); p_len += strlen(host);
         }
-
-        plaintext[p_len++] = (port >> 8) & 0xFF; 
-        plaintext[p_len++] = port & 0xFF;
-
+        plaintext[p_len++] = (port >> 8) & 0xFF; plaintext[p_len++] = port & 0xFF;
         plaintext[p_len++] = 0x0D; plaintext[p_len++] = 0x0A;
-
         memcpy(proto_buf, salt, 4);
         for(int i=0; i<p_len; i++) {
             proto_buf[4 + i] = plaintext[i] ^ salt[i % 4];
@@ -512,7 +512,6 @@ DWORD WINAPI client_handler(LPVOID p) {
         proto_len = 4 + p_len;
         flen = build_ws_frame((char*)proto_buf, proto_len, ws_send_buf);
         tls_write(&tls, ws_send_buf, flen);
-
     } else if (is_shadowsocks) {
         if (inet_pton(AF_INET, host, &ip4) == 1) {
             proto_buf[proto_len++] = 0x01; memcpy(proto_buf + proto_len, &ip4, 4); proto_len += 4;
@@ -580,6 +579,7 @@ DWORD WINAPI client_handler(LPVOID p) {
     }
     
     // 6. 转发循环
+    log_msg("[Client] Pipe loop started.");
     ioctlsocket(c, FIONBIO, &mode); 
     ioctlsocket(r, FIONBIO, &mode);
 
@@ -624,7 +624,7 @@ DWORD WINAPI client_handler(LPVOID p) {
                     if (new_cap > ws_read_buf_cap) {
                         char* new_buf = (char*)realloc(ws_read_buf, new_cap);
                         if (!new_buf) {
-                            log_msg("[Err] OOM expanding read buffer");
+                            log_msg("[Client] Error: OOM expanding read buffer");
                             goto cl_end;
                         }
                         ws_read_buf = new_buf;
@@ -689,7 +689,6 @@ DWORD WINAPI client_handler(LPVOID p) {
 
 cl_end:
     if (res) freeaddrinfo(res);
-    // [Optimization] 归还 buffer 到内存池
     if (c_buf) pool_free_buffer(c_buf, IO_BUFFER_SIZE); 
     if (ws_read_buf) free(ws_read_buf); 
     if (ws_send_buf) free(ws_send_buf); 
@@ -705,7 +704,7 @@ cl_end:
 
 // 监听线程与管理函数
 DWORD WINAPI server_thread(LPVOID p) {
-    // [Optimization] 初始化内存池
+    log_msg("[Server] Thread started. Init buffer pool.");
     init_buffer_pool();
 
     g_listen_sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -719,13 +718,13 @@ DWORD WINAPI server_thread(LPVOID p) {
     setsockopt(g_listen_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
     
     if (bind(g_listen_sock, (struct sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
-        log_msg("Port %d bind fail", g_localPort); 
+        log_msg("[Server] Error: Bind failed on port %d. Code: %d", g_localPort, WSAGetLastError()); 
         g_proxyRunning = FALSE; 
         return 0;
     }
     
     listen(g_listen_sock, 100);
-    log_msg("Proxy Started: 127.0.0.1:%d", g_localPort);
+    log_msg("[Server] Proxy Listening on 127.0.0.1:%d", g_localPort);
     
     while(g_proxyRunning) {
         SOCKET c = accept(g_listen_sock, NULL, NULL);
@@ -757,35 +756,43 @@ DWORD WINAPI server_thread(LPVOID p) {
                 LeaveCriticalSection(&g_configLock);
 
                 // [Fix] 恢复默认栈大小 (0=1MB)，防止 OpenSSL 栈溢出
-                // [GCC Fix] 移除 SEH
                 HANDLE hClient = CreateThread(NULL, 0, client_handler, (LPVOID)ctx, 0, NULL);
                 
                 if (hClient) CloseHandle(hClient); 
                 else { 
                     free(ctx); 
                     closesocket(c); 
-                    log_msg("[Err] CreateThread failed");
+                    log_msg("[Server] Error: CreateThread failed.");
                 }
             } else {
                 closesocket(c);
-                log_msg("[Err] OOM creating context");
+                log_msg("[Server] Error: OOM creating context.");
             }
-        } else break;
+        } else {
+            // accept 返回 error，可能是 socket 关闭了
+            if (g_proxyRunning) {
+                log_msg("[Server] Accept returned error: %d", WSAGetLastError());
+                Sleep(100);
+            }
+        }
     }
+    log_msg("[Server] Thread exiting.");
     return 0;
 }
 
 void StartProxyCore() {
     if (g_proxyRunning) return;
     g_proxyRunning = TRUE;
+    log_msg("[Core] Starting Proxy Core...");
     hProxyThread = CreateThread(NULL, 0, server_thread, NULL, 0, NULL);
     if (!hProxyThread) { 
-        log_msg("CreateThread Failed"); 
+        log_msg("[Core] Failed to create server thread!"); 
         g_proxyRunning = FALSE; 
     }
 }
 
 void StopProxyCore() {
+    log_msg("[Core] Stopping Proxy Core...");
     g_proxyRunning = FALSE;
     if (g_listen_sock != INVALID_SOCKET) { 
         closesocket(g_listen_sock); 
@@ -804,5 +811,5 @@ void StopProxyCore() {
     g_pool_idx = -1;
     LeaveCriticalSection(&g_pool_lock);
     
-    log_msg("Proxy Stopped");
+    log_msg("[Core] Proxy Stopped.");
 }
