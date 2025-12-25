@@ -132,6 +132,7 @@ BOOL CALLBACK InitCryptoCallback(PINIT_ONCE InitOnce, PVOID Parameter, PVOID *Co
     SSL_CTX_set_min_proto_version(g_ssl_ctx, TLS1_2_VERSION);
     SSL_CTX_set_max_proto_version(g_ssl_ctx, TLS1_3_VERSION);
     
+    // 使用 Chrome 常用加密套件列表
     const char *chrome_ciphers = "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-RSA-AES128-SHA";
     SSL_CTX_set_cipher_list(g_ssl_ctx, chrome_ciphers);
     SSL_CTX_set_options(g_ssl_ctx, SSL_OP_NO_COMPRESSION | SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION);
@@ -180,8 +181,7 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
     
     // [ECH 处理]
     if (g_enableECH) {
-        // [Fix] 优先使用配置的 ECH Public Name 作为查询对象 (支持 Cloudflare CDN 模式)
-        // 如果 g_echPublicName 为空，则回退到查询 target_sni
+        // [Fix] 优先使用配置的 ECH Public Name 作为查询对象
         const char* query_domain = (g_echPublicName && strlen(g_echPublicName)) ? g_echPublicName : (target_sni ? target_sni : target_host);
         
         size_t ech_len = 0;
@@ -200,12 +200,21 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
     }
 
     if (settings && settings->enablePadding) {
-        // ... (Padding 逻辑禁用，避免 unused 警告) ...
         int range = settings->padMax - settings->padMin;
         if (range < 0) range = 0;
         unsigned char rnd; RAND_bytes(&rnd, 1);
         int blockSize = settings->padMin + (range > 0 ? (rnd % (range + 1)) : 0);
-        (void)blockSize; 
+        
+        // [Fix] 仅在非 BoringSSL 环境下启用 Block Padding
+        // BoringSSL 不支持 SSL_set_block_padding，会直接忽略此设置
+        if (blockSize > 0) {
+        #if !defined(OPENSSL_IS_BORINGSSL)
+            SSL_set_block_padding(ctx->ssl, blockSize);
+        #else
+            // BoringSSL 下暂不支持记录层填充
+            (void)blockSize; // 避免未使用变量警告
+        #endif
+        }
     }
 
     BIO *bio = BIO_new_socket(ctx->sock, BIO_NOCLOSE);
