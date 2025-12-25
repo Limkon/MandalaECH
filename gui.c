@@ -75,13 +75,20 @@ DWORD WINAPI AutoUpdateThread(LPVOID lpParam) {
     return 0;
 }
 
-// 手动更新线程
+// [修复] 手动更新线程：增加安全性校验，防止 Runtime 错误
 DWORD WINAPI ManualUpdateThread(LPVOID param) {
     HWND hWnd = (HWND)param;
-    // TRUE=强制记录日志
+    if (!IsWindow(hWnd)) return 0;
+
+    log_msg("[Thread] 手动更新订阅开始...");
+    
+    // 执行更新逻辑 (UpdateAllSubscriptions 内部需有文件锁保护)
     int count = UpdateAllSubscriptions(TRUE);
-    // 通知 UI 线程更新完成
-    PostMessage(hWnd, WM_UPDATE_FINISH, (WPARAM)count, 0);
+    
+    // 确保窗口依然存在再发送完成消息
+    if (IsWindow(hWnd)) {
+        PostMessage(hWnd, WM_UPDATE_FINISH, (WPARAM)count, 0);
+    }
     return 0;
 }
 
@@ -188,7 +195,6 @@ void SaveEditedNode(HWND hWnd) {
     int netIdx = SendMessage(GetDlgItem(hWnd, ID_EDIT_NET), CB_GETCURSEL, 0, 0);
     int tlsIdx = SendMessage(GetDlgItem(hWnd, ID_EDIT_TLS), CB_GETCURSEL, 0, 0);
 
-    // 1. 获取原始节点类型 (防止类型丢失)
     char originalType[64] = {0};
     char* buffer = NULL; long size = 0;
     if (ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) {
@@ -210,7 +216,6 @@ void SaveEditedNode(HWND hWnd) {
         }
     }
 
-    // 2. 构建新节点 JSON
     cJSON* newNode = cJSON_CreateObject();
     cJSON_AddStringToObject(newNode, "tag", tag);
     cJSON_AddStringToObject(newNode, "server", addr);
@@ -225,7 +230,6 @@ void SaveEditedNode(HWND hWnd) {
              if (strlen(pass)>0) cJSON_AddStringToObject(newNode, "password", pass);
         }
     } else {
-        // 简单推断
         if (strlen(user) > 20) {
             cJSON_AddStringToObject(newNode, "type", "vmess");
             cJSON_AddStringToObject(newNode, "uuid", user);
@@ -255,7 +259,6 @@ void SaveEditedNode(HWND hWnd) {
         cJSON_AddItemToObject(newNode, "tls", tlsObj);
     }
 
-    // 3. 写入文件
     if (ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) {
         cJSON* root = cJSON_Parse(buffer); free(buffer);
         if (root) {
@@ -299,7 +302,6 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
     static HWND hHotkey, hPortEdit;
     switch(msg) {
         case WM_CREATE: {
-            // [Lock] 保护读取
             EnterCriticalSection(&g_configLock);
             int localPort = g_localPort;
             int modifiers = g_hotkeyModifiers;
@@ -321,7 +323,6 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             LeaveCriticalSection(&g_configLock);
 
             int y = 25;
-            // 基础设置
             CreateWindowW(L"STATIC", L"全局快捷键:", WS_CHILD|WS_VISIBLE, 25, y, 140, 20, hWnd, NULL,NULL,NULL);
             hHotkey = CreateWindowExW(0, HOTKEY_CLASSW, NULL, WS_CHILD|WS_VISIBLE|WS_BORDER, 160, y-3, 270, 25, hWnd, (HMENU)ID_HOTKEY_CTRL, NULL,NULL);
             UINT hkMod = 0; if (modifiers & MOD_SHIFT) hkMod |= HOTKEYF_SHIFT;
@@ -334,7 +335,6 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             hPortEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", NULL, WS_CHILD|WS_VISIBLE|ES_NUMBER, 160, y-3, 100, 25, hWnd, (HMENU)ID_PORT_EDIT, NULL,NULL);
             SetDlgItemInt(hWnd, ID_PORT_EDIT, localPort, FALSE);
 
-            // 抗封锁设置 GroupBox
             y += 50;
             CreateWindowW(L"BUTTON", L"抗封锁策略配置", WS_CHILD|WS_VISIBLE|BS_GROUPBOX, 20, y, 420, 440, hWnd, NULL, NULL, NULL);
             
@@ -343,7 +343,6 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             y += 30;
             HWND hChk2 = CreateWindowW(L"BUTTON", L"启用 ALPN 协议伪装 (http/1.1)", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 35, y, 380, 22, hWnd, (HMENU)ID_CHK_ALPN, NULL, NULL);
             
-            // 分片设置
             y += 35;
             HWND hChk3 = CreateWindowW(L"BUTTON", L"启用 TCP 随机分片 (对抗 SNI 阻断)", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 35, y, 380, 22, hWnd, (HMENU)ID_CHK_FRAG, NULL, NULL);
             
@@ -356,7 +355,6 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             CreateWindowW(L"STATIC", L"延迟(ms):", WS_CHILD|WS_VISIBLE, 290, y+2, 60, 20, hWnd, NULL,NULL,NULL);
             HWND hDly = CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER|ES_CENTER, 355, y, 40, 22, hWnd, (HMENU)ID_EDIT_FRAG_DLY, NULL, NULL);
 
-            // Padding 设置
             y += 40;
             HWND hChkPad = CreateWindowW(L"BUTTON", L"启用 TLS 流量填充 (随机包长度)", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 35, y, 380, 22, hWnd, (HMENU)ID_CHK_PADDING, NULL, NULL);
             
@@ -366,7 +364,6 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             CreateWindowW(L"STATIC", L"-", WS_CHILD|WS_VISIBLE, 215, y+2, 10, 20, hWnd, NULL,NULL,NULL);
             HWND hPMax = CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER|ES_CENTER, 230, y, 40, 22, hWnd, (HMENU)ID_EDIT_PAD_MAX, NULL, NULL);
 
-            // ECH 设置
             y += 40;
             HWND hChkECH = CreateWindowW(L"BUTTON", L"启用 ECH (Encrypted Client Hello)", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, 35, y, 380, 22, hWnd, (HMENU)ID_CHK_ECH, NULL, NULL);
             
@@ -378,7 +375,6 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             CreateWindowW(L"STATIC", L"ECH域名:", WS_CHILD|WS_VISIBLE, 55, y+2, 80, 20, hWnd, NULL,NULL,NULL);
             HWND hEchPub = CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_AUTOHSCROLL, 140, y, 255, 22, hWnd, (HMENU)ID_EDIT_ECH_DOMAIN, NULL, NULL);
 
-            // UA 设置
             y += 45;
             CreateWindowW(L"STATIC", L"伪装平台:", WS_CHILD|WS_VISIBLE, 35, y+3, 80, 20, hWnd, NULL,NULL,NULL);
             HWND hCombo = CreateWindowW(L"COMBOBOX", NULL, WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL, 120, y, 280, 200, hWnd, (HMENU)ID_COMBO_PLATFORM, NULL, NULL);
@@ -386,12 +382,10 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             y += 30;
             HWND hEditUA = CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_AUTOHSCROLL, 35, y, 365, 25, hWnd, (HMENU)ID_EDIT_UA_STR, NULL, NULL);
 
-            // 按钮
             y += 60;
             CreateWindowW(L"BUTTON", L"确定", WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON, 110, y, 100, 32, hWnd, (HMENU)IDOK, NULL,NULL);
             CreateWindowW(L"BUTTON", L"取消", WS_CHILD|WS_VISIBLE, 250, y, 100, 32, hWnd, (HMENU)IDCANCEL, NULL,NULL);
 
-            // 初始化控件状态
             SendMessage(hChk1, BM_SETCHECK, chrome ? BST_CHECKED : BST_UNCHECKED, 0);
             SendMessage(hChk2, BM_SETCHECK, alpn ? BST_CHECKED : BST_UNCHECKED, 0);
             SendMessage(hChk3, BM_SETCHECK, frag ? BST_CHECKED : BST_UNCHECKED, 0);
@@ -440,7 +434,6 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
                 
                 int port = GetDlgItemInt(hWnd, ID_PORT_EDIT, NULL, FALSE);
 
-                // [Lock] 保护写入
                 EnterCriticalSection(&g_configLock);
 
                 g_fragSizeMin = fMin; g_fragSizeMax = fMax; g_fragDelayMs = fDly;
@@ -537,7 +530,6 @@ LRESULT CALLBACK SubWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             CreateWindowW(L"BUTTON", L"保存设置", WS_CHILD|WS_VISIBLE, 280, 210, 80, 28, hWnd, (HMENU)ID_SUB_SAVE_BTN, NULL,NULL);
             CreateWindowW(L"BUTTON", L"立即更新", WS_CHILD|WS_VISIBLE, 370, 210, 100, 28, hWnd, (HMENU)ID_SUB_UPD_BTN, NULL,NULL);
             
-            // 更新周期设置
             int yGrp = 250;
             CreateWindowW(L"BUTTON", L"自动更新周期", WS_CHILD|WS_VISIBLE|BS_GROUPBOX, 10, yGrp, 460, 60, hWnd, (HMENU)IDC_GROUP_SUB_UPDATE, NULL, NULL);
             
@@ -682,7 +674,7 @@ LRESULT CALLBACK NodeMgrWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         case WM_REFRESH_NODELIST:
             SendMessage(hList, LB_RESETCONTENT, 0, 0);
             EnterCriticalSection(&g_configLock); 
-            ParseTags(); // 内部虽然有锁，但这里为了保护遍历过程
+            ParseTags(); 
             for(int i = 0; i < nodeCount; i++) {
                 SendMessageW(hList, LB_ADDSTRING, 0, (LPARAM)nodeTags[i]);
             }
@@ -721,7 +713,6 @@ LRESULT CALLBACK NodeMgrWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                     SendMessageW(hList, LB_GETTEXT, selIndices[i], (LPARAM)tagsToDelete[i]);
                 }
                 
-                // 执行删除
                 for (int i = 0; i < selCount; i++) { DeleteNode(tagsToDelete[i]); free(tagsToDelete[i]); }
                 
                 free(tagsToDelete); free(selIndices);
@@ -887,14 +878,12 @@ void OpenLogViewer(BOOL bShow) {
     if (bShow) ShowWindow(hLogViewerWnd, SW_SHOW); else ShowWindow(hLogViewerWnd, SW_HIDE);
 }
 
-// [修复] 解决链接错误：实现托盘图标切换功能
+// [修复] 补全 ToggleTrayIcon 函数实现，解决链接错误
 void ToggleTrayIcon() {
     if (g_isIconVisible) {
-        // 隐藏：从托盘移除图标
         Shell_NotifyIconW(NIM_DELETE, &nid);
         g_isIconVisible = FALSE;
     } else {
-        // 显示：添加图标到托盘
         Shell_NotifyIconW(NIM_ADD, &nid);
         Shell_NotifyIconW(NIM_SETVERSION, &nid);
         g_isIconVisible = TRUE;
@@ -936,8 +925,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
     else if (msg == WM_COMMAND) {
         int id = LOWORD(wParam);
+        // [修复] 优化退出流程，防止程序停止响应
         if (id == ID_TRAY_EXIT) { 
-            Shell_NotifyIconW(NIM_DELETE, &nid); if (IsSystemProxyEnabled()) SetSystemProxy(FALSE); StopProxyCore(); ExitProcess(0); 
+            log_msg("[System] 正在安全退出程序...");
+            Shell_NotifyIconW(NIM_DELETE, &nid); 
+            if (IsSystemProxyEnabled()) SetSystemProxy(FALSE); 
+            StopProxyCore(); 
+            Sleep(200);
+            ExitProcess(0); 
         }
         else if (id == ID_TRAY_SYSTEM_PROXY) SetSystemProxy(!IsSystemProxyEnabled());
         else if (id == ID_TRAY_SHOW_CONSOLE) OpenLogViewer(TRUE);
@@ -990,7 +985,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nShow) {
     srand((unsigned)time(NULL));
 
-    // 1. 初始化全局锁 (最早调用)
     InitGlobalLocks();
 
     wchar_t exePath[MAX_PATH]; GetModuleFileNameW(NULL, exePath, MAX_PATH);
@@ -998,7 +992,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nSho
 
     WSADATA wsa; WSAStartup(MAKEWORD(2,2), &wsa);
     
-    // 2. 初始化 OpenSSL 全局表
     init_crypto_global(); 
 
     INITCOMMONCONTROLSEX ic = {sizeof(INITCOMMONCONTROLSEX), ICC_HOTKEY_CLASS}; InitCommonControlsEx(&ic);
@@ -1025,9 +1018,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nSho
     nid.uCallbackMessage = WM_TRAY; nid.hIcon = wc.hIcon; wcscpy(nid.szTip, L"Mandala Client");
     if (g_hideTrayStart == 1) { g_isIconVisible = FALSE; } else { Shell_NotifyIconW(NIM_ADD, &nid); g_isIconVisible = TRUE; }
     
-    ParseTags(); // 内部已加锁
+    ParseTags(); 
 
-    // 优先使用上次保存的节点
     if (wcslen(currentNode) > 0) {
         SwitchNode(currentNode);
     }
