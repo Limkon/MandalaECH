@@ -39,7 +39,7 @@ jobs:
           echo "Building OpenSSL (This will only run once)..."
           git clone --depth 1 https://github.com/defo-project/openssl.git openssl-ech
           cd openssl-ech
-          ./Configure mingw64 no-shared enable-ech --prefix=${GITHUB_WORKSPACE}/openssl_dist
+          ./Configure mingw64 no-shared enable-ech --prefix=${GITHUB_WORKSPACE}/openssl_dist -D__int64="long long"
           mingw32-make -j8
           mingw32-make install_sw
 
