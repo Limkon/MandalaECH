@@ -10,15 +10,13 @@
 #include <openssl/rand.h>
 #include <openssl/bio.h>
 
-// [Fix] 删除 g_ssl_ctx 的重复定义
-// 它已经在 globals.c 中定义，这里通过 common.h 的 extern 声明引用即可
-// SSL_CTX *g_ssl_ctx = NULL; 
+// SSL_CTX *g_ssl_ctx = NULL; // [Fix] 已在 globals.c 定义，此处删除
 
 static BIO_METHOD *method_frag = NULL;
 static INIT_ONCE g_crypto_init_once = INIT_ONCE_STATIC_INIT;
 
 // ---------------------- BIO Fragmentation Implementation ----------------------
-
+// (保持原样)
 typedef struct {
     int first_packet_sent;
     int frag_min;
@@ -26,7 +24,6 @@ typedef struct {
     int frag_delay;
 } FragCtx;
 
-// 前向声明
 static int frag_write(BIO *b, const char *in, int inl);
 static int frag_read(BIO *b, char *out, int outl);
 static long frag_ctrl(BIO *b, int cmd, long num, void *ptr);
@@ -111,7 +108,7 @@ static long frag_ctrl(BIO *b, int cmd, long num, void *ptr) {
 }
 
 // ---------------------- Initialization Logic ----------------------
-
+// (保持原样)
 BOOL CALLBACK InitCryptoCallback(PINIT_ONCE InitOnce, PVOID Parameter, PVOID *Context) {
     SSL_library_init(); 
     OpenSSL_add_all_algorithms(); 
@@ -183,7 +180,10 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
     
     // [ECH 处理]
     if (g_enableECH) {
-        const char* query_domain = (target_sni && strlen(target_sni)) ? target_sni : target_host;
+        // [Fix] 优先使用配置的 ECH Public Name 作为查询对象 (支持 Cloudflare CDN 模式)
+        // 如果 g_echPublicName 为空，则回退到查询 target_sni
+        const char* query_domain = (g_echPublicName && strlen(g_echPublicName)) ? g_echPublicName : (target_sni ? target_sni : target_host);
+        
         size_t ech_len = 0;
         unsigned char* ech_config = FetchECHConfig(query_domain, g_echConfigServer, &ech_len);
         
@@ -200,14 +200,12 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
     }
 
     if (settings && settings->enablePadding) {
+        // ... (Padding 逻辑禁用，避免 unused 警告) ...
         int range = settings->padMax - settings->padMin;
         if (range < 0) range = 0;
-        unsigned char rnd; 
-        RAND_bytes(&rnd, 1);
+        unsigned char rnd; RAND_bytes(&rnd, 1);
         int blockSize = settings->padMin + (range > 0 ? (rnd % (range + 1)) : 0);
-        
-        // if (blockSize > 0) SSL_set_block_padding(ctx->ssl, blockSize);
-        (void)blockSize; // 消除未使用变量的警告
+        (void)blockSize; 
     }
 
     BIO *bio = BIO_new_socket(ctx->sock, BIO_NOCLOSE);
@@ -231,6 +229,7 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
     return 0;
 }
 
+// ... (tls_write, tls_read... 保持不变) ...
 int tls_write(TLSContext *ctx, const char *data, int len) {
     if (!ctx || !ctx->ssl) return -1;
     int written = 0;
