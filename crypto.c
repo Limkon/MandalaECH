@@ -14,7 +14,7 @@
 // ---------------------- Global Variables ----------------------
 
 // 全局 SSL 上下文 (用于代理连接)
-static SSL_CTX *g_ssl_ctx = NULL;
+SSL_CTX *g_ssl_ctx = NULL;
 
 // 全局 BIO 方法 (用于分片)
 static BIO_METHOD *method_frag = NULL;
@@ -481,3 +481,4 @@ int ws_read_payload_exact(TLSContext *tls, char *out_buf, int expected_len) {
     
     return payload_len;
 }
+
