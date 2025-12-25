@@ -4,63 +4,30 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/rand.h>
 #include <openssl/bio.h>
 
-// [Def] RFC 7685 Padding Extension Type
-#ifndef TLSEXT_TYPE_padding
-#define TLSEXT_TYPE_padding 21
-#endif
-
 // 引用 globals.c 中的全局变量
 extern SSL_CTX *g_ssl_ctx;
-
-// --------------------------------------------------------------------------
-// [Fix] 针对 BoringSSL 链接错误的修复
-// --------------------------------------------------------------------------
-
-// 1. 定义扩展上下文 (如果头文件缺失)
-#ifndef SSL_EXT_CLIENT_HELLO
-#define SSL_EXT_CLIENT_HELLO 0x0001
-#endif
-
-// 2. 定义回调函数类型 (适配 BoringSSL 的简单签名)
-typedef int (*custom_ext_add_cb)(SSL *ssl, unsigned ext_type,
-                                 const unsigned char **out, size_t *outlen,
-                                 int *al, void *add_arg);
-
-typedef void (*custom_ext_free_cb)(SSL *ssl, unsigned ext_type,
-                                   const unsigned char *out, void *add_arg);
-
-typedef int (*custom_ext_parse_cb)(SSL *ssl, unsigned ext_type,
-                                   const unsigned char *in, size_t inlen,
-                                   int *al, void *parse_arg);
-
-// 3. 手动声明 SSL_CTX_add_custom_ext
-// 注意：我们将 add_cb 声明为简单类型，以匹配我们的回调实现。
-// 链接器只看符号名 'SSL_CTX_add_custom_ext'，不检查参数类型，这样可以链接成功。
-extern int SSL_CTX_add_custom_ext(SSL_CTX *ctx, unsigned ext_type,
-                                  unsigned context,
-                                  custom_ext_add_cb add_cb,
-                                  custom_ext_free_cb free_cb,
-                                  void *add_arg,
-                                  custom_ext_parse_cb parse_cb,
-                                  void *parse_arg);
-
-// --------------------------------------------------------------------------
 
 static BIO_METHOD *method_frag = NULL;
 static INIT_ONCE g_crypto_init_once = INIT_ONCE_STATIC_INIT;
 
-// ---------------------- BIO Fragmentation Implementation ----------------------
+// ---------------------- BIO Implementation (Frag + Padding) ----------------------
 typedef struct {
     int first_packet_sent;
+    // 分片配置
     int frag_min;
     int frag_max;
     int frag_delay;
+    // 填充配置 (移动到 BIO 内部处理)
+    int enable_padding;
+    int pad_min;
+    int pad_max;
 } FragCtx;
 
 static int frag_write(BIO *b, const char *in, int inl);
@@ -87,12 +54,121 @@ static int frag_free(BIO *b) {
     return 1;
 }
 
-void BIO_set_frag_params(BIO *b, int min, int max, int delay) {
+// [Update] 设置参数时同时传入 Padding 配置
+void BIO_set_params(BIO *b, const CryptoSettings *s) {
     FragCtx *ctx = (FragCtx *)BIO_get_data(b);
-    if (ctx) { ctx->frag_min = min; ctx->frag_max = max; ctx->frag_delay = delay; }
+    if (ctx && s) { 
+        ctx->frag_min = s->fragMin; 
+        ctx->frag_max = s->fragMax; 
+        ctx->frag_delay = s->fragDelay;
+        ctx->enable_padding = s->enablePadding;
+        ctx->pad_min = s->padMin;
+        ctx->pad_max = s->padMax;
+    }
 }
 
 #define MAX_FRAG_COUNT 32 
+#define TLS_HEADER_LEN 5
+#define HANDSHAKE_HEADER_LEN 4
+
+// 辅助：手动构造带 Padding 的 ClientHello
+// 返回新分配的缓冲区，caller 需 free。如果失败返回 NULL。
+static char* inject_padding(const char* in, int in_len, int* out_len, int pad_min, int pad_max) {
+    // 简单的 TLS ClientHello 解析器
+    if (in_len < TLS_HEADER_LEN + HANDSHAKE_HEADER_LEN) return NULL;
+    
+    unsigned char* data = (unsigned char*)in;
+    
+    // 1. 检查 Record Type (0x16 = Handshake)
+    if (data[0] != 0x16) return NULL; 
+    
+    // 2. 检查 Handshake Type (0x01 = ClientHello)
+    if (data[5] != 0x01) return NULL;
+
+    // 3. 解析各个字段长度以找到 Extensions 结尾
+    // Record Header (5) + Handshake Header (4) + Version (2) + Random (32) = 43 bytes
+    int offset = 43; 
+    if (in_len < offset + 1) return NULL;
+
+    // Session ID
+    int sess_id_len = data[offset];
+    offset += 1 + sess_id_len;
+    
+    if (in_len < offset + 2) return NULL;
+    // Cipher Suites
+    int cipher_len = (data[offset] << 8) | data[offset+1];
+    offset += 2 + cipher_len;
+
+    if (in_len < offset + 1) return NULL;
+    // Compression Methods
+    int comp_len = data[offset];
+    offset += 1 + comp_len;
+
+    if (in_len < offset + 2) return NULL;
+    // Extensions Length
+    int ext_len_offset = offset;
+    int ext_total_len = (data[offset] << 8) | data[offset+1];
+    offset += 2;
+    
+    // 校验解析是否正确
+    if (offset + ext_total_len != in_len - TLS_HEADER_LEN) {
+        // 解析长度不匹配，可能不是标准的 ClientHello 或者有其他数据，放弃注入
+        return NULL;
+    }
+
+    // 4. 计算 Padding
+    int range = pad_max - pad_min;
+    if (range < 0) range = 0;
+    unsigned char rnd; RAND_bytes(&rnd, 1);
+    int pad_data_len = pad_min + (range > 0 ? (rnd % (range + 1)) : 0);
+    if (pad_data_len <= 0) return NULL;
+
+    int pad_ext_len = 4 + pad_data_len; // 2(Type) + 2(Len) + Data
+    int new_total_len = in_len + pad_ext_len;
+
+    char* new_buf = (char*)malloc(new_total_len);
+    if (!new_buf) return NULL;
+
+    // 5. 复制并拼接
+    // 复制头部直到扩展长度字段之前
+    memcpy(new_buf, in, in_len);
+    
+    unsigned char* p = (unsigned char*)new_buf + in_len; // 指向原数据末尾，即追加位置
+
+    // 6. 追加 Padding Extension (0x0015)
+    // Type
+    *p++ = 0x00; *p++ = 0x15;
+    // Length
+    *p++ = (pad_data_len >> 8) & 0xFF;
+    *p++ = pad_data_len & 0xFF;
+    // Data (0x00)
+    memset(p, 0, pad_data_len);
+
+    // 7. 回填修改长度字段
+    unsigned char* ptr = (unsigned char*)new_buf;
+    
+    // Update Record Length (Bytes 3-4)
+    int old_rec_len = (ptr[3] << 8) | ptr[4];
+    int new_rec_len = old_rec_len + pad_ext_len;
+    ptr[3] = (new_rec_len >> 8) & 0xFF;
+    ptr[4] = new_rec_len & 0xFF;
+
+    // Update Handshake Length (Bytes 6-8 of Record Body -> Bytes 6-8 global)
+    // Handshake 长度是 24-bit integer
+    int old_hs_len = (ptr[6] << 16) | (ptr[7] << 8) | ptr[8];
+    int new_hs_len = old_hs_len + pad_ext_len;
+    ptr[6] = (new_hs_len >> 16) & 0xFF;
+    ptr[7] = (new_hs_len >> 8) & 0xFF;
+    ptr[8] = new_hs_len & 0xFF;
+
+    // Update Extensions Length (ext_len_offset)
+    int new_ext_total_len = ext_total_len + pad_ext_len;
+    ptr[ext_len_offset] = (new_ext_total_len >> 8) & 0xFF;
+    ptr[ext_len_offset+1] = new_ext_total_len & 0xFF;
+
+    *out_len = new_total_len;
+    return new_buf;
+}
 
 static int frag_write(BIO *b, const char *in, int inl) {
     FragCtx *ctx = (FragCtx *)BIO_get_data(b);
@@ -100,35 +176,93 @@ static int frag_write(BIO *b, const char *in, int inl) {
     if (!ctx || !next) return 0;
     BIO_clear_retry_flags(b);
 
+    // 待发送的数据缓冲区和长度
+    const char* send_buf = in;
+    int send_len = inl;
+    char* alloc_buf = NULL; // 用于释放
+
+    // [Logic] 如果是第一个数据包（ClientHello），尝试注入 Padding
     if (inl > 0 && ctx->first_packet_sent == 0) {
-        ctx->first_packet_sent = 1; 
-        int bytes_sent = 0;
-        int remaining = inl;
-        int frag_count = 0;
-        while (remaining > 0) {
-            if (frag_count >= MAX_FRAG_COUNT) {
-                int ret = BIO_write(next, in + bytes_sent, remaining);
-                if (ret <= 0) { BIO_copy_next_retry(b); return (bytes_sent > 0 ? bytes_sent : ret); }
-                bytes_sent += ret; remaining -= ret; break;
+        if (ctx->enable_padding) {
+            int new_len = 0;
+            char* padded = inject_padding(in, inl, &new_len, ctx->pad_min, ctx->pad_max);
+            if (padded) {
+                // 注入成功，使用新缓冲区
+                send_buf = padded;
+                send_len = new_len;
+                alloc_buf = padded;
+                log_msg("[TLS] Padding injected: +%d bytes", new_len - inl);
             }
-            int range = ctx->frag_max - ctx->frag_min; if (range < 0) range = 0;
+        }
+        ctx->first_packet_sent = 1; 
+        
+        // --- 可以在这里直接 return 写入，也可以继续走下面的分片逻辑 ---
+        // 为了同时支持 Padding 和 Fragment，我们让修改后的 buffer 继续走分片逻辑
+    }
+
+    int total_sent = 0;
+    
+    // [Logic] 分片逻辑
+    if (ctx->frag_min > 0 && ctx->frag_max >= ctx->frag_min) {
+        int bytes_processed = 0;
+        int remaining = send_len;
+        int frag_count = 0;
+        
+        while (remaining > 0) {
+            // 如果超过最大分片数，剩余部分一次性发送
+            if (frag_count >= MAX_FRAG_COUNT) {
+                int ret = BIO_write(next, send_buf + bytes_processed, remaining);
+                if (ret <= 0) { 
+                    if (alloc_buf) free(alloc_buf);
+                    BIO_copy_next_retry(b); 
+                    return (bytes_processed > 0 ? (alloc_buf ? inl : bytes_processed) : ret); 
+                }
+                bytes_processed += ret; 
+                remaining -= ret; 
+                break;
+            }
+
+            int range = ctx->frag_max - ctx->frag_min; 
+            if (range < 0) range = 0;
             unsigned char rnd_byte; RAND_bytes(&rnd_byte, 1);
             int chunk_size = ctx->frag_min + (range > 0 ? (rnd_byte % (range + 1)) : 0);
+            
             if (chunk_size < 1) chunk_size = 1;
             if (chunk_size > remaining) chunk_size = remaining;
-            int ret = BIO_write(next, in + bytes_sent, chunk_size);
-            if (ret <= 0) { BIO_copy_next_retry(b); return (bytes_sent > 0 ? bytes_sent : ret); }
-            bytes_sent += ret; remaining -= ret; frag_count++;
+
+            int ret = BIO_write(next, send_buf + bytes_processed, chunk_size);
+            if (ret <= 0) { 
+                if (alloc_buf) free(alloc_buf);
+                BIO_copy_next_retry(b); 
+                return (bytes_processed > 0 ? (alloc_buf ? inl : bytes_processed) : ret); 
+            }
+            
+            bytes_processed += ret; 
+            remaining -= ret; 
+            frag_count++;
+
             if (remaining > 0 && ctx->frag_delay > 0) {
                 unsigned char dly_rnd; RAND_bytes(&dly_rnd, 1);
                 Sleep(dly_rnd % (ctx->frag_delay + 1));
             }
         }
-        return bytes_sent;
+        total_sent = bytes_processed;
+    } else {
+        // 无分片，直接发送
+        total_sent = BIO_write(next, send_buf, send_len);
     }
-    int ret = BIO_write(next, in, inl);
+
+    if (alloc_buf) free(alloc_buf);
+    
+    // 注意：BIO_write 返回值必须对应输入 in 的长度，而不是我们填充后的长度
+    // 否则上层 OpenSSL 状态机可能会困惑
+    if (total_sent > 0) {
+        BIO_copy_next_retry(b);
+        return inl; // 假装我们只写了 input 那么多，实际上我们写了更多
+    }
+    
     BIO_copy_next_retry(b);
-    return ret;
+    return total_sent;
 }
 
 static int frag_read(BIO *b, char *out, int outl) {
@@ -144,48 +278,6 @@ static long frag_ctrl(BIO *b, int cmd, long num, void *ptr) {
     BIO *next = BIO_next(b);
     if (!next) return 0;
     return BIO_ctrl(next, cmd, num, ptr);
-}
-
-// ---------------------- Custom TLS Padding Implementation ----------------------
-
-// 回调：构造 Padding 扩展数据
-static int padding_add_cb(SSL *ssl, unsigned int ext_type,
-                          const unsigned char **out, size_t *outlen,
-                          int *al, void *add_arg) {
-    // 1. 获取连接配置 (通过 SSL_set_app_data 传入)
-    CryptoSettings* settings = (CryptoSettings*)SSL_get_app_data(ssl);
-    
-    // 如果没有配置或未启用 Padding，则不添加扩展
-    if (!settings || !settings->enablePadding) return 0; 
-
-    // 2. 计算随机长度
-    int range = settings->padMax - settings->padMin;
-    if (range < 0) range = 0;
-    
-    unsigned char rnd_byte;
-    RAND_bytes(&rnd_byte, 1);
-    
-    int pad_len = settings->padMin + (range > 0 ? (rnd_byte % (range + 1)) : 0);
-    
-    if (pad_len <= 0) return 0;
-
-    // 3. 分配内存 (BoringSSL/OpenSSL 会调用 free_cb 释放)
-    unsigned char* data = (unsigned char*)malloc(pad_len);
-    if (!data) return -1; 
-
-    // 4. 填充 0
-    memset(data, 0, pad_len);
-
-    *out = data;
-    *outlen = pad_len;
-    
-    return 1; // 成功
-}
-
-// 回调：释放 Padding 扩展数据
-static void padding_free_cb(SSL *ssl, unsigned int ext_type,
-                            const unsigned char *out, void *add_arg) {
-    if (out) free((void*)out);
 }
 
 // ---------------------- Initialization Logic ----------------------
@@ -217,15 +309,8 @@ BOOL CALLBACK InitCryptoCallback(PINIT_ONCE InitOnce, PVOID Parameter, PVOID *Co
     SSL_CTX_set_options(g_ssl_ctx, SSL_OP_NO_COMPRESSION | SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION);
     SSL_CTX_set_session_cache_mode(g_ssl_ctx, SSL_SESS_CACHE_CLIENT);
 
-    // [Fix] 使用通用的 SSL_CTX_add_custom_ext
-    // 传入 SSL_EXT_CLIENT_HELLO (0x0001) 表示该扩展仅在 ClientHello 中发送
-    // 参数类型匹配我们上方的手动声明，链接器将找到库中的对应符号
-    if (!SSL_CTX_add_custom_ext(g_ssl_ctx, TLSEXT_TYPE_padding,
-                                SSL_EXT_CLIENT_HELLO,
-                                padding_add_cb, padding_free_cb, NULL,
-                                NULL, NULL)) {
-        log_msg("[Warn] Failed to register Padding extension callback");
-    }
+    // [Fix] 移除所有 SSL_CTX_add_custom_ext 调用
+    // 依赖 BIO 层的 inject_padding 实现随机填充
 
     HRSRC hRes = FindResourceW(NULL, MAKEINTRESOURCEW(2), RT_RCDATA);
     if (hRes) {
@@ -287,16 +372,13 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
         }
     }
 
-    // [Config] 传递配置给回调函数使用
-    if (settings) {
-        SSL_set_app_data(ctx->ssl, (void*)settings);
-    }
-
+    // 始终挂载 BIO，以便处理 Padding 或 Fragmentation
     BIO *bio = BIO_new_socket(ctx->sock, BIO_NOCLOSE);
-    if (settings && settings->enableFragment && method_frag) {
+    if (method_frag) {
         BIO *frag = BIO_new(method_frag);
         if (frag) {
-            BIO_set_frag_params(frag, settings->fragMin, settings->fragMax, settings->fragDelay);
+            // [Update] 使用新的 BIO_set_params 传递所有配置
+            BIO_set_params(frag, settings);
             bio = BIO_push(frag, bio);
         }
     }
@@ -313,7 +395,7 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
     return 0;
 }
 
-// ... (以下 tls_write, tls_read 保持不变)
+// ... (tls_write, tls_read 保持不变)
 int tls_write(TLSContext *ctx, const char *data, int len) {
     if (!ctx || !ctx->ssl) return -1;
     int written = 0;
