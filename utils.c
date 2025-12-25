@@ -8,6 +8,7 @@
 #include <windows.h>
 #include <wininet.h>
 #include <ctype.h> 
+#include <stdarg.h> // 必须包含用于 va_list
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
@@ -21,6 +22,10 @@
 #pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "wininet.lib")
 
+// 全局日志锁，防止多线程写文件冲突
+static CRITICAL_SECTION g_logLock;
+static int g_logLockInit = 0;
+
 BOOL IsWindows8OrGreater() {
     HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
     if (hKernel32 == NULL) return FALSE;
@@ -28,46 +33,71 @@ BOOL IsWindows8OrGreater() {
     return (pFunc != NULL);
 }
 
-// [Robustness] 改进日志函数
+// [Debug] 增强版日志函数：输出到 DebugView + log.txt 文件
 void log_msg(const char *format, ...) {
-    if (!g_enableLog && strstr(format, "[Fatal]") == NULL) return;
+    // 初始化锁
+    if (!g_logLockInit) {
+        InitializeCriticalSection(&g_logLock);
+        g_logLockInit = 1;
+    }
 
-    char buf[2048]; 
+    // 格式化时间
     char time_buf[64]; 
     SYSTEMTIME st; 
-    
     GetLocalTime(&st);
-    snprintf(time_buf, sizeof(time_buf), "[%02d:%02d:%02d] ", st.wHour, st.wMinute, st.wSecond);
+    snprintf(time_buf, sizeof(time_buf), "[%02d:%02d:%02d.%03d] ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
     
+    // 格式化消息
+    char buf[4096]; 
     va_list args; 
     va_start(args, format); 
     vsnprintf(buf, sizeof(buf) - 2, format, args); 
     va_end(args);
     buf[sizeof(buf) - 1] = 0; 
     
-    char final_msg[2200]; 
-    snprintf(final_msg, sizeof(final_msg), "%s%s\r\n", time_buf, buf);
+    // 组合最终字符串
+    char final_msg[4200]; 
+    snprintf(final_msg, sizeof(final_msg), "%s%s\n", time_buf, buf); // 使用 \n 方便文件阅读
     
+    // 1. 输出到调试器 (DebugView)
     OutputDebugStringA(final_msg);
     
+    // 2. 输出到 GUI 日志窗口 (如果有)
     extern HWND hLogViewerWnd; 
     if (hLogViewerWnd && IsWindow(hLogViewerWnd)) {
-        int wLen = MultiByteToWideChar(CP_UTF8, 0, final_msg, -1, NULL, 0);
+        // GUI 需要 \r\n 换行
+        char gui_msg[4200];
+        snprintf(gui_msg, sizeof(gui_msg), "%s%s\r\n", time_buf, buf);
+        int wLen = MultiByteToWideChar(CP_UTF8, 0, gui_msg, -1, NULL, 0);
         if (wLen > 0) {
             wchar_t* wBuf = (wchar_t*)malloc((wLen + 1) * sizeof(wchar_t));
             if (wBuf) {
-                MultiByteToWideChar(CP_UTF8, 0, final_msg, -1, wBuf, wLen);
+                MultiByteToWideChar(CP_UTF8, 0, gui_msg, -1, wBuf, wLen);
                 wBuf[wLen] = 0;
                 PostMessageW(hLogViewerWnd, WM_LOG_UPDATE, 0, (LPARAM)wBuf);
             }
         }
     }
+
+    // 3. [关键] 输出到 log.txt 文件
+    EnterCriticalSection(&g_logLock);
+    FILE* fp = fopen("log.txt", "a+"); // 追加模式
+    if (fp) {
+        fprintf(fp, "%s", final_msg);
+        fflush(fp); // 强制刷新缓冲区，确保崩溃前写入
+        fclose(fp);
+    }
+    LeaveCriticalSection(&g_logLock);
 }
 
 // --- 文件 IO ---
 BOOL ReadFileToBuffer(const wchar_t* filename, char** buffer, long* size) {
+    log_msg("[FileIO] Reading file: %ls", filename);
     FILE* f = _wfopen(filename, L"rb");
-    if (!f) return FALSE;
+    if (!f) {
+        log_msg("[FileIO] Failed to open file: %ls", filename);
+        return FALSE;
+    }
     
     fseek(f, 0, SEEK_END);
     long fsize = ftell(f);
@@ -75,8 +105,13 @@ BOOL ReadFileToBuffer(const wchar_t* filename, char** buffer, long* size) {
     
     if (fsize < 0) { fclose(f); return FALSE; }
 
+    log_msg("[FileIO] File size: %ld bytes. Allocating memory...", fsize);
     *buffer = (char*)malloc(fsize + 1);
-    if (!*buffer) { fclose(f); return FALSE; }
+    if (!*buffer) { 
+        log_msg("[Fatal] Memory allocation failed for file buffer!");
+        fclose(f); 
+        return FALSE; 
+    }
     
     size_t read_bytes = fread(*buffer, 1, fsize, f);
     (*buffer)[read_bytes] = 0; 
@@ -84,17 +119,23 @@ BOOL ReadFileToBuffer(const wchar_t* filename, char** buffer, long* size) {
     if (size) *size = (long)read_bytes;
     
     fclose(f);
+    log_msg("[FileIO] File read successfully.");
     return TRUE;
 }
 
 BOOL WriteBufferToFile(const wchar_t* filename, const char* buffer) {
+    log_msg("[FileIO] Writing to file: %ls", filename);
     FILE* f = _wfopen(filename, L"wb");
-    if (!f) return FALSE;
+    if (!f) {
+        log_msg("[Err] Failed to open file for writing: %ls", filename);
+        return FALSE;
+    }
     
     size_t len = strlen(buffer);
-    fwrite(buffer, 1, len, f);
+    size_t written = fwrite(buffer, 1, len, f);
     
     fclose(f);
+    log_msg("[FileIO] Wrote %zu bytes.", written);
     return TRUE;
 }
 
@@ -166,7 +207,6 @@ unsigned char* Base64Decode(const char* input, size_t* out_len) {
         if (input[i] == '\r' || input[i] == '\n') { i++; continue; } 
         if (input[i] == '=') break; 
         
-        // [Safety] 防止非法字符/中文导致数组越界访问
         unsigned char a = (unsigned char)input[i];
         if (a >= 128 || b64_table[a] == -1) { i++; continue; } 
 
@@ -219,20 +259,23 @@ static int HexToBin(const char* hex, unsigned char* out, int max_len) {
 }
 
 unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t* out_len) {
+    log_msg("[ECH] Fetching config for %s from %s", domain, doh_server);
     if (!domain || !doh_server) return NULL;
     char url[1024];
     snprintf(url, sizeof(url), "%s?name=%s&type=65", doh_server, domain);
 
-    log_msg("[ECH] Querying %s for %s", doh_server, domain);
     char* json_str = Utils_HttpGet(url);
     if (!json_str) {
-        log_msg("[ECH] DoH request failed.");
+        log_msg("[ECH] Failed to get DoH response.");
         return NULL;
     }
 
     cJSON* root = cJSON_Parse(json_str);
     free(json_str);
-    if (!root) return NULL;
+    if (!root) {
+        log_msg("[ECH] JSON Parse failed.");
+        return NULL;
+    }
 
     unsigned char* ech_config = NULL;
     *out_len = 0;
@@ -327,15 +370,20 @@ static BOOL ParseUrl(const char* url, URL_COMPONENTS_SIMPLE* out) {
     return TRUE;
 }
 
-// [Safety] 修复 x64 下 SOCKET 强转 int 的风险，以及增强 SSL 握手稳定性
 static char* InternalHttpsGet(const char* url) {
+    log_msg("[HTTP] Fetching URL: %s", url);
     URL_COMPONENTS_SIMPLE u;
-    if (!ParseUrl(url, &u)) return NULL;
+    if (!ParseUrl(url, &u)) {
+        log_msg("[HTTP] Invalid URL format.");
+        return NULL;
+    }
 
-    // [Thread Safety] 局部 SSL Context，避免静态变量多线程冲突
     const SSL_METHOD* method = TLS_client_method();
     SSL_CTX* ctx = SSL_CTX_new(method);
-    if (!ctx) return NULL;
+    if (!ctx) {
+        log_msg("[HTTP] SSL_CTX_new failed.");
+        return NULL;
+    }
     SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
 
     SOCKET s = INVALID_SOCKET;
@@ -350,23 +398,26 @@ static char* InternalHttpsGet(const char* url) {
     char portStr[16]; snprintf(portStr, 16, "%d", u.port);
     
     if (getaddrinfo(u.host, portStr, &hints, &res) != 0) {
+        log_msg("[HTTP] getaddrinfo failed for %s", u.host);
         SSL_CTX_free(ctx); 
         return NULL;
     }
     
     s = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
     if (s == INVALID_SOCKET) { 
+        log_msg("[HTTP] Socket creation failed.");
         freeaddrinfo(res); 
         SSL_CTX_free(ctx);
         return NULL; 
     }
     
-    // 设置超时防止卡死
     DWORD timeout = 8000; 
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
     setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
 
+    log_msg("[HTTP] Connecting to %s:%d...", u.host, u.port);
     if (connect(s, res->ai_addr, (int)res->ai_addrlen) != 0) {
+        log_msg("[HTTP] TCP connect failed.");
         closesocket(s); freeaddrinfo(res); 
         SSL_CTX_free(ctx);
         return NULL;
@@ -380,15 +431,15 @@ static char* InternalHttpsGet(const char* url) {
         return NULL; 
     }
     
-    // [Fix] 正确的类型转换：先转 intptr_t 再转 int
-    // Windows 的 socket handle 虽然是 64 位，但作为文件描述符传递给 OpenSSL 时
-    // 在 Windows 平台上通常可以安全地进行这种转换，因为 OpenSSL 内部会再次处理
-    // 关键是不能直接 (int)s，否则高位非零时会变成负数或截断
+    // [Fix] 64-bit safe cast
     SSL_set_fd(ssl, (int)(intptr_t)s);
-    
     SSL_set_tlsext_host_name(ssl, u.host);
 
-    if (SSL_connect(ssl) != 1) goto cleanup;
+    log_msg("[HTTP] Doing SSL handshake...");
+    if (SSL_connect(ssl) != 1) {
+        log_msg("[HTTP] SSL_connect failed. ERR: %lu", ERR_get_error());
+        goto cleanup;
+    }
 
     char req[2048];
     snprintf(req, sizeof(req), 
@@ -399,20 +450,28 @@ static char* InternalHttpsGet(const char* url) {
         "Connection: close\r\n\r\n", 
         u.path, u.host);
         
-    // [Fix] 显式转换长度为 int
-    if (SSL_write(ssl, req, (int)strlen(req)) <= 0) goto cleanup;
+    if (SSL_write(ssl, req, (int)strlen(req)) <= 0) {
+        log_msg("[HTTP] Failed to send request header.");
+        goto cleanup;
+    }
 
     int total_cap = 65536; 
     int total_len = 0;
     buf = (char*)malloc(total_cap);
-    if (!buf) goto cleanup;
+    if (!buf) {
+        log_msg("[HTTP] OOM allocating receive buffer.");
+        goto cleanup;
+    }
 
+    log_msg("[HTTP] Receiving data...");
     while (1) {
-        // 动态扩容
         if (total_len >= total_cap - 1024) {
             int new_cap = total_cap * 2;
             char* new_buf = (char*)realloc(buf, new_cap);
-            if (!new_buf) { free(buf); buf = NULL; goto cleanup; }
+            if (!new_buf) { 
+                log_msg("[HTTP] OOM reallocating buffer.");
+                free(buf); buf = NULL; goto cleanup; 
+            }
             buf = new_buf;
             total_cap = new_cap;
         }
@@ -420,14 +479,15 @@ static char* InternalHttpsGet(const char* url) {
         int n = SSL_read(ssl, buf + total_len, total_cap - total_len - 1);
         if (n <= 0) {
             int err = SSL_get_error(ssl, n);
-            // 正常的关闭连接或零返回
             if (err == SSL_ERROR_ZERO_RETURN || err == SSL_ERROR_SYSCALL) break; 
+            log_msg("[HTTP] SSL_read error: %d", err);
             break; 
         }
         total_len += n;
     }
     buf[total_len] = 0;
 
+    log_msg("[HTTP] Received %d bytes.", total_len);
     char* body = strstr(buf, "\r\n\r\n");
     if (body) { 
         body += 4; 
@@ -461,12 +521,14 @@ char* GetClipboardText() {
     char* text = _strdup(pszText);
     GlobalUnlock(hData);
     CloseClipboard();
+    log_msg("[Clipboard] Read text (len=%d)", strlen(text));
     return text;
 }
 
 // --- 系统代理 ---
 void SetSystemProxy(BOOL enable) {
     extern int g_localPort;
+    log_msg("[System] SetSystemProxy: %d, Port: %d", enable, g_localPort);
     if (g_localPort <= 0) g_localPort = 1080; 
 
     wchar_t proxyServerString[256] = {0};
