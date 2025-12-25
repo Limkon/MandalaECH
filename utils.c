@@ -21,8 +21,8 @@
 #pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "wininet.lib")
 
-// 工具类专用 SSL_CTX，单例模式
-static SSL_CTX* g_utils_ctx = NULL;
+// [Fix] 移除不安全的全局静态 SSL_CTX，改为局部创建以支持多线程
+// static SSL_CTX* g_utils_ctx = NULL;
 
 BOOL IsWindows8OrGreater() {
     HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
@@ -334,11 +334,10 @@ static char* InternalHttpsGet(const char* url) {
     URL_COMPONENTS_SIMPLE u;
     if (!ParseUrl(url, &u)) return NULL;
 
-    if (!g_utils_ctx) {
-        g_utils_ctx = SSL_CTX_new(TLS_client_method());
-        if (!g_utils_ctx) return NULL;
-        SSL_CTX_set_verify(g_utils_ctx, SSL_VERIFY_NONE, NULL);
-    }
+    // [Fix] 使用局部变量 SSL_CTX，避免多线程竞争导致的 Runtime Error
+    SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
+    if (!ctx) return NULL;
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
 
     SOCKET s = INVALID_SOCKET;
     SSL *ssl = NULL;
@@ -351,22 +350,35 @@ static char* InternalHttpsGet(const char* url) {
     hints.ai_socktype = SOCK_STREAM;
     char portStr[16]; snprintf(portStr, 16, "%d", u.port);
     
-    if (getaddrinfo(u.host, portStr, &hints, &res) != 0) return NULL;
+    if (getaddrinfo(u.host, portStr, &hints, &res) != 0) {
+        SSL_CTX_free(ctx); 
+        return NULL;
+    }
     
     s = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (s == INVALID_SOCKET) { freeaddrinfo(res); return NULL; }
+    if (s == INVALID_SOCKET) { 
+        freeaddrinfo(res); 
+        SSL_CTX_free(ctx);
+        return NULL; 
+    }
     
     DWORD timeout = 5000;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
     setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
 
     if (connect(s, res->ai_addr, (int)res->ai_addrlen) != 0) {
-        closesocket(s); freeaddrinfo(res); return NULL;
+        closesocket(s); freeaddrinfo(res); 
+        SSL_CTX_free(ctx);
+        return NULL;
     }
     freeaddrinfo(res);
 
-    ssl = SSL_new(g_utils_ctx);
-    if (!ssl) { closesocket(s); return NULL; }
+    ssl = SSL_new(ctx);
+    if (!ssl) { 
+        closesocket(s); 
+        SSL_CTX_free(ctx);
+        return NULL; 
+    }
     SSL_set_fd(ssl, (int)s);
     SSL_set_tlsext_host_name(ssl, u.host);
 
@@ -409,6 +421,7 @@ cleanup:
     if (buf) free(buf);
     if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); }
     if (s != INVALID_SOCKET) closesocket(s);
+    if (ctx) SSL_CTX_free(ctx); // [Fix] 释放局部 Context
     return result;
 }
 
