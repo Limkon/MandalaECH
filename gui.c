@@ -1,3 +1,4 @@
+#define WIN32_LEAN_AND_MEAN
 #include "gui.h"
 #include "config.h"
 #include "proxy.h"
@@ -12,7 +13,7 @@
 
 #pragma comment(lib, "comctl32.lib")
 
-// --- 全局变量声明 (使用 extern 引用 globals.c 中的定义) ---
+// --- 全局变量声明 (使用 extern) ---
 extern HWND hwnd;             
 extern NOTIFYICONDATA nid;    
 extern HMENU hMenu;           
@@ -22,11 +23,9 @@ extern HFONT hLogFont;
 extern HWND hLogViewerWnd;    
 extern HWND hSubList;         
 
-// 静态变量 (仅本文件可见)
 static HWND hSettingsWnd = NULL;
 static HWND hSubWnd = NULL;
 
-// 订阅窗口控件 ID
 #define ID_SUB_LIST     3000
 #define ID_SUB_ADD_BTN  3001
 #define ID_SUB_DEL_BTN  3002
@@ -34,10 +33,8 @@ static HWND hSubWnd = NULL;
 #define ID_SUB_URL_EDIT 3004
 #define ID_SUB_SAVE_BTN 3005
 
-// 自定义消息
 #define WM_UPDATE_FINISH (WM_USER + 200)
 
-// --- 函数原型声明 ---
 void OpenSettingsWindow();
 void OpenSubWindow();
 void OpenNodeManager();
@@ -49,7 +46,6 @@ void LoadNodeToEdit(HWND hWnd, const wchar_t* tag);
 void SaveEditedNode(HWND hWnd);
 void ToggleTrayIcon();
 
-// --- 辅助函数 ---
 BOOL CALLBACK EnumSetFont(HWND hWnd, LPARAM lParam) {
     SendMessageW(hWnd, WM_SETFONT, (WPARAM)lParam, TRUE);
     return TRUE;
@@ -60,13 +56,8 @@ void AddComboItem(HWND hCombo, const wchar_t* text, BOOL select) {
     if (select) SendMessage(hCombo, CB_SETCURSEL, idx, 0);
 }
 
-// --- 线程逻辑 ---
-
-// 自动更新线程
 DWORD WINAPI AutoUpdateThread(LPVOID lpParam) {
-    log_msg("[AutoUpdate] Thread started. Waiting 3s...");
     Sleep(3000); 
-    
     EnterCriticalSection(&g_configLock);
     int subCount = g_subCount;
     int mode = g_subUpdateMode;
@@ -74,63 +65,37 @@ DWORD WINAPI AutoUpdateThread(LPVOID lpParam) {
     long long lastTime = g_lastUpdateTime;
     LeaveCriticalSection(&g_configLock);
 
-    log_msg("[AutoUpdate] Config: count=%d, mode=%d, interval=%d", subCount, mode, intervalHours);
-
     if (subCount > 0) {
         long long now = (long long)time(NULL);
         long long intervalSeconds = 0;
-        
-        if (mode == 0) intervalSeconds = 24 * 3600;      // 每天
-        else if (mode == 1) intervalSeconds = 7 * 24 * 3600; // 每周
-        else intervalSeconds = intervalHours * 3600;    // 自定义
+        if (mode == 0) intervalSeconds = 24 * 3600;
+        else if (mode == 1) intervalSeconds = 7 * 24 * 3600;
+        else intervalSeconds = intervalHours * 3600;
 
-        if (lastTime > 0 && (now - lastTime) < intervalSeconds) {
-            log_msg("[AutoUpdate] Not due yet. Skipping.");
-            return 0;
-        }
+        if (lastTime > 0 && (now - lastTime) < intervalSeconds) return 0;
 
-        log_msg("[AutoUpdate] Starting update...");
         int count = UpdateAllSubscriptions(FALSE);
-        log_msg("[AutoUpdate] Finished. New nodes: %d", count);
-        
         if (count > 0) {
             HWND hMgr = FindWindowW(L"NodeMgr", NULL);
-            if (hMgr && IsWindow(hMgr)) {
-                PostMessage(hMgr, WM_REFRESH_NODELIST, 0, 0);
-            }
+            if (hMgr && IsWindow(hMgr)) PostMessage(hMgr, WM_REFRESH_NODELIST, 0, 0);
         }
     }
     return 0;
 }
 
-// 手动更新线程
 DWORD WINAPI ManualUpdateThread(LPVOID param) {
-    log_msg("[ManualUpdate] Thread started.");
     HWND hWnd = (HWND)param;
-    if (!IsWindow(hWnd)) {
-        log_msg("[ManualUpdate] Invalid window handle.");
-        return 0;
-    }
-
-    log_msg("[ManualUpdate] Updating...");
+    if (!IsWindow(hWnd)) return 0;
     int count = UpdateAllSubscriptions(TRUE);
-    log_msg("[ManualUpdate] Done. Count: %d", count);
-    
-    if (IsWindow(hWnd)) {
-        PostMessage(hWnd, WM_UPDATE_FINISH, (WPARAM)count, 0);
-    } else {
-        if (count > 0) {
-            HWND hMgr = FindWindowW(L"NodeMgr", NULL);
-            if (hMgr) PostMessage(hMgr, WM_REFRESH_NODELIST, 0, 0);
-        }
+    if (IsWindow(hWnd)) PostMessage(hWnd, WM_UPDATE_FINISH, (WPARAM)count, 0);
+    else if (count > 0) {
+        HWND hMgr = FindWindowW(L"NodeMgr", NULL);
+        if (hMgr) PostMessage(hMgr, WM_REFRESH_NODELIST, 0, 0);
     }
     return 0;
 }
-
-// --- 节点编辑逻辑 ---
 
 void LoadNodeToEdit(HWND hWnd, const wchar_t* tag) {
-    log_msg("[NodeEdit] Loading: %ls", tag);
     char* buffer = NULL; long size = 0;
     if (!ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) return;
     cJSON* root = cJSON_Parse(buffer); free(buffer);
@@ -198,7 +163,6 @@ void LoadNodeToEdit(HWND hWnd, const wchar_t* tag) {
 }
 
 void SaveEditedNode(HWND hWnd) {
-    log_msg("[NodeEdit] Saving node...");
     wchar_t wTag[256], wAddr[256], wUser[256], wPass[256], wHost[256], wPath[256];
     char tag[256], addr[256], user[256], pass[256], host[256], path[256];
     
@@ -312,9 +276,9 @@ void SaveEditedNode(HWND hWnd) {
             free(out); cJSON_Delete(root);
         } else cJSON_Delete(newNode);
     } else cJSON_Delete(newNode);
+    MessageBoxW(hWnd, L"节点配置已更新", L"操作成功", MB_OK); DestroyWindow(hWnd);
+    HWND hMgr = FindWindowW(L"NodeMgr", NULL); if (hMgr) SendMessage(hMgr, WM_REFRESH_NODELIST, 0, 0);
 }
-
-// --- ListBox 消息处理 ---
 
 LRESULT CALLBACK ListBox_Proc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == WM_KEYDOWN) {
@@ -326,13 +290,10 @@ LRESULT CALLBACK ListBox_Proc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
     return CallWindowProc(g_oldListBoxProc, hWnd, msg, wParam, lParam);
 }
 
-// --- 设置窗口消息处理 ---
-
 LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     static HWND hHotkey, hPortEdit;
     switch(msg) {
         case WM_CREATE: {
-            log_msg("[Settings] Creating window...");
             EnterCriticalSection(&g_configLock);
             int localPort = g_localPort;
             int modifiers = g_hotkeyModifiers;
@@ -448,7 +409,6 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
                 if (idx >= 0 && idx < 5) SetDlgItemTextA(hWnd, ID_EDIT_UA_STR, UA_TEMPLATES[idx]);
             }
             if (LOWORD(wParam) == IDOK) {
-                log_msg("[Settings] Saving...");
                 int fMin = GetDlgItemInt(hWnd, ID_EDIT_FRAG_MIN, NULL, FALSE);
                 int fMax = GetDlgItemInt(hWnd, ID_EDIT_FRAG_MAX, NULL, FALSE);
                 int fDly = GetDlgItemInt(hWnd, ID_EDIT_FRAG_DLY, NULL, FALSE);
@@ -497,11 +457,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
                 LeaveCriticalSection(&g_configLock);
 
                 SaveSettings(); 
-                if (g_proxyRunning) { 
-                    log_msg("[Settings] Restarting proxy...");
-                    StopProxyCore(); 
-                    StartProxyCore(); 
-                }
+                if (g_proxyRunning) { StopProxyCore(); StartProxyCore(); }
                 DestroyWindow(hWnd);
             } else if (LOWORD(wParam) == IDCANCEL) DestroyWindow(hWnd);
             break;
@@ -511,29 +467,17 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
     return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
 
-// 确保函数定义在调用之前
 void OpenSettingsWindow() {
     if (hSettingsWnd && IsWindow(hSettingsWnd)) {
         ShowWindow(hSettingsWnd, SW_RESTORE);
         SetForegroundWindow(hSettingsWnd);
         return;
     }
-    WNDCLASSW wc = {0}; 
-    wc.lpfnWndProc=SettingsWndProc; 
-    wc.hInstance=GetModuleHandle(NULL); 
-    wc.lpszClassName=L"Settings"; 
-    wc.hbrBackground=(HBRUSH)(COLOR_BTNFACE+1);
-    
-    WNDCLASSW temp; 
-    if (!GetClassInfoW(GetModuleHandle(NULL), L"Settings", &temp)) {
-        RegisterClassW(&wc);
-    }
-    
+    WNDCLASSW wc = {0}; wc.lpfnWndProc=SettingsWndProc; wc.hInstance=GetModuleHandle(NULL); wc.lpszClassName=L"Settings"; wc.hbrBackground=(HBRUSH)(COLOR_BTNFACE+1);
+    WNDCLASSW temp; if (!GetClassInfoW(GetModuleHandle(NULL), L"Settings", &temp)) RegisterClassW(&wc);
     hSettingsWnd = CreateWindowW(L"Settings", L"软件设置", WS_VISIBLE|WS_CAPTION|WS_SYSMENU, CW_USEDEFAULT,0,480,660, hwnd,NULL,wc.hInstance,NULL);
     ShowWindow(hSettingsWnd, SW_SHOW);
 }
-
-// --- 订阅设置窗口消息处理 ---
 
 void RefreshSubList() {
     if (!hSubList) return;
@@ -561,7 +505,6 @@ void UpdateSubUIState(HWND hDlg) {
 LRESULT CALLBACK SubWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch(msg) {
         case WM_CREATE: {
-            log_msg("[SubWnd] Created.");
             hSubList = CreateWindowExW(0, WC_LISTVIEWW, NULL, 
                 WS_CHILD|WS_VISIBLE|WS_BORDER|LVS_REPORT|LVS_NOCOLUMNHEADER|LVS_SHOWSELALWAYS|LVS_SINGLESEL, 
                 10, 10, 460, 150, hWnd, (HMENU)ID_SUB_LIST, GetModuleHandle(NULL), NULL);
@@ -641,11 +584,8 @@ LRESULT CALLBACK SubWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 } else MessageBoxW(hWnd, L"请先在列表中选中一项", L"提示", MB_OK);
             }
             else if (id == ID_SUB_SAVE_BTN || id == ID_SUB_UPD_BTN) {
-                log_msg("[SubWnd] Save/Update clicked.");
                 EnterCriticalSection(&g_configLock);
-                
                 for(int i=0; i<g_subCount; i++) g_subs[i].enabled = ListView_GetCheckState(hSubList, i);
-                
                 if (SendMessage(GetDlgItem(hWnd, IDC_RADIO_WEEKLY), BM_GETCHECK, 0, 0) == BST_CHECKED) {
                     g_subUpdateMode = UPDATE_MODE_WEEKLY;
                 } else if (SendMessage(GetDlgItem(hWnd, IDC_RADIO_CUSTOM), BM_GETCHECK, 0, 0) == BST_CHECKED) {
@@ -653,14 +593,10 @@ LRESULT CALLBACK SubWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 } else {
                     g_subUpdateMode = UPDATE_MODE_DAILY;
                 }
-
                 int interval = GetDlgItemInt(hWnd, IDC_EDIT_CUSTOM_TIME, NULL, FALSE);
                 if (interval > 0) g_subUpdateInterval = interval;
-                
                 LeaveCriticalSection(&g_configLock);
-                
                 SaveSettings(); 
-
                 if (id == ID_SUB_SAVE_BTN) {
                     MessageBoxW(hWnd, L"订阅设置已保存", L"成功", MB_OK);
                 } else {
@@ -673,10 +609,8 @@ LRESULT CALLBACK SubWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         case WM_UPDATE_FINISH: { 
             int count = (int)wParam;
-            log_msg("[SubWnd] Update finished. Count: %d", count);
             EnableWindow(GetDlgItem(hWnd, ID_SUB_UPD_BTN), TRUE);
             SetWindowTextW(hWnd, L"订阅设置");
-            
             if (count < 0) {
                 MessageBoxW(hWnd, L"更新过程中发生严重错误，程序已拦截崩溃。\n请检查日志或网络连接。", L"更新失败", MB_OK | MB_ICONERROR);
             } else {
@@ -706,22 +640,17 @@ void OpenSubWindow() {
     ShowWindow(hSubWnd, SW_SHOW); UpdateWindow(hSubWnd);
 }
 
-// --- 节点管理窗口消息处理 ---
-
 LRESULT CALLBACK NodeMgrWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     static HWND hList;
     #define ID_NODEMGR_SUB 2003 
 
     switch(msg) {
         case WM_CREATE:
-            log_msg("[NodeMgr] Created.");
             hList = CreateWindowW(L"LISTBOX", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|WS_VSCROLL|LBS_NOTIFY|LBS_EXTENDEDSEL, 10, 10, 410, 170, hWnd, (HMENU)ID_NODEMGR_LIST, NULL, NULL);
             g_oldListBoxProc = (WNDPROC)SetWindowLongPtr(hList, GWLP_WNDPROC, (LONG_PTR)ListBox_Proc);
-            
             CreateWindowW(L"BUTTON", L"编辑选中节点", WS_CHILD | WS_VISIBLE, 10, 185, 120, 30, hWnd, (HMENU)ID_NODEMGR_EDIT, NULL, NULL);
             CreateWindowW(L"BUTTON", L"删除选中节点", WS_CHILD | WS_VISIBLE, 140, 185, 120, 30, hWnd, (HMENU)ID_NODEMGR_DEL, NULL, NULL);
             CreateWindowW(L"BUTTON", L"订阅设置", WS_CHILD | WS_VISIBLE, 270, 185, 120, 30, hWnd, (HMENU)ID_NODEMGR_SUB, NULL, NULL);
-
             EnumChildWindows(hWnd, EnumSetFont, (LPARAM)hAppFont);
             SendMessage(hWnd, WM_SETFONT, (WPARAM)hAppFont, TRUE);
             SendMessage(hWnd, WM_REFRESH_NODELIST, 0, 0); 
@@ -767,9 +696,7 @@ LRESULT CALLBACK NodeMgrWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                     tagsToDelete[i] = (wchar_t*)malloc((len + 1) * sizeof(wchar_t));
                     SendMessageW(hList, LB_GETTEXT, selIndices[i], (LPARAM)tagsToDelete[i]);
                 }
-                
                 for (int i = 0; i < selCount; i++) { DeleteNode(tagsToDelete[i]); free(tagsToDelete[i]); }
-                
                 free(tagsToDelete); free(selIndices);
                 SendMessage(hWnd, WM_REFRESH_NODELIST, 0, 0); MessageBoxW(hWnd, L"删除完成", L"提示", MB_OK);
             }
@@ -792,8 +719,6 @@ void OpenNodeManager() {
     hMgr = CreateWindowW(L"NodeMgr", L"节点管理 (支持 Ctrl+A 全选/多选)", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT, 0, 450, 270, NULL, NULL, GetModuleHandle(NULL), NULL);
     ShowWindow(hMgr, SW_SHOW);
 }
-
-// --- 节点编辑窗口消息处理 ---
 
 LRESULT CALLBACK NodeEditWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch(msg) {
@@ -875,8 +800,6 @@ void OpenNodeEditWindow(const wchar_t* tag) {
     if(h) { ShowWindow(h, SW_SHOW); UpdateWindow(h); }
 }
 
-// --- 日志窗口消息处理 ---
-
 LRESULT CALLBACK LogWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     static HWND hEdit;
     static HWND hChk;
@@ -944,8 +867,6 @@ void ToggleTrayIcon() {
     }
 }
 
-// --- 托盘与主窗口消息处理 ---
-
 LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == WM_TRAY && LOWORD(lParam) == WM_RBUTTONUP) {
         POINT pt; GetCursorPos(&pt); SetForegroundWindow(hWnd);
@@ -981,7 +902,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         int id = LOWORD(wParam);
         
         if (id == ID_TRAY_EXIT) { 
-            log_msg("[System] User clicked Exit.");
             Shell_NotifyIconW(NIM_DELETE, &nid); 
             if (IsSystemProxyEnabled()) SetSystemProxy(FALSE); 
             StopProxyCore(); 
@@ -991,14 +911,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         else if (id == ID_TRAY_SYSTEM_PROXY) SetSystemProxy(!IsSystemProxyEnabled());
         else if (id == ID_TRAY_SHOW_CONSOLE) OpenLogViewer(TRUE);
         else if (id == ID_TRAY_MANAGE_NODES) OpenNodeManager();
-        else if (id == ID_TRAY_SETTINGS) {
-            log_msg("[Menu] Opening Settings Window...");
-            OpenSettingsWindow();
-        }
+        else if (id == ID_TRAY_SETTINGS) OpenSettingsWindow();
         else if (id == ID_TRAY_HIDE_ICON) ToggleTrayIcon();
         else if (id == ID_TRAY_AUTORUN) SetAutorun(!IsAutorun());
         else if (id == ID_TRAY_IMPORT_CLIPBOARD) {
-            log_msg("[Import] Import from clipboard.");
             int count = ImportFromClipboard(); 
             if (count > 0) {
                 ParseTags();
@@ -1039,10 +955,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
 
-// --- 主程序入口 ---
-
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nShow) {
-    log_msg("=== Application Startup ===");
     srand((unsigned)time(NULL));
 
     InitGlobalLocks();
@@ -1094,8 +1007,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nSho
     
     MSG msg; while(GetMessage(&msg, NULL, 0, 0)) { TranslateMessage(&msg); DispatchMessage(&msg); }
     
-    cleanup_crypto_global();
-    DeleteGlobalLocks(); 
+    // [Fix] Exit Crash: 移除显式清理，避免多线程冲突
+    // cleanup_crypto_global(); 
+    // DeleteGlobalLocks(); 
     
     return 0;
 }
