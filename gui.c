@@ -61,37 +61,57 @@ DWORD WINAPI AutoUpdateThread(LPVOID lpParam) {
             return 0;
         }
 
-        // 执行更新 (FALSE=静默模式)
-        int count = UpdateAllSubscriptions(FALSE);
-        
-        // 如果有更新，通知 UI 刷新
-        if (count > 0) {
-            HWND hMgr = FindWindowW(L"NodeMgr", NULL);
-            if (hMgr && IsWindow(hMgr)) {
-                PostMessage(hMgr, WM_REFRESH_NODELIST, 0, 0);
+        // [Security] 增加异常捕获，防止后台线程崩溃导致主程序退出
+        __try {
+            // 执行更新 (FALSE=静默模式)
+            int count = UpdateAllSubscriptions(FALSE);
+            
+            // 如果有更新，通知 UI 刷新
+            if (count > 0) {
+                HWND hMgr = FindWindowW(L"NodeMgr", NULL);
+                if (hMgr && IsWindow(hMgr)) {
+                    PostMessage(hMgr, WM_REFRESH_NODELIST, 0, 0);
+                }
             }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            log_msg("[Fatal] 自动更新线程发生严重崩溃！");
         }
     }
     return 0;
 }
 
-// [修复] 手动更新线程：增加安全性校验，防止窗口销毁后 PostMessage 导致的 Runtime 错误
+// [修复] 手动更新线程：增加安全性校验和 SEH 异常处理
 DWORD WINAPI ManualUpdateThread(LPVOID param) {
     HWND hWnd = (HWND)param;
     if (!IsWindow(hWnd)) return 0;
 
     log_msg("[Thread] 手动更新订阅开始...");
     
-    // 执行更新逻辑 (UpdateAllSubscriptions 内部已由文件锁保护)
-    int count = UpdateAllSubscriptions(TRUE);
+    int count = 0;
+    BOOL success = FALSE;
+
+    // [Security] 使用 SEH 捕获 Runtime Error
+    __try {
+        // UpdateAllSubscriptions 内部已由文件锁保护
+        count = UpdateAllSubscriptions(TRUE);
+        success = TRUE;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        log_msg("[Fatal] 订阅更新过程中发生崩溃 (Exception Code: 0x%08X)", GetExceptionCode());
+        success = FALSE;
+    }
     
     // 确保窗口依然存在再发送完成消息
     if (IsWindow(hWnd)) {
-        PostMessage(hWnd, WM_UPDATE_FINISH, (WPARAM)count, 0);
+        // 如果成功返回数量，如果崩溃返回 -1
+        PostMessage(hWnd, WM_UPDATE_FINISH, (WPARAM)(success ? count : -1), 0);
     } else {
         // 如果订阅窗口已关闭，尝试通知节点管理器刷新
-        HWND hMgr = FindWindowW(L"NodeMgr", NULL);
-        if (hMgr) PostMessage(hMgr, WM_REFRESH_NODELIST, 0, 0);
+        if (success) {
+            HWND hMgr = FindWindowW(L"NodeMgr", NULL);
+            if (hMgr) PostMessage(hMgr, WM_REFRESH_NODELIST, 0, 0);
+        }
     }
     return 0;
 }
@@ -631,11 +651,16 @@ LRESULT CALLBACK SubWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             int count = (int)wParam;
             EnableWindow(GetDlgItem(hWnd, ID_SUB_UPD_BTN), TRUE);
             SetWindowTextW(hWnd, L"订阅设置");
-            wchar_t msg[128]; 
-            swprintf_s(msg, 128, L"更新完成，共获取 %d 个节点。", count);
-            MessageBoxW(hWnd, msg, L"结果", MB_OK);
-            HWND hMgr = FindWindowW(L"NodeMgr", NULL);
-            if (hMgr) SendMessage(hMgr, WM_REFRESH_NODELIST, 0, 0);
+            
+            if (count < 0) {
+                MessageBoxW(hWnd, L"更新过程中发生严重错误，程序已拦截崩溃。\n请检查日志或网络连接。", L"更新失败", MB_OK | MB_ICONERROR);
+            } else {
+                wchar_t msg[128]; 
+                swprintf_s(msg, 128, L"更新完成，共获取 %d 个节点。", count);
+                MessageBoxW(hWnd, msg, L"结果", MB_OK);
+                HWND hMgr = FindWindowW(L"NodeMgr", NULL);
+                if (hMgr) SendMessage(hMgr, WM_REFRESH_NODELIST, 0, 0);
+            }
             break;
         }
         case WM_CLOSE: DestroyWindow(hWnd); break;
