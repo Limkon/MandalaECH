@@ -16,9 +16,12 @@
 static HWND hSettingsWnd = NULL;
 static HWND hSubWnd = NULL;
 static HWND hNodeMgrWnd = NULL;
-static HWND hLogViewerWnd = NULL;
+// [Fix] 移除 static，使其与 common.h 中的 extern 声明一致
+HWND hLogViewerWnd = NULL;
 
-// --- 控件 ID 定义 (确保不冲突) ---
+// --- 控件 ID 定义 ---
+// [Fix] 移除了与 resource.h 冲突的 ID 定义 (ID_EDIT_TAG 等)
+// 仅保留 resource.h 中没有的订阅窗口专用 ID
 #define ID_SUB_LIST     3000
 #define ID_SUB_ADD_BTN  3001
 #define ID_SUB_DEL_BTN  3002
@@ -26,15 +29,6 @@ static HWND hLogViewerWnd = NULL;
 #define ID_SUB_URL_EDIT 3004
 #define ID_SUB_SAVE_BTN 3005
 
-#define ID_EDIT_TAG     4001
-#define ID_EDIT_ADDR    4002
-#define ID_EDIT_PORT    4003
-#define ID_EDIT_USER    4004
-#define ID_EDIT_PASS    4005
-#define ID_EDIT_NET     4006
-#define ID_EDIT_TLS     4007
-#define ID_EDIT_HOST    4008
-#define ID_EDIT_PATH    4009
 #define ID_BTN_SAVE     4010
 #define ID_BTN_CANCEL   4011
 
