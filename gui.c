@@ -16,8 +16,6 @@
 static HWND hSettingsWnd = NULL;
 static HWND hSubWnd = NULL;
 static HWND hNodeMgrWnd = NULL;
-// [Fix] 移除 static，使其与 common.h 中的 extern 声明一致
-HWND hLogViewerWnd = NULL;
 
 // --- 控件 ID 定义 ---
 // [Fix] 移除了与 resource.h 冲突的 ID 定义 (ID_EDIT_TAG 等)
@@ -933,3 +931,4 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nSho
     DeleteGlobalLocks();
     return 0;
 }
+
