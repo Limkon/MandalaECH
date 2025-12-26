@@ -3,12 +3,16 @@
 #include "utils.h"
 #include "common.h"
 #include <openssl/sha.h>
+#include <stdio.h>
 
-// [Safety] 全局活跃连接计数器与内存水位监控
+// [Fix] 补充 ECH 全局变量声明 (如果在 common.h 中未声明)
+extern int g_enableECH; 
+
+// [Safety] 全局活跃连接计数器
 static volatile LONG g_active_connections = 0;
-volatile LONG64 g_total_allocated_mem = 0; 
 
-// [Concurrency] 客户端线程上下文 - 确保配置在线程间隔离
+// [Concurrency] 客户端线程上下文
+// 确保 Worker 线程使用独立的配置副本
 typedef struct {
     SOCKET clientSock;
     ProxyConfig config;          
@@ -37,7 +41,7 @@ void parse_uuid(const char* uuid_str, unsigned char* out) {
 // --- 辅助函数：Trojan 密码哈希 ---
 void trojan_password_hash(const char* password, char* out_hex) {
     unsigned char digest[SHA224_DIGEST_LENGTH];
-    SHA224((unsigned char*)password, (size_t)strlen(password), digest);
+    SHA224((const unsigned char*)password, strlen(password), digest);
     for(int i = 0; i < SHA224_DIGEST_LENGTH; i++) {
         snprintf(out_hex + (i * 2), 3, "%02x", digest[i]); 
     }
@@ -67,16 +71,15 @@ int read_header_robust(SOCKET s, char* buf, int max_len, int timeout_sec) {
         total_read += n;
         buf[total_read] = 0; 
         
-        // SOCKS5 探测 (05 01 00)
+        // SOCKS5 (05 01 00)
         if (buf[0] == 0x05) { 
             if (total_read >= 2) return total_read; 
         }
-        // HTTP 探测
+        // HTTP
         else { 
             if (strstr(buf, "\r\n\r\n")) return total_read; 
         }
-        
-        if (total_read > 8192) break; // 防御超大头部攻击
+        if (total_read > 8192) break; 
     }
     return total_read > 0 ? total_read : -1;
 }
@@ -117,25 +120,7 @@ void base64_encode_key(const unsigned char* src, char* dst) {
     *(dst-1) = '='; *dst = 0;
 }
 
-// [Optimization] 动态内存分配与监控包装器
-void* proxy_malloc(size_t size) {
-    if (g_total_allocated_mem + (LONG64)size > MAX_TOTAL_MEMORY_USAGE) {
-        log_msg("[Warn] Memory limit reached, allocation denied.");
-        return NULL;
-    }
-    void* p = malloc(size);
-    if (p) InterlockedAdd64(&g_total_allocated_mem, (LONG64)size);
-    return p;
-}
-
-void proxy_free(void* p, size_t size) {
-    if (p) {
-        free(p);
-        InterlockedAdd64(&g_total_allocated_mem, -(LONG64)size);
-    }
-}
-
-// --- 客户端处理线程 (核心逻辑) ---
+// --- 客户端处理线程 ---
 DWORD WINAPI client_handler(LPVOID p) {
     InterlockedIncrement(&g_active_connections);
     ClientContext* ctx = (ClientContext*)p;
@@ -152,34 +137,33 @@ DWORD WINAPI client_handler(LPVOID p) {
     TLSContext tls; memset(&tls, 0, sizeof(tls));
     SOCKET r = INVALID_SOCKET;      
     char *c_buf = NULL, *ws_read_buf = NULL, *ws_send_buf = NULL; 
+    
+    // [Fix] 移除 proxy_malloc，使用标准 malloc，避免 InterlockedAdd64 导致的崩溃
     int ws_read_buf_cap = IO_BUFFER_SIZE; 
     int ws_buf_len = 0; 
-    int browser_len;
-    char method[16], host[256], port_str[16];
-    int port = 80, is_connect_method = 0, is_socks5 = 0;
-    char *header_end = NULL; int header_len = 0;
-    struct addrinfo hints, *res = NULL, *ptr = NULL;
-
-    // 分配初始缓冲区并记录内存占用
-    c_buf = (char*)proxy_malloc(IO_BUFFER_SIZE); 
-    ws_read_buf = (char*)proxy_malloc(ws_read_buf_cap); 
-    ws_send_buf = (char*)proxy_malloc(IO_BUFFER_SIZE + 4096); 
+    
+    c_buf = (char*)malloc(IO_BUFFER_SIZE); 
+    ws_read_buf = (char*)malloc(ws_read_buf_cap); 
+    ws_send_buf = (char*)malloc(IO_BUFFER_SIZE + 4096); 
     if (!c_buf || !ws_read_buf || !ws_send_buf) goto cl_end; 
 
     int flag = 1;
     setsockopt(c, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
     
     // 1. 读取浏览器首包
-    browser_len = read_header_robust(c, c_buf, IO_BUFFER_SIZE, 10);
+    int browser_len = read_header_robust(c, c_buf, IO_BUFFER_SIZE, 10);
     if (browser_len <= 0) goto cl_end; 
     c_buf[browser_len] = 0;
     
+    char method[16] = {0}, host[256] = {0}, port_str[16] = {0};
+    int port = 80, is_connect_method = 0, is_socks5 = 0;
+    char *header_end = NULL; int header_len = 0;
+
     // 协议探测
     if (c_buf[0] == 0x05) { 
-        // Socks5 处理
-        send(c, "\x05\x00", 2, 0); // 无需认证
+        // Socks5
+        send(c, "\x05\x00", 2, 0); 
         is_socks5 = 1;
-        
         int n = recv_timeout(c, c_buf, IO_BUFFER_SIZE, 10);
         if (n <= 0) goto cl_end;
         browser_len = n;
@@ -197,7 +181,7 @@ DWORD WINAPI client_handler(LPVOID p) {
         } else goto cl_end;
     } 
     else {
-        // HTTP/HTTPS 处理
+        // HTTP/HTTPS
         if (sscanf(c_buf, "%15s %255s", method, host) == 2) {
             char *p_col = strchr(host, ':');
             if (p_col) { *p_col = 0; port = atoi(p_col+1); }
@@ -209,20 +193,10 @@ DWORD WINAPI client_handler(LPVOID p) {
         } else goto cl_end;
     }
     
-    // [Desensitization] 日志脱敏处理 (隐藏部分 Host 信息)
-    char display_host[256]; strcpy(display_host, host);
-#if LOG_DESENSITIZE
-    if (strlen(display_host) > 4) {
-        // 简单脱敏：保留首尾，中间打码
-        size_t dlen = strlen(display_host);
-        if (dlen > 8) {
-            for(size_t i=3; i<dlen-3; i++) if(display_host[i]!='.') display_host[i] = '*';
-        }
-    }
-#endif
-    log_msg("[Proxy] %s -> %s:%d", method, display_host, port);
+    log_msg("[Proxy] %s -> %s:%d", method, host, port);
     
     // 2. 连接代理服务器
+    struct addrinfo hints, *res = NULL, *ptr = NULL;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM;
     hints.ai_protocol = IPPROTO_TCP;
@@ -280,7 +254,7 @@ DWORD WINAPI client_handler(LPVOID p) {
         log_msg("[Err] WS Handshake Fail: %.50s", ws_read_buf); goto cl_end; 
     }
     
-    // 处理 Early Data (粘包)
+    // 处理 Early Data
     char* body_start = strstr(ws_read_buf, "\r\n\r\n");
     if (body_start) {
         body_start += 4; 
@@ -292,7 +266,7 @@ DWORD WINAPI client_handler(LPVOID p) {
         }
     }
     
-    // 4. 代理协议封包 (VLESS / Trojan / SS / Mandala / Socks)
+    // 4. 协议封装
     unsigned char proto_buf[2048]; 
     int proto_len = 0, flen = 0;
     struct in_addr ip4; struct in6_addr ip6;
@@ -303,10 +277,10 @@ DWORD WINAPI client_handler(LPVOID p) {
     BOOL is_mandala = (_stricmp(localConfig.type, "mandala") == 0);
 
     if (is_vless) {
-        proto_buf[proto_len++] = 0x00; // Version
+        proto_buf[proto_len++] = 0x00; 
         parse_uuid(localConfig.user, proto_buf + proto_len); proto_len += 16; 
-        proto_buf[proto_len++] = 0x00; // Addons
-        proto_buf[proto_len++] = 0x01; // TCP
+        proto_buf[proto_len++] = 0x00; 
+        proto_buf[proto_len++] = 0x01; 
         proto_buf[proto_len++] = (port >> 8) & 0xFF; proto_buf[proto_len++] = port & 0xFF;        
         if (inet_pton(AF_INET, host, &ip4) == 1) {
             proto_buf[proto_len++] = 0x01; memcpy(proto_buf + proto_len, &ip4, 4); proto_len += 4;
@@ -320,10 +294,10 @@ DWORD WINAPI client_handler(LPVOID p) {
         tls_write(&tls, ws_send_buf, flen);
     } 
     else if (is_trojan || is_mandala) {
-        char hex_pass[SHA224_DIGEST_LENGTH * 2 + 1]; 
+        char hex_pass[128]; 
         trojan_password_hash(localConfig.pass, hex_pass);
         
-        if (is_mandala) { // Mandala 自定义协议
+        if (is_mandala) { 
             unsigned char salt[4], plaintext[2048]; 
             int p_len = 0;
             for(int i=0; i<4; i++) salt[i] = rand() % 256;
@@ -332,7 +306,7 @@ DWORD WINAPI client_handler(LPVOID p) {
             int pad = rand() % 16; plaintext[p_len++] = (unsigned char)pad;
             for(int i=0; i<pad; i++) plaintext[p_len++] = rand() % 256;
             
-            plaintext[p_len++] = 0x01; // TCP
+            plaintext[p_len++] = 0x01; 
             if (inet_pton(AF_INET, host, &ip4) == 1) {
                  plaintext[p_len++] = 0x01; memcpy(plaintext + p_len, &ip4, 4); p_len += 4;
             } else if (inet_pton(AF_INET6, host, &ip6) == 1) {
@@ -347,7 +321,7 @@ DWORD WINAPI client_handler(LPVOID p) {
             memcpy(proto_buf, salt, 4);
             for(int i=0; i<p_len; i++) proto_buf[4 + i] = plaintext[i] ^ salt[i % 4];
             proto_len = 4 + p_len;
-        } else { // Trojan 标准协议
+        } else { 
             memcpy(proto_buf, hex_pass, 56); proto_len = 56;
             proto_buf[proto_len++] = 0x0D; proto_buf[proto_len++] = 0x0A;
             proto_buf[proto_len++] = 0x01; 
@@ -378,7 +352,8 @@ DWORD WINAPI client_handler(LPVOID p) {
         flen = build_ws_frame((char*)proto_buf, proto_len, ws_send_buf);
         tls_write(&tls, ws_send_buf, flen);
     }
-    else { // SOCKS5 Outbound
+    else { 
+        // SOCKS5 Outbound
         char auth[] = {0x05, 0x01, 0x00}; 
         if (strlen(localConfig.user) > 0) auth[2] = 0x02; 
         flen = build_ws_frame(auth, 3, ws_send_buf);
@@ -431,7 +406,7 @@ DWORD WINAPI client_handler(LPVOID p) {
         tls_write(&tls, ws_send_buf, flen);
     }
     
-    // 6. 转发循环 (非阻塞 IO)
+    // 6. 转发循环
     u_long mode = 1; 
     ioctlsocket(c, FIONBIO, &mode); 
     ioctlsocket(r, FIONBIO, &mode);
@@ -443,7 +418,6 @@ DWORD WINAPI client_handler(LPVOID p) {
         int pending = SSL_pending(tls.ssl);
         tv.tv_sec = 1; tv.tv_usec = 0;
         
-        // 如果有缓存数据，不再等待
         if (pending > 0 || ws_buf_len > 0) { tv.tv_sec = 0; tv.tv_usec = 0; }
         
         int n = select(0, &fds, NULL, NULL, &tv);
@@ -455,32 +429,23 @@ DWORD WINAPI client_handler(LPVOID p) {
             if (len > 0) {
                 flen = build_ws_frame(c_buf, len, ws_send_buf);
                 if (tls_write(&tls, ws_send_buf, flen) < 0) break;
-            } else if (len == 0) {
-                break;
-            } else if (WSAGetLastError() != WSAEWOULDBLOCK) {
-                break;
-            }
+            } else if (len == 0) break; 
+            else if (WSAGetLastError() != WSAEWOULDBLOCK) break;
         }
         
         // 代理 -> 浏览器
         if (FD_ISSET(r, &fds) || pending > 0) {
-            // [Optimization] 动态扩容与水位控制
             if (ws_buf_len >= ws_read_buf_cap - 1024) { 
                 if (ws_read_buf_cap < MAX_WS_FRAME_SIZE) {
                     int new_cap = ws_read_buf_cap * 2;
                     if (new_cap > MAX_WS_FRAME_SIZE) new_cap = MAX_WS_FRAME_SIZE;
-                    
-                    // 尝试重分配
                     char* new_buf = (char*)realloc(ws_read_buf, new_cap);
                     if (new_buf) {
-                        // 更新全局内存计数
-                        InterlockedAdd64(&g_total_allocated_mem, (LONG64)(new_cap - ws_read_buf_cap));
                         ws_read_buf = new_buf;
                         ws_read_buf_cap = new_cap;
                     }
                 }
             }
-            // 确保不溢出
             if (ws_buf_len < ws_read_buf_cap) {
                 int len = tls_read(&tls, ws_read_buf + ws_buf_len, ws_read_buf_cap - ws_buf_len);
                 if (len > 0) ws_buf_len += len;
@@ -492,27 +457,23 @@ DWORD WINAPI client_handler(LPVOID p) {
         while (ws_buf_len > 0) {
             int hl, pl;
             long long frame_total = check_ws_frame((unsigned char*)ws_read_buf, ws_buf_len, &hl, &pl);
-            if (frame_total < 0) goto cl_end; // 帧过大或错误
+            if (frame_total < 0) goto cl_end; 
             if (frame_total > 0) {
                 int opcode = ws_read_buf[0] & 0x0F;
-                if (opcode == 0x8) goto cl_end; // Close
+                if (opcode == 0x8) goto cl_end; 
                 
                 if ((opcode == 0x1 || opcode == 0x2) && pl > 0) {
                     char* payload_ptr = ws_read_buf + hl;
                     int payload_size = pl;
                     
-                    // VLESS 响应头剥离 (Response Header: 2 bytes version + 1 byte len + N bytes info)
                     if (is_vless && !vless_response_header_stripped) {
                         if (payload_size >= 2) {
                             int addon_len = (unsigned char)payload_ptr[1];
                             int head_size = 2 + addon_len;
                             if (payload_size >= head_size) {
-                                payload_ptr += head_size;
-                                payload_size -= head_size;
+                                payload_ptr += head_size; payload_size -= head_size;
                                 vless_response_header_stripped = 1;
-                            } else { 
-                                payload_size = 0; // 数据不足，等下一包
-                            }
+                            } else payload_size = 0;
                         } else payload_size = 0;
                     }
                     
@@ -521,31 +482,27 @@ DWORD WINAPI client_handler(LPVOID p) {
                     }
                 }
                 
-                // 移除已处理帧
                 if (frame_total < ws_buf_len) {
                     memmove(ws_read_buf, ws_read_buf + frame_total, ws_buf_len - (int)frame_total);
                 }
                 ws_buf_len -= (int)frame_total;
-            } else break; // 数据不完整
+            } else break; 
         }
     }
 
 cl_end:
     if (res) freeaddrinfo(res);
-    // 释放内存并更新全局水位
-    proxy_free(c_buf, IO_BUFFER_SIZE);
-    proxy_free(ws_read_buf, ws_read_buf_cap);
-    proxy_free(ws_send_buf, IO_BUFFER_SIZE + 4096);
-    
+    free(c_buf);
+    free(ws_read_buf);
+    free(ws_send_buf);
     tls_close(&tls);
     if (r != INVALID_SOCKET) closesocket(r); 
     if (c != INVALID_SOCKET) closesocket(c);
-    
     InterlockedDecrement(&g_active_connections);
     return 0;
 }
 
-// 监听线程与管理函数
+// 监听线程
 DWORD WINAPI server_thread(LPVOID p) {
     g_listen_sock = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in addr; 
@@ -569,14 +526,12 @@ DWORD WINAPI server_thread(LPVOID p) {
     while(g_proxyRunning) {
         SOCKET c = accept(g_listen_sock, NULL, NULL);
         if (c != INVALID_SOCKET) {
-            // [Safety] 最大连接数限制
             if (g_active_connections >= MAX_CONNECTIONS) {
                 closesocket(c);
                 Sleep(10); 
                 continue;
             }
 
-            // [Concurrency] 配置快照
             ClientContext* ctx = (ClientContext*)malloc(sizeof(ClientContext));
             if (ctx) {
                 ctx->clientSock = c;
@@ -585,6 +540,7 @@ DWORD WINAPI server_thread(LPVOID p) {
                 strncpy(ctx->userAgent, g_userAgentStr, sizeof(ctx->userAgent)-1);
                 ctx->userAgent[sizeof(ctx->userAgent)-1] = 0;
                 
+                // [Fix] 补全所有加密配置，防止 ECH 选项未初始化导致崩溃
                 ctx->cryptoSettings.enableFragment = g_enableFragment;
                 ctx->cryptoSettings.fragMin = g_fragSizeMin;
                 ctx->cryptoSettings.fragMax = g_fragSizeMax;
@@ -593,6 +549,10 @@ DWORD WINAPI server_thread(LPVOID p) {
                 ctx->cryptoSettings.padMin = g_padSizeMin;
                 ctx->cryptoSettings.padMax = g_padSizeMax;
                 ctx->cryptoSettings.enableChromeCiphers = g_enableChromeCiphers;
+                
+                // [Fix] 关键：复制 ECH 开关
+                ctx->cryptoSettings.enableECH = g_enableECH;
+
                 LeaveCriticalSection(&g_configLock);
 
                 HANDLE hClient = CreateThread(NULL, 0, client_handler, (LPVOID)ctx, 0, NULL);
