@@ -1,34 +1,38 @@
 #include "config.h"
 #include "utils.h"
 #include "proxy.h" 
+#include "common.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <wchar.h> // [修复] 引入宽字符处理头文件
+#include <wchar.h> 
 #include <time.h> 
 
 // --- 全局变量声明 ---
 Subscription g_subs[MAX_SUBS];
 int g_subCount = 0;
 
-// 新增：订阅更新配置默认值
 int g_subUpdateMode = 0;      // 0=每天 (默认)
 int g_subUpdateInterval = 24; // 24小时 (默认)
-long long g_lastUpdateTime = 0; // [新增] 上次更新时间戳
+long long g_lastUpdateTime = 0; 
 
 // --- 内部辅助函数声明 ---
 int Internal_BatchAddNodesFromText(const char* text, cJSON* outbounds);
 char* GetUniqueTagName(cJSON* outbounds, const char* type, const char* base_name);
 cJSON* ParseMandala(const char* link);
+cJSON* ParseVmess(const char* link);
+cJSON* ParseShadowsocks(const char* link);
+cJSON* ParseVlessOrTrojan(const char* link);
+cJSON* ParseSocks(const char* link);
 
-// [Security Fix] 安全字符串复制辅助函数
+// [Security] 安全字符串复制
 static void SafeStrCpy(char* dest, size_t destSize, const char* src) {
     if (!dest || destSize == 0) return;
     if (!src) { dest[0] = '\0'; return; }
     snprintf(dest, destSize, "%s", src);
 }
 
-// --- 辅助：安全获取或创建 JSON 对象 ---
+// [Helper] 安全获取或创建 JSON 对象
 static cJSON* GetOrCreateObj(cJSON* parent, const char* name) {
     cJSON* item = cJSON_GetObjectItem(parent, name);
     if (!item) {
@@ -38,19 +42,18 @@ static cJSON* GetOrCreateObj(cJSON* parent, const char* name) {
     return item;
 }
 
-// --- SS Plugin 解析辅助函数 ---
+// --- SS Plugin 解析辅助 ---
 static void ParseSSPlugin(cJSON* outbound, const char* pluginParam) {
     if (!pluginParam || !outbound) return;
     char* pluginCopy = _strdup(pluginParam);
     if (!pluginCopy) return;
 
-    char host[256] = {0}; char path[256] = {0}; char sni[256] = {0}; char mode[64] = {0};
+    char host[256] = {0}, path[256] = {0}, sni[256] = {0}, mode[64] = {0};
     BOOL isTls = FALSE;
     BOOL isV2ray = (strstr(pluginCopy, "v2ray-plugin") != NULL);
     
     char* start = pluginCopy;
     char* end = NULL;
-    
     while (start && *start) {
         end = strchr(start, ';');
         if (end) *end = '\0'; 
@@ -61,10 +64,9 @@ static void ParseSSPlugin(cJSON* outbound, const char* pluginParam) {
         else if (strncmp(start, "sni=", 4) == 0) SafeStrCpy(sni, sizeof(sni), start+4);
         else if (strncmp(start, "mode=", 5) == 0) SafeStrCpy(mode, sizeof(mode), start+5);
         else if (strcmp(start, "tls") == 0) isTls = TRUE;
-        else if (strncmp(start, "obfs=", 5) == 0) { if (strcmp(start+5, "tls") == 0) isTls = TRUE; }
+        else if (strncmp(start, "obfs=", 5) == 0 && strcmp(start+5, "tls") == 0) isTls = TRUE;
 
-        if (end) start = end + 1;
-        else start = NULL;
+        if (end) start = end + 1; else start = NULL;
     }
 
     if (isTls) {
@@ -86,7 +88,7 @@ static void ParseSSPlugin(cJSON* outbound, const char* pluginParam) {
     free(pluginCopy);
 }
 
-// --- 配置文件基础操作 ---
+// --- 配置加载与保存 ---
 
 void LoadSettings() {
     UINT modifiers = GetPrivateProfileIntW(L"Settings", L"Modifiers", MOD_CONTROL | MOD_ALT, g_iniFilePath);
@@ -94,6 +96,7 @@ void LoadSettings() {
     int port = GetPrivateProfileIntW(L"Settings", L"LocalPort", 10809, g_iniFilePath);
     int hideTray = GetPrivateProfileIntW(L"Settings", L"HideTray", 0, g_iniFilePath);
     
+    // 抗封锁配置
     int enableChrome = GetPrivateProfileIntW(L"Settings", L"ChromeCiphers", 1, g_iniFilePath);
     int enableALPN = GetPrivateProfileIntW(L"Settings", L"EnableALPN", 1, g_iniFilePath);
     int enableFrag = GetPrivateProfileIntW(L"Settings", L"EnableFragment", 0, g_iniFilePath);
@@ -105,53 +108,39 @@ void LoadSettings() {
     int padMax = GetPrivateProfileIntW(L"Settings", L"PadMax", 500, g_iniFilePath);
     int uaIdx = GetPrivateProfileIntW(L"Settings", L"UAPlatform", 0, g_iniFilePath);
 
-    // [新增] 读取 ECH 配置
+    // ECH 配置
     int enableECH = GetPrivateProfileIntW(L"Settings", L"EnableECH", 0, g_iniFilePath);
-    wchar_t wEchServer[256] = {0};
+    wchar_t wEchServer[256] = {0}, wEchPub[256] = {0};
     GetPrivateProfileStringW(L"Settings", L"ECHServer", L"https://cloudflare-dns.com/dns-query", wEchServer, 256, g_iniFilePath);
-    wchar_t wEchPub[256] = {0};
     GetPrivateProfileStringW(L"Settings", L"ECHPublicName", L"", wEchPub, 256, g_iniFilePath);
 
-    // 读取订阅更新配置
+    // 订阅配置
     int upMode = GetPrivateProfileIntW(L"Subscriptions", L"UpdateMode", 0, g_iniFilePath);
     int upInterval = GetPrivateProfileIntW(L"Subscriptions", L"UpdateInterval", 24, g_iniFilePath);
-
-    // [新增] 读取上次更新时间
+    
     wchar_t wTimeBuf[64] = {0};
     GetPrivateProfileStringW(L"Subscriptions", L"LastUpdateTime", L"0", wTimeBuf, 64, g_iniFilePath);
-    
-    // [修复] 使用标准 wcstoll 替代 _wtoll
-    g_lastUpdateTime = wcstoll(wTimeBuf, NULL, 10);
+    long long lastTime = wcstoll(wTimeBuf, NULL, 10);
 
     EnterCriticalSection(&g_configLock);
 
-    g_hotkeyModifiers = modifiers;
-    g_hotkeyVk = vk;
-    g_localPort = port;
-    g_hideTrayStart = hideTray;
+    g_hotkeyModifiers = modifiers; g_hotkeyVk = vk;
+    g_localPort = port; g_hideTrayStart = hideTray;
     
-    g_enableChromeCiphers = enableChrome;
-    g_enableALPN = enableALPN;
-    g_enableFragment = enableFrag;
-    g_fragSizeMin = fragMin;
-    g_fragSizeMax = fragMax;
-    g_fragDelayMs = fragDly;
-    g_enablePadding = enablePad;
-    g_padSizeMin = padMin;
-    g_padSizeMax = padMax;
+    g_enableChromeCiphers = enableChrome; g_enableALPN = enableALPN;
+    g_enableFragment = enableFrag; g_fragSizeMin = fragMin; g_fragSizeMax = fragMax; g_fragDelayMs = fragDly;
+    g_enablePadding = enablePad; g_padSizeMin = padMin; g_padSizeMax = padMax;
 
-    // [新增] 赋值 ECH 全局变量
+    if (g_fragSizeMin < 1) g_fragSizeMin = 1; if (g_fragSizeMax < g_fragSizeMin) g_fragSizeMax = g_fragSizeMin;
+    if (g_fragDelayMs < 0) g_fragDelayMs = 0; 
+    if (g_padSizeMin < 0) g_padSizeMin = 0; if (g_padSizeMax < g_padSizeMin) g_padSizeMax = g_padSizeMin;
+
     g_enableECH = enableECH;
     WideCharToMultiByte(CP_UTF8, 0, wEchServer, -1, g_echConfigServer, sizeof(g_echConfigServer), NULL, NULL);
     WideCharToMultiByte(CP_UTF8, 0, wEchPub, -1, g_echPublicName, sizeof(g_echPublicName), NULL, NULL);
 
-    if (g_fragSizeMin < 1) g_fragSizeMin = 1; if (g_fragSizeMax < g_fragSizeMin) g_fragSizeMax = g_fragSizeMin;
-    if (g_fragDelayMs < 0) g_fragDelayMs = 0; if (g_padSizeMin < 0) g_padSizeMin = 0; if (g_padSizeMax < g_padSizeMin) g_padSizeMax = g_padSizeMin;
-
     g_uaPlatformIndex = uaIdx;
-    
-    g_subUpdateMode = upMode;
-    g_subUpdateInterval = upInterval;
+    g_subUpdateMode = upMode; g_subUpdateInterval = upInterval; g_lastUpdateTime = lastTime;
 
     wchar_t wUABuf[512] = {0}; 
     GetPrivateProfileStringW(L"Settings", L"UserAgent", L"", wUABuf, 512, g_iniFilePath);
@@ -164,8 +153,7 @@ void LoadSettings() {
     if (g_subCount > MAX_SUBS) g_subCount = MAX_SUBS;
     for (int i = 0; i < g_subCount; i++) {
         wchar_t wKeyEn[32], wKeyUrl[32], wUrl[512];
-        _snwprintf(wKeyEn, 32, L"Sub%d_Enabled", i); 
-        _snwprintf(wKeyUrl, 32, L"Sub%d_Url", i);
+        swprintf_s(wKeyEn, 32, L"Sub%d_Enabled", i); swprintf_s(wKeyUrl, 32, L"Sub%d_Url", i);
         g_subs[i].enabled = GetPrivateProfileIntW(L"Subscriptions", wKeyEn, 1, g_iniFilePath);
         GetPrivateProfileStringW(L"Subscriptions", wKeyUrl, L"", wUrl, 512, g_iniFilePath);
         WideCharToMultiByte(CP_UTF8, 0, wUrl, -1, g_subs[i].url, 512, NULL, NULL);
@@ -178,30 +166,27 @@ void SaveSettings() {
     EnterCriticalSection(&g_configLock);
 
     wchar_t buffer[16];
-    _snwprintf(buffer, 16, L"%u", g_hotkeyModifiers); WritePrivateProfileStringW(L"Settings", L"Modifiers", buffer, g_iniFilePath);
-    _snwprintf(buffer, 16, L"%u", g_hotkeyVk); WritePrivateProfileStringW(L"Settings", L"VK", buffer, g_iniFilePath);
-    _snwprintf(buffer, 16, L"%d", g_localPort); WritePrivateProfileStringW(L"Settings", L"LocalPort", buffer, g_iniFilePath);
-    _snwprintf(buffer, 16, L"%d", g_hideTrayStart); WritePrivateProfileStringW(L"Settings", L"HideTray", buffer, g_iniFilePath);
-    _snwprintf(buffer, 16, L"%d", g_enableChromeCiphers); WritePrivateProfileStringW(L"Settings", L"ChromeCiphers", buffer, g_iniFilePath);
-    _snwprintf(buffer, 16, L"%d", g_enableALPN); WritePrivateProfileStringW(L"Settings", L"EnableALPN", buffer, g_iniFilePath);
-    _snwprintf(buffer, 16, L"%d", g_enableFragment); WritePrivateProfileStringW(L"Settings", L"EnableFragment", buffer, g_iniFilePath);
-    _snwprintf(buffer, 16, L"%d", g_fragSizeMin); WritePrivateProfileStringW(L"Settings", L"FragMin", buffer, g_iniFilePath);
-    _snwprintf(buffer, 16, L"%d", g_fragSizeMax); WritePrivateProfileStringW(L"Settings", L"FragMax", buffer, g_iniFilePath);
-    _snwprintf(buffer, 16, L"%d", g_fragDelayMs); WritePrivateProfileStringW(L"Settings", L"FragDelay", buffer, g_iniFilePath);
-    _snwprintf(buffer, 16, L"%d", g_enablePadding); WritePrivateProfileStringW(L"Settings", L"EnablePadding", buffer, g_iniFilePath);
-    _snwprintf(buffer, 16, L"%d", g_padSizeMin); WritePrivateProfileStringW(L"Settings", L"PadMin", buffer, g_iniFilePath);
-    _snwprintf(buffer, 16, L"%d", g_padSizeMax); WritePrivateProfileStringW(L"Settings", L"PadMax", buffer, g_iniFilePath);
-    _snwprintf(buffer, 16, L"%d", g_uaPlatformIndex); WritePrivateProfileStringW(L"Settings", L"UAPlatform", buffer, g_iniFilePath);
+    swprintf_s(buffer, 16, L"%u", g_hotkeyModifiers); WritePrivateProfileStringW(L"Settings", L"Modifiers", buffer, g_iniFilePath);
+    swprintf_s(buffer, 16, L"%u", g_hotkeyVk); WritePrivateProfileStringW(L"Settings", L"VK", buffer, g_iniFilePath);
+    swprintf_s(buffer, 16, L"%d", g_localPort); WritePrivateProfileStringW(L"Settings", L"LocalPort", buffer, g_iniFilePath);
+    swprintf_s(buffer, 16, L"%d", g_hideTrayStart); WritePrivateProfileStringW(L"Settings", L"HideTray", buffer, g_iniFilePath);
     
-    // [新增] 保存 ECH 配置
-    _snwprintf(buffer, 16, L"%d", g_enableECH); 
-    WritePrivateProfileStringW(L"Settings", L"EnableECH", buffer, g_iniFilePath);
+    swprintf_s(buffer, 16, L"%d", g_enableChromeCiphers); WritePrivateProfileStringW(L"Settings", L"ChromeCiphers", buffer, g_iniFilePath);
+    swprintf_s(buffer, 16, L"%d", g_enableALPN); WritePrivateProfileStringW(L"Settings", L"EnableALPN", buffer, g_iniFilePath);
+    swprintf_s(buffer, 16, L"%d", g_enableFragment); WritePrivateProfileStringW(L"Settings", L"EnableFragment", buffer, g_iniFilePath);
+    swprintf_s(buffer, 16, L"%d", g_fragSizeMin); WritePrivateProfileStringW(L"Settings", L"FragMin", buffer, g_iniFilePath);
+    swprintf_s(buffer, 16, L"%d", g_fragSizeMax); WritePrivateProfileStringW(L"Settings", L"FragMax", buffer, g_iniFilePath);
+    swprintf_s(buffer, 16, L"%d", g_fragDelayMs); WritePrivateProfileStringW(L"Settings", L"FragDelay", buffer, g_iniFilePath);
+    swprintf_s(buffer, 16, L"%d", g_enablePadding); WritePrivateProfileStringW(L"Settings", L"EnablePadding", buffer, g_iniFilePath);
+    swprintf_s(buffer, 16, L"%d", g_padSizeMin); WritePrivateProfileStringW(L"Settings", L"PadMin", buffer, g_iniFilePath);
+    swprintf_s(buffer, 16, L"%d", g_padSizeMax); WritePrivateProfileStringW(L"Settings", L"PadMax", buffer, g_iniFilePath);
+    swprintf_s(buffer, 16, L"%d", g_uaPlatformIndex); WritePrivateProfileStringW(L"Settings", L"UAPlatform", buffer, g_iniFilePath);
     
-    wchar_t wEchServerOut[256] = {0};
+    swprintf_s(buffer, 16, L"%d", g_enableECH); WritePrivateProfileStringW(L"Settings", L"EnableECH", buffer, g_iniFilePath);
+    
+    wchar_t wEchServerOut[256] = {0}, wEchPubOut[256] = {0};
     MultiByteToWideChar(CP_UTF8, 0, g_echConfigServer, -1, wEchServerOut, 256);
     WritePrivateProfileStringW(L"Settings", L"ECHServer", wEchServerOut, g_iniFilePath);
-
-    wchar_t wEchPubOut[256] = {0};
     MultiByteToWideChar(CP_UTF8, 0, g_echPublicName, -1, wEchPubOut, 256);
     WritePrivateProfileStringW(L"Settings", L"ECHPublicName", wEchPubOut, g_iniFilePath);
 
@@ -210,24 +195,19 @@ void SaveSettings() {
     WritePrivateProfileStringW(L"Settings", L"UserAgent", wUABuf, g_iniFilePath);
 
     WritePrivateProfileStringW(L"Settings", L"LastNode", currentNode, g_iniFilePath);
-
-    WritePrivateProfileStringW(L"Subscriptions", NULL, NULL, g_iniFilePath);
+    WritePrivateProfileStringW(L"Subscriptions", NULL, NULL, g_iniFilePath); // Clear section
     
-    // [新增] 保存上次更新时间
-    // [修复] 使用 _snwprintf 替代 _i64tow (非标准函数)
-    wchar_t wTimeBuf[64];
-    _snwprintf(wTimeBuf, 64, L"%lld", g_lastUpdateTime);
+    wchar_t wTimeBuf[64]; swprintf_s(wTimeBuf, 64, L"%lld", g_lastUpdateTime);
     WritePrivateProfileStringW(L"Subscriptions", L"LastUpdateTime", wTimeBuf, g_iniFilePath);
 
-    _snwprintf(buffer, 16, L"%d", g_subUpdateMode); WritePrivateProfileStringW(L"Subscriptions", L"UpdateMode", buffer, g_iniFilePath);
-    _snwprintf(buffer, 16, L"%d", g_subUpdateInterval); WritePrivateProfileStringW(L"Subscriptions", L"UpdateInterval", buffer, g_iniFilePath);
+    swprintf_s(buffer, 16, L"%d", g_subUpdateMode); WritePrivateProfileStringW(L"Subscriptions", L"UpdateMode", buffer, g_iniFilePath);
+    swprintf_s(buffer, 16, L"%d", g_subUpdateInterval); WritePrivateProfileStringW(L"Subscriptions", L"UpdateInterval", buffer, g_iniFilePath);
+    swprintf_s(buffer, 16, L"%d", g_subCount); WritePrivateProfileStringW(L"Subscriptions", L"Count", buffer, g_iniFilePath);
 
-    _snwprintf(buffer, 16, L"%d", g_subCount); WritePrivateProfileStringW(L"Subscriptions", L"Count", buffer, g_iniFilePath);
     for (int i = 0; i < g_subCount; i++) {
         wchar_t wKeyEn[32], wKeyUrl[32], wUrl[512], wVal[2];
-        _snwprintf(wKeyEn, 32, L"Sub%d_Enabled", i); 
-        _snwprintf(wKeyUrl, 32, L"Sub%d_Url", i);
-        _snwprintf(wVal, 2, L"%d", g_subs[i].enabled); 
+        swprintf_s(wKeyEn, 32, L"Sub%d_Enabled", i); swprintf_s(wKeyUrl, 32, L"Sub%d_Url", i);
+        swprintf_s(wVal, 2, L"%d", g_subs[i].enabled); 
         WritePrivateProfileStringW(L"Subscriptions", wKeyEn, wVal, g_iniFilePath);
         MultiByteToWideChar(CP_UTF8, 0, g_subs[i].url, -1, wUrl, 512); 
         WritePrivateProfileStringW(L"Subscriptions", wKeyUrl, wUrl, g_iniFilePath);
@@ -240,7 +220,7 @@ void SetAutorun(BOOL enable) {
     HKEY hKey; wchar_t path[MAX_PATH]; GetModuleFileNameW(NULL, path, MAX_PATH);
     if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 
         0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
-        if (enable) RegSetValueExW(hKey, L"MyProxyClient", 0, REG_SZ, (BYTE*)path, (wcslen(path)+1)*sizeof(wchar_t));
+        if (enable) RegSetValueExW(hKey, L"MyProxyClient", 0, REG_SZ, (BYTE*)path, (DWORD)(wcslen(path)+1)*sizeof(wchar_t));
         else RegDeleteValueW(hKey, L"MyProxyClient");
         RegCloseKey(hKey);
     }
@@ -256,22 +236,17 @@ BOOL IsAutorun() {
     return FALSE;
 }
 
+// --- 节点管理操作 ---
+
 void ParseTags() {
     EnterCriticalSection(&g_configLock);
-
     if (nodeTags) { for(int i=0; i<nodeCount; i++) free(nodeTags[i]); free(nodeTags); }
     nodeCount = 0; nodeTags = NULL;
     char* buffer = NULL; long size = 0;
-    if (!ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) {
-        LeaveCriticalSection(&g_configLock);
-        return;
-    }
+    if (!ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) { LeaveCriticalSection(&g_configLock); return; }
 
     cJSON* root = cJSON_Parse(buffer); free(buffer);
-    if (!root) {
-        LeaveCriticalSection(&g_configLock);
-        return;
-    }
+    if (!root) { LeaveCriticalSection(&g_configLock); return; }
 
     cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
     cJSON* node;
@@ -286,7 +261,6 @@ void ParseTags() {
         }
     }
     cJSON_Delete(root);
-    
     LeaveCriticalSection(&g_configLock);
 }
 
@@ -313,7 +287,6 @@ char* GetUniqueTagName(cJSON* outbounds, const char* type, const char* base_name
 
 void ParseNodeConfigToGlobal(cJSON *node) {
     if (!node) return;
-    
     EnterCriticalSection(&g_configLock);
 
     memset(&g_proxyConfig, 0, sizeof(ProxyConfig));
@@ -352,16 +325,10 @@ void ParseNodeConfigToGlobal(cJSON *node) {
     if (strlen(g_proxyConfig.sni) == 0) SafeStrCpy(g_proxyConfig.sni, sizeof(g_proxyConfig.sni), g_proxyConfig.host);
 
     cJSON *type = cJSON_GetObjectItem(node, "type");
-    if (type && type->valuestring) {
-        SafeStrCpy(g_proxyConfig.type, sizeof(g_proxyConfig.type), type->valuestring);
-    } else {
-        SafeStrCpy(g_proxyConfig.type, sizeof(g_proxyConfig.type), "socks");
-    }
+    if (type && type->valuestring) SafeStrCpy(g_proxyConfig.type, sizeof(g_proxyConfig.type), type->valuestring);
+    else SafeStrCpy(g_proxyConfig.type, sizeof(g_proxyConfig.type), "socks");
 
     LeaveCriticalSection(&g_configLock);
-
-    log_msg("Node Config Loaded: %s:%d (Type: %s, SNI: %s)", 
-        g_proxyConfig.host, g_proxyConfig.port, g_proxyConfig.type, g_proxyConfig.sni);
 }
 
 void SwitchNode(const wchar_t* tag) {
@@ -388,8 +355,7 @@ void SwitchNode(const wchar_t* tag) {
         StartProxyCore(); 
         SaveSettings();   
         
-        wchar_t tip[128]; 
-        _snwprintf(tip, 128, L"已切换: %s", tag);
+        wchar_t tip[128]; swprintf_s(tip, 128, L"已切换: %s", tag);
         wcsncpy(nid.szInfo, tip, 127); wcsncpy(nid.szInfoTitle, L"Mandala Client", 63); nid.uFlags |= NIF_INFO;
         Shell_NotifyIconW(NIM_MODIFY, &nid);
     }
@@ -439,32 +405,22 @@ int Internal_BatchAddNodesFromText(const char* text, cJSON* outbounds) {
     unsigned char* decoded = NULL;
     size_t decLen = 0;
 
-    if (strstr(text, "://")) {
-        sourceText = _strdup(text);
-    } else {
+    if (strstr(text, "://")) sourceText = _strdup(text);
+    else {
         decoded = Base64Decode(text, &decLen);
-        if (decoded && decLen > 0) {
-            sourceText = (char*)decoded;
-        } else {
-            sourceText = _strdup(text);
-            if (decoded) free(decoded);
-        }
+        if (decoded && decLen > 0) sourceText = (char*)decoded;
+        else { sourceText = _strdup(text); if (decoded) free(decoded); }
     }
     
     if (!sourceText) return 0;
     
     char* p = sourceText;
     while (*p) {
-        size_t span = strspn(p, "\r\n ,");
-        p += span;
-        if (!*p) break;
-        
+        size_t span = strspn(p, "\r\n ,"); p += span; if (!*p) break;
         size_t len = strcspn(p, "\r\n ,");
         if (len > 0) {
             char* line = (char*)malloc(len + 1);
-            strncpy(line, p, len);
-            line[len] = '\0';
-            TrimString(line);
+            strncpy(line, p, len); line[len] = '\0'; TrimString(line);
             
             if (strlen(line) > 0) {
                 cJSON* node = NULL;
@@ -490,9 +446,7 @@ int Internal_BatchAddNodesFromText(const char* text, cJSON* outbounds) {
             p += len;
         }
     }
-    
-    free(sourceText); 
-    return count;
+    free(sourceText); return count;
 }
 
 int ImportFromClipboard() {
@@ -513,57 +467,42 @@ int UpdateAllSubscriptions(BOOL forceMsg) {
     for(int i=0; i<g_subCount; i++) if(g_subs[i].enabled && strlen(g_subs[i].url) > 4) activeSubs++;
     LeaveCriticalSection(&g_configLock);
 
-    if (activeSubs == 0) { if (forceMsg) log_msg("[Sub] No active subscriptions found."); return 0; }
-    log_msg("[Sub] Starting update for %d subscriptions...", activeSubs);
+    if (activeSubs == 0) { if (forceMsg) log_msg("[Sub] No active subscriptions."); return 0; }
+    log_msg("[Sub] Updating %d subscriptions...", activeSubs);
     char* rawData[MAX_SUBS] = {0}; int downloadSuccess = 0;
     
-    char subUrls[MAX_SUBS][512];
-    int subIndices[MAX_SUBS];
-    int count = 0;
-
+    char subUrls[MAX_SUBS][512]; int subIndices[MAX_SUBS]; int count = 0;
     EnterCriticalSection(&g_configLock);
     for (int i = 0; i < g_subCount; i++) {
         if (g_subs[i].enabled && strlen(g_subs[i].url) > 4) {
-            strncpy(subUrls[count], g_subs[i].url, 512);
-            subIndices[count] = i;
-            count++;
+            strncpy(subUrls[count], g_subs[i].url, 512); subIndices[count] = i; count++;
         }
     }
     LeaveCriticalSection(&g_configLock);
 
     for (int i = 0; i < count; i++) {
-        log_msg("[Sub] Downloading (%d/%d): %s", i+1, count, subUrls[i]);
+        log_msg("[Sub] DL (%d/%d): %s", i+1, count, subUrls[i]);
         char* data = Utils_HttpGet(subUrls[i]);
-        if (data) { rawData[i] = data; downloadSuccess++; } else log_msg("[Sub] Download failed: %s", subUrls[i]);
+        if (data) { rawData[i] = data; downloadSuccess++; } else log_msg("[Sub] Failed: %s", subUrls[i]);
     }
 
-    if (downloadSuccess == 0) { log_msg("[Error] All downloads failed. Config not updated."); return 0; }
+    if (downloadSuccess == 0) { log_msg("[Err] All downloads failed."); return 0; }
     
     char* buffer = NULL; long size = 0; cJSON* root = NULL;
     if (ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) { root = cJSON_Parse(buffer); free(buffer); }
     if (!root) { root = cJSON_CreateObject(); }
     if (cJSON_HasObjectItem(root, "outbounds")) cJSON_DeleteItemFromObject(root, "outbounds");
     cJSON* outbounds = cJSON_CreateArray(); cJSON_AddItemToObject(root, "outbounds", outbounds);
-    int totalNewNodes = 0;
     
+    int totalNewNodes = 0;
     for (int i = 0; i < count; i++) {
-        if (rawData[i]) { 
-            int c = Internal_BatchAddNodesFromText(rawData[i], outbounds); 
-            totalNewNodes += c; 
-            free(rawData[i]); 
-        }
+        if (rawData[i]) { totalNewNodes += Internal_BatchAddNodesFromText(rawData[i], outbounds); free(rawData[i]); }
     }
-    log_msg("[Sub] Total nodes parsed: %d. Saving config...", totalNewNodes);
+    
     char* out = cJSON_Print(root); WriteBufferToFile(CONFIG_FILE, out); free(out); cJSON_Delete(root);
     ParseTags(); 
-    
-    // [Modified] Update timestamp if success
-    if (downloadSuccess > 0) {
-        g_lastUpdateTime = (long long)time(NULL);
-        SaveSettings();
-    }
-    
-    log_msg("[Sub] Update complete.");
+    if (downloadSuccess > 0) { g_lastUpdateTime = (long long)time(NULL); SaveSettings(); }
+    log_msg("[Sub] Update done. Nodes: %d", totalNewNodes);
     return totalNewNodes;
 }
 
@@ -572,11 +511,12 @@ void ToggleTrayIcon() {
     if (g_isIconVisible) { Shell_NotifyIconW(NIM_DELETE, &nid); g_isIconVisible = FALSE; g_hideTrayStart = 1; }
     else { nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP; Shell_NotifyIconW(NIM_ADD, &nid); g_isIconVisible = TRUE; g_hideTrayStart = 0; }
     LeaveCriticalSection(&g_configLock);
-    
     SaveSettings(); 
 }
 
-// --- 协议解析函数 ---
+// --- 协议解析实现 (Vmess/Vless/Trojan/Shadowsocks/Socks/Mandala) ---
+
+// SOCKS 解析
 cJSON* ParseSocks(const char* link) {
     if (strncmp(link, "socks://", 8) != 0) return NULL;
     const char* p = link + 8; const char* at = strchr(p, '@'); if (!at) return NULL; 
@@ -585,37 +525,25 @@ cJSON* ParseSocks(const char* link) {
     char* user = (char*)decoded; char* pass = strchr(user, ':'); if (pass) { *pass = 0; pass++; } else pass = "";
     
     p = at + 1; const char* colon = strchr(p, ':'); const char* qMark = strchr(p, '?'); const char* hash = strchr(p, '#');
-    const char* hostEnd = colon;
-    if (!hostEnd || (qMark && qMark < hostEnd)) hostEnd = qMark;
-    if (!hostEnd || (hash && hash < hostEnd)) hostEnd = hash;
-    if (!hostEnd) hostEnd = p + strlen(p);
+    const char* hostEnd = colon ? colon : (qMark ? qMark : (hash ? hash : p + strlen(p)));
+    if (qMark && qMark < hostEnd) hostEnd = qMark; if (hash && hash < hostEnd) hostEnd = hash;
 
-    int portNum = 443;
-    if (colon && colon < hostEnd) portNum = atoi(colon + 1);
-
+    int portNum = 443; if (colon && colon < hostEnd) portNum = atoi(colon + 1);
     int hostLen = (int)(hostEnd - p); char* host = (char*)malloc(hostLen + 1); strncpy(host, p, hostLen); host[hostLen] = 0;
     
     char* tag = hash ? (char*)malloc(strlen(hash+1)+1) : _strdup("Socks-Import"); if(hash) UrlDecode(tag, hash+1);
     const char* query = qMark ? qMark + 1 : NULL;
     char* sni = GetQueryParam(query, "sni"); if (!sni) sni = GetQueryParam(query, "peer");
-    
-    char* path = GetQueryParam(query, "path");
-    if (path) {
-        char* decodedPath = _strdup(path);
-        if (decodedPath) {
-             UrlDecode(decodedPath, path);
-             free(path); path = decodedPath;
-        }
-    }
-    
+    char* path = GetQueryParam(query, "path"); if (path) { char* d = _strdup(path); UrlDecode(d, path); free(path); path=d; }
     char* type = GetQueryParam(query, "type"); if (!type) type = GetQueryParam(query, "transport");
     char* security = GetQueryParam(query, "security"); char* hostHeader = GetQueryParam(query, "host");
+    
     cJSON* outbound = cJSON_CreateObject();
     cJSON_AddStringToObject(outbound, "type", "socks_tls"); cJSON_AddStringToObject(outbound, "tag", tag);
     cJSON_AddStringToObject(outbound, "server", host); cJSON_AddNumberToObject(outbound, "server_port", portNum);
     cJSON_AddStringToObject(outbound, "username", user); cJSON_AddStringToObject(outbound, "password", pass);
-    BOOL enableTls = (security && strcmp(security, "tls") == 0) || sni != NULL;
-    if (enableTls) {
+    
+    if ((security && strcmp(security, "tls") == 0) || sni != NULL) {
         cJSON* tls = cJSON_CreateObject(); cJSON_AddBoolToObject(tls, "enabled", cJSON_True);
         if (sni) cJSON_AddStringToObject(tls, "server_name", sni); else cJSON_AddStringToObject(tls, "server_name", host);
         cJSON_AddItemToObject(outbound, "tls", tls);
@@ -623,42 +551,39 @@ cJSON* ParseSocks(const char* link) {
     if (type && strcmp(type, "ws") == 0) {
         cJSON* trans = cJSON_CreateObject(); cJSON_AddStringToObject(trans, "type", "ws");
         if (path) cJSON_AddStringToObject(trans, "path", path);
-        cJSON* headers = cJSON_CreateObject(); 
-        if (hostHeader) cJSON_AddStringToObject(headers, "Host", hostHeader); else cJSON_AddStringToObject(headers, "Host", host);
+        cJSON* headers = cJSON_CreateObject(); cJSON_AddStringToObject(headers, "Host", hostHeader?hostHeader:host);
         cJSON_AddItemToObject(trans, "headers", headers); cJSON_AddItemToObject(outbound, "transport", trans);
     }
-    if (sni) free(sni); if (path) free(path); if (type) free(type); if (security) free(security); if (hostHeader) free(hostHeader);
+    if(sni) free(sni); if(path) free(path); if(type) free(type); if(security) free(security); if(hostHeader) free(hostHeader);
     free(host); free(tag); free(decoded); return outbound;
 }
 
+// Shadowsocks 解析
 cJSON* ParseShadowsocks(const char* link) {
     if (strncmp(link, "ss://", 5) != 0) return NULL;
-    const char* p = link + 5; 
-    const char* hash = strchr(p, '#'); char* tag = hash ? (char*)malloc(strlen(hash+1)+1) : _strdup("SS");
+    const char* p = link + 5; const char* hash = strchr(p, '#'); 
+    char* tag = hash ? (char*)malloc(strlen(hash+1)+1) : _strdup("SS");
     if(hash) UrlDecode(tag, hash+1); else strcpy(tag, "SS");
-    const char* qMark = strchr(p, '?');
-    const char* endOfMain = qMark ? qMark : (hash ? hash : p + strlen(p));
+    
+    const char* qMark = strchr(p, '?'); const char* endOfMain = qMark ? qMark : (hash ? hash : p + strlen(p));
     size_t mainLen = (size_t)(endOfMain - p);
     char* mainPart = (char*)malloc(mainLen + 1); strncpy(mainPart, p, mainLen); mainPart[mainLen] = 0;
+    
     char serverPort[256] = {0}, methodPass[256] = {0}; char* at = strchr(mainPart, '@');
     if (!at) {
         size_t decLen; unsigned char* decoded = Base64Decode(mainPart, &decLen);
         if(!decoded) { free(mainPart); free(tag); return NULL; }
-        char* dStr = (char*)decoded; at = strchr(dStr, '@');
+        at = strchr((char*)decoded, '@');
         if (at) { 
             SafeStrCpy(serverPort, sizeof(serverPort), at+1); 
-            size_t mpLen = at - dStr;
-            if (mpLen >= sizeof(methodPass)) mpLen = sizeof(methodPass) - 1;
-            strncpy(methodPass, dStr, mpLen); methodPass[mpLen]=0; 
+            size_t mpLen = at - (char*)decoded; if (mpLen >= sizeof(methodPass)) mpLen = sizeof(methodPass) - 1;
+            strncpy(methodPass, (char*)decoded, mpLen); methodPass[mpLen]=0; 
         }
         free(decoded);
     } else {
         SafeStrCpy(serverPort, sizeof(serverPort), at+1); 
-        char b64User[256]; 
-        size_t uLen = at - mainPart;
-        if (uLen >= sizeof(b64User)) uLen = sizeof(b64User) - 1;
+        char b64User[256]; size_t uLen = at - mainPart; if (uLen >= sizeof(b64User)) uLen = sizeof(b64User) - 1;
         strncpy(b64User, mainPart, uLen); b64User[uLen] = 0;
-        
         size_t decLen; unsigned char* decoded = Base64Decode(b64User, &decLen);
         if(decoded) { SafeStrCpy(methodPass, sizeof(methodPass), (char*)decoded); free(decoded); } 
         else SafeStrCpy(methodPass, sizeof(methodPass), b64User);
@@ -674,45 +599,15 @@ cJSON* ParseShadowsocks(const char* link) {
     cJSON_AddStringToObject(outbound, "method", methodPass); cJSON_AddStringToObject(outbound, "password", pass);
 
     if (qMark) {
-        const char* qStart = qMark + 1; size_t qLen = hash ? (size_t)(hash - qStart) : strlen(qStart);
-        char* queryStr = (char*)malloc(qLen + 1); strncpy(queryStr, qStart, qLen); queryStr[qLen] = 0;
-        
+        char* queryStr = _strdup(qMark+1); if(hash) queryStr[hash-(qMark+1)] = 0;
         char* pluginVal = GetQueryParam(queryStr, "plugin");
         if (pluginVal) { UrlDecode(pluginVal, pluginVal); ParseSSPlugin(outbound, pluginVal); free(pluginVal); }
-
-        char* directSni = GetQueryParam(queryStr, "sni");
-        char* directHost = GetQueryParam(queryStr, "host"); if(!directHost) directHost = GetQueryParam(queryStr, "obfs-host");
-        char* directPath = GetQueryParam(queryStr, "path");
-        char* directMode = GetQueryParam(queryStr, "mode"); if(!directMode) directMode = GetQueryParam(queryStr, "type");
-        char* directSecurity = GetQueryParam(queryStr, "security"); 
-
-        BOOL needTls = (directSecurity && strcmp(directSecurity, "tls") == 0) || directSni != NULL;
-        if (needTls) {
-            cJSON* tlsObj = GetOrCreateObj(outbound, "tls");
-            if (!cJSON_HasObjectItem(tlsObj, "enabled")) cJSON_AddBoolToObject(tlsObj, "enabled", cJSON_True);
-            if (directSni && !cJSON_HasObjectItem(tlsObj, "server_name")) cJSON_AddStringToObject(tlsObj, "server_name", directSni);
-            else if (directHost && !cJSON_HasObjectItem(tlsObj, "server_name")) cJSON_AddStringToObject(tlsObj, "server_name", directHost);
-        }
-
-        BOOL isWs = (directMode && strcmp(directMode, "ws") == 0);
-        if (isWs) {
-             cJSON* trans = GetOrCreateObj(outbound, "transport");
-             if (!cJSON_HasObjectItem(trans, "type")) cJSON_AddStringToObject(trans, "type", "ws");
-             if (directPath && !cJSON_HasObjectItem(trans, "path")) cJSON_AddStringToObject(trans, "path", directPath);
-             if (directHost) {
-                 cJSON* headers = GetOrCreateObj(trans, "headers");
-                 if (!cJSON_HasObjectItem(headers, "Host")) cJSON_AddStringToObject(headers, "Host", directHost);
-             }
-        }
-
-        if(directSni) free(directSni); if(directHost) free(directHost); if(directPath) free(directPath);
-        if(directMode) free(directMode); if(directSecurity) free(directSecurity);
         free(queryStr);
     }
-    
     free(tag); return outbound;
 }
 
+// VMess 解析
 cJSON* ParseVmess(const char* link) {
     if (strncmp(link, "vmess://", 8) != 0) return NULL;
     size_t len; unsigned char* decoded = Base64Decode(link + 8, &len); if (!decoded) return NULL;
@@ -746,6 +641,7 @@ cJSON* ParseVmess(const char* link) {
     cJSON_Delete(vmessJson); return outbound;
 }
 
+// VLESS / Trojan 解析
 cJSON* ParseVlessOrTrojan(const char* link) {
     char protocol[16] = {0};
     if (strncmp(link, "vless://", 8) == 0) strcpy(protocol, "vless");
@@ -754,53 +650,32 @@ cJSON* ParseVlessOrTrojan(const char* link) {
     const char* p = link + strlen(protocol) + 3; const char* at = strchr(p, '@'); if (!at) return NULL;
     int uuidLen = (int)(at - p); char* uuid = (char*)malloc(uuidLen + 1); strncpy(uuid, p, uuidLen); uuid[uuidLen] = 0;
     p = at + 1; const char* colon = strchr(p, ':'); const char* qMark = strchr(p, '?'); const char* hash = strchr(p, '#');
-    const char* hostEnd = colon;
-    if (!hostEnd || (qMark && qMark < hostEnd)) hostEnd = qMark;
-    if (!hostEnd || (hash && hash < hostEnd)) hostEnd = hash;
-    if (!hostEnd) hostEnd = p + strlen(p);
-
-    const char* portStart = colon ? colon + 1 : NULL; 
+    const char* hostEnd = colon ? colon : (qMark ? qMark : (hash ? hash : p + strlen(p)));
+    if (qMark && qMark < hostEnd) hostEnd = qMark; if (hash && hash < hostEnd) hostEnd = hash;
     
+    int portNum = (colon && colon < hostEnd) ? atoi(colon+1) : 443;
     int hostLen = (int)(hostEnd - p); char* host = (char*)malloc(hostLen + 1); strncpy(host, p, hostLen); host[hostLen] = 0;
-    int portNum = portStart ? atoi(portStart) : 443;
-    
-    char* tag = hash ? (char*)malloc(strlen(hash+1)+1) : _strdup(protocol);
-    if(hash) UrlDecode(tag, hash+1);
+    char* tag = hash ? (char*)malloc(strlen(hash+1)+1) : _strdup(protocol); if(hash) UrlDecode(tag, hash+1);
     
     cJSON* outbound = cJSON_CreateObject();
     cJSON_AddStringToObject(outbound, "type", protocol); cJSON_AddStringToObject(outbound, "tag", tag);
     cJSON_AddStringToObject(outbound, "server", host); cJSON_AddNumberToObject(outbound, "server_port", portNum);
     if (strcmp(protocol, "vless") == 0) cJSON_AddStringToObject(outbound, "uuid", uuid);
     else cJSON_AddStringToObject(outbound, "password", uuid);
+
     const char* query = qMark ? qMark + 1 : NULL;
     char* type = GetQueryParam(query, "type");
     if (type && strcmp(type, "ws") == 0) {
         cJSON* t = cJSON_CreateObject(); cJSON_AddStringToObject(t, "type", "ws");
-        
-        char* path = GetQueryParam(query, "path");
-        if (path) { 
-            char* decodedPath = _strdup(path); 
-            if(decodedPath) {
-                UrlDecode(decodedPath, path);
-                cJSON_AddStringToObject(t, "path", decodedPath);
-                free(decodedPath);
-            }
-            free(path); 
-        }
-        
-        char* hHeader = GetQueryParam(query, "host");
-        if (hHeader) {
-            cJSON* headers = cJSON_CreateObject(); cJSON_AddStringToObject(headers, "Host", hHeader);
-            cJSON_AddItemToObject(t, "headers", headers); free(hHeader);
-        }
+        char* path = GetQueryParam(query, "path"); if (path) { char* d=_strdup(path); UrlDecode(d, path); cJSON_AddStringToObject(t, "path", d); free(d); free(path); }
+        char* hHeader = GetQueryParam(query, "host"); if (hHeader) { cJSON* h=cJSON_CreateObject(); cJSON_AddStringToObject(h, "Host", hHeader); cJSON_AddItemToObject(t, "headers", h); free(hHeader); }
         cJSON_AddItemToObject(outbound, "transport", t);
     }
     if (type) free(type);
     char* security = GetQueryParam(query, "security");
     if (security && strcmp(security, "tls") == 0) {
         cJSON* tlsObj = cJSON_CreateObject(); cJSON_AddBoolToObject(tlsObj, "enabled", cJSON_True);
-        char* sni = GetQueryParam(query, "sni");
-        if (sni) { cJSON_AddStringToObject(tlsObj, "server_name", sni); free(sni); }
+        char* sni = GetQueryParam(query, "sni"); if (sni) { cJSON_AddStringToObject(tlsObj, "server_name", sni); free(sni); }
         else cJSON_AddStringToObject(tlsObj, "server_name", host);
         cJSON_AddItemToObject(outbound, "tls", tlsObj);
     }
@@ -808,89 +683,40 @@ cJSON* ParseVlessOrTrojan(const char* link) {
     free(uuid); free(host); free(tag); return outbound;
 }
 
+// Mandala 协议解析
 cJSON* ParseMandala(const char* link) {
     if (strncmp(link, "mandala://", 10) != 0) return NULL;
+    const char* p = link + 10; const char* at = strchr(p, '@'); if (!at) return NULL;
+    int uuidLen = (int)(at - p); char* uuid = (char*)malloc(uuidLen + 1); strncpy(uuid, p, uuidLen); uuid[uuidLen] = 0;
+    p = at + 1; const char* colon = strchr(p, ':'); const char* qMark = strchr(p, '?'); const char* hash = strchr(p, '#');
+    const char* hostEnd = colon ? colon : (qMark ? qMark : (hash ? hash : p + strlen(p)));
+    if (qMark && qMark < hostEnd) hostEnd = qMark; if (hash && hash < hostEnd) hostEnd = hash;
     
-    const char* p = link + 10; 
-    const char* at = strchr(p, '@'); 
-    if (!at) return NULL;
-
-    int uuidLen = (int)(at - p); 
-    char* uuid = (char*)malloc(uuidLen + 1); 
-    strncpy(uuid, p, uuidLen); 
-    uuid[uuidLen] = 0;
-
-    p = at + 1; 
-    const char* colon = strchr(p, ':'); 
-    const char* qMark = strchr(p, '?'); 
-    const char* hash = strchr(p, '#');
+    int portNum = (colon && colon < hostEnd) ? atoi(colon+1) : 443;
+    int hostLen = (int)(hostEnd - p); char* host = (char*)malloc(hostLen + 1); strncpy(host, p, hostLen); host[hostLen] = 0;
+    char* tag = hash ? (char*)malloc(strlen(hash+1)+1) : _strdup("Mandala"); if(hash) UrlDecode(tag, hash+1);
     
-    const char* hostEnd = colon;
-    if (!hostEnd || (qMark && qMark < hostEnd)) hostEnd = qMark;
-    if (!hostEnd || (hash && hash < hostEnd)) hostEnd = hash;
-    if (!hostEnd) hostEnd = p + strlen(p);
-    
-    const char* portStart = colon ? colon + 1 : NULL; 
-    
-    int hostLen = (int)(hostEnd - p); 
-    char* host = (char*)malloc(hostLen + 1); 
-    strncpy(host, p, hostLen); 
-    host[hostLen] = 0;
-    
-    int portNum = portStart ? atoi(portStart) : 443;
-
-    char* tag = hash ? (char*)malloc(strlen(hash+1)+1) : _strdup("Mandala");
-    if(hash) UrlDecode(tag, hash+1);
-
     cJSON* outbound = cJSON_CreateObject();
-    cJSON_AddStringToObject(outbound, "type", "mandala"); 
-    cJSON_AddStringToObject(outbound, "tag", tag);
-    cJSON_AddStringToObject(outbound, "server", host); 
-    cJSON_AddNumberToObject(outbound, "server_port", portNum);
+    cJSON_AddStringToObject(outbound, "type", "mandala"); cJSON_AddStringToObject(outbound, "tag", tag);
+    cJSON_AddStringToObject(outbound, "server", host); cJSON_AddNumberToObject(outbound, "server_port", portNum);
     cJSON_AddStringToObject(outbound, "password", uuid); 
 
     const char* query = qMark ? qMark + 1 : NULL;
-    
     char* type = GetQueryParam(query, "type");
     if (type && strcmp(type, "ws") == 0) {
-        cJSON* t = cJSON_CreateObject(); 
-        cJSON_AddStringToObject(t, "type", "ws");
-        
-        char* path = GetQueryParam(query, "path");
-        if (path) { 
-            char* decodedPath = _strdup(path); 
-            if (decodedPath) {
-                UrlDecode(decodedPath, path);
-                cJSON_AddStringToObject(t, "path", decodedPath); 
-                free(decodedPath);
-            }
-            free(path); 
-        }
-        
-        char* hHeader = GetQueryParam(query, "host");
-        if (hHeader) {
-            cJSON* headers = cJSON_CreateObject(); 
-            cJSON_AddStringToObject(headers, "Host", hHeader);
-            cJSON_AddItemToObject(t, "headers", headers); 
-            free(hHeader);
-        }
+        cJSON* t = cJSON_CreateObject(); cJSON_AddStringToObject(t, "type", "ws");
+        char* path = GetQueryParam(query, "path"); if (path) { char* d=_strdup(path); UrlDecode(d, path); cJSON_AddStringToObject(t, "path", d); free(d); free(path); }
+        char* hHeader = GetQueryParam(query, "host"); if (hHeader) { cJSON* h=cJSON_CreateObject(); cJSON_AddStringToObject(h, "Host", hHeader); cJSON_AddItemToObject(t, "headers", h); free(hHeader); }
         cJSON_AddItemToObject(outbound, "transport", t);
     }
     if (type) free(type);
-
     char* security = GetQueryParam(query, "security");
     if (security && strcmp(security, "tls") == 0) {
-        cJSON* tlsObj = cJSON_CreateObject(); 
-        cJSON_AddBoolToObject(tlsObj, "enabled", cJSON_True);
-        
-        char* sni = GetQueryParam(query, "sni");
-        if (sni) { cJSON_AddStringToObject(tlsObj, "server_name", sni); free(sni); }
+        cJSON* tlsObj = cJSON_CreateObject(); cJSON_AddBoolToObject(tlsObj, "enabled", cJSON_True);
+        char* sni = GetQueryParam(query, "sni"); if (sni) { cJSON_AddStringToObject(tlsObj, "server_name", sni); free(sni); }
         else cJSON_AddStringToObject(tlsObj, "server_name", host);
-        
         cJSON_AddItemToObject(outbound, "tls", tlsObj);
     }
     if (security) free(security);
-
-    free(uuid); free(host); free(tag); 
-    return outbound;
+    free(uuid); free(host); free(tag); return outbound;
 }
