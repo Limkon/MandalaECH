@@ -41,7 +41,6 @@ BOOL IsWindows8OrGreater() {
 // 日志系统实现
 // --------------------------------------------------------------------------
 void log_msg(const char *format, ...) {
-    // 如果未开启日志且不是致命错误，则直接返回
     if (!g_enableLog && strstr(format, "[Fatal]") == NULL) {
         return;
     }
@@ -61,10 +60,8 @@ void log_msg(const char *format, ...) {
     char final_msg[2200]; 
     snprintf(final_msg, sizeof(final_msg), "%s%s\r\n", time_buf, buf);
     
-    // 输出到调试器
     OutputDebugStringA(final_msg);
     
-    // 发送消息给 GUI 日志窗口
     extern HWND hLogViewerWnd; 
     if (hLogViewerWnd && IsWindow(hLogViewerWnd)) {
         int wLen = MultiByteToWideChar(CP_UTF8, 0, final_msg, -1, NULL, 0);
@@ -122,7 +119,6 @@ void TrimString(char* str) {
     if (!str) return;
     
     char* p = str;
-    // 去除头部
     while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
         p++;
     }
@@ -131,7 +127,6 @@ void TrimString(char* str) {
         memmove(str, p, strlen(p) + 1);
     }
     
-    // 去除尾部
     char* pEnd = str + strlen(str) - 1;
     while (pEnd >= str && (*pEnd == ' ' || *pEnd == '\t' || *pEnd == '\r' || *pEnd == '\n')) {
         *pEnd-- = 0;
@@ -174,7 +169,6 @@ char* GetQueryParam(const char* query, const char* key) {
     const char* p = strstr(query, search);
     if (!p) return NULL;
     
-    // 确保匹配完整单词
     if (p != query && *(p-1) != '&' && *(p-1) != '?') {
         return NULL; 
     }
@@ -258,7 +252,7 @@ unsigned char* Base64Decode(const char* input, size_t* out_len) {
 }
 
 // --------------------------------------------------------------------------
-// ECH (Encrypted Client Hello) 解析实现 (最新修复版)
+// ECH (Encrypted Client Hello) 解析实现
 // --------------------------------------------------------------------------
 static int HexToBin(const char* hex, unsigned char* out, int max_len) {
     int len = 0;
@@ -303,7 +297,7 @@ unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t
     *out_len = 0;
 
     cJSON* answer = cJSON_GetObjectItem(root, "Answer");
-    // [修复] 增加 Answer 数组的健壮性检查，防止在 Win7 下空指针崩溃
+    // [修复] 加强 Answer 数组检查，防止在 Windows 7 下非法内存读取
     if (answer && cJSON_IsArray(answer)) {
         int array_size = cJSON_GetArraySize(answer);
         for (int i = 0; i < array_size; i++) {
@@ -317,7 +311,6 @@ unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t
                     const char* data_str = data->valuestring;
                     log_msg("[ECH] Found Type 65: %.64s...", data_str); 
 
-                    // 策略 1: 解析 Presentation Format (ech="...")
                     const char* ech_pos = strstr(data_str, "ech=\"");
                     if (ech_pos) {
                         ech_pos += 5; 
@@ -331,19 +324,18 @@ unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t
                                 ech_config = Base64Decode(b64_str, out_len);
                                 free(b64_str);
                                 if (ech_config) {
-                                    log_msg("[ECH] Success: Parsed ech=\"...\" (len=%d)", *out_len);
+                                    log_msg("[ECH] Success: Parsed ech=\"...\" (len=%d)", (int)*out_len);
                                     break; 
                                 }
                             }
                         }
                     }
 
-                    // 策略 2: 解析 Hex 格式
                     if (!ech_config) {
                         unsigned char rdata[4096];
                         int rdata_len = HexToBin(data_str, rdata, sizeof(rdata));
                         if (rdata_len > 5) { 
-                            int p = 2; // Priority
+                            int p = 2; 
                             while (p < rdata_len) {
                                 int label_len = rdata[p++];
                                 if (label_len == 0) break; 
@@ -372,8 +364,6 @@ unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t
             }
             if (ech_config) break; 
         }
-    } else {
-        log_msg("[ECH] No valid Answer section found.");
     }
 
     cJSON_Delete(root);
@@ -409,7 +399,7 @@ static BOOL ParseUrl(const char* url, URL_COMPONENTS_SIMPLE* out) {
     const char* slash = strchr(p, '/');
     int hostLen = slash ? (int)(slash - p) : (int)strlen(p);
     
-    if (hostLen >= sizeof(out->host)) return FALSE;
+    if (hostLen >= (int)sizeof(out->host)) return FALSE;
     strncpy(out->host, p, hostLen);
     out->host[hostLen] = 0;
     
@@ -480,7 +470,7 @@ static char* InternalHttpsGet(const char* url) {
         "Connection: close\r\n\r\n", 
         u.path, u.host);
         
-    if (SSL_write(ssl, req, strlen(req)) <= 0) goto cleanup;
+    if (SSL_write(ssl, req, (int)strlen(req)) <= 0) goto cleanup;
 
     int total_cap = 65536; 
     int total_len = 0;
@@ -498,12 +488,13 @@ static char* InternalHttpsGet(const char* url) {
         if (n <= 0) break;
         total_len += n;
     }
+
     if (buf) {
         buf[total_len] = 0;
         char* body = strstr(buf, "\r\n\r\n");
         if (body) { 
             body += 4; 
-            // [修复] 使用 _strdup 分配独立内存，防止直接 free(buf) 导致 body 悬空
+            // [修复] 使用 _strdup 分配独立内存，防止 Windows 7 下 body 指针悬挂
             result = _strdup(body); 
             free(buf); 
         } 
@@ -542,6 +533,7 @@ char* GetClipboardText() {
     }
     
     char* text = _strdup(pszText);
+    
     GlobalUnlock(hData);
     CloseClipboard();
     
@@ -566,11 +558,12 @@ void SetSystemProxy(BOOL enable) {
             log_msg("[Proxy] Failed to open registry key.");
             return;
         }
+
         if (enable) {
             DWORD dwEnable = 1;
             RegSetValueExW(hKey, L"ProxyEnable", 0, REG_DWORD, (const BYTE*)&dwEnable, sizeof(dwEnable));
-            RegSetValueExW(hKey, L"ProxyOverride", 0, REG_SZ, (const BYTE*)proxyBypassString, (wcslen(proxyBypassString) + 1) * sizeof(wchar_t));
-            RegSetValueExW(hKey, L"ProxyServer", 0, REG_SZ, (const BYTE*)proxyServerString, (wcslen(proxyServerString) + 1) * sizeof(wchar_t));
+            RegSetValueExW(hKey, L"ProxyOverride", 0, REG_SZ, (const BYTE*)proxyBypassString, (DWORD)(wcslen(proxyBypassString) + 1) * sizeof(wchar_t));
+            RegSetValueExW(hKey, L"ProxyServer", 0, REG_SZ, (const BYTE*)proxyServerString, (DWORD)(wcslen(proxyServerString) + 1) * sizeof(wchar_t));
             RegDeleteValueW(hKey, L"SocksProxyServer"); 
         } else {
             DWORD dwEnable = 0;
@@ -579,13 +572,16 @@ void SetSystemProxy(BOOL enable) {
             RegDeleteValueW(hKey, L"SocksProxyServer");
         }
         RegCloseKey(hKey);
-    } else {
+    } 
+    else {
         INTERNET_PER_CONN_OPTION_LISTW list;
         INTERNET_PER_CONN_OPTIONW options[3];
         DWORD dwBufSize = sizeof(list);
+        
         options[0].dwOption = INTERNET_PER_CONN_FLAGS;
         options[1].dwOption = INTERNET_PER_CONN_PROXY_SERVER;
         options[2].dwOption = INTERNET_PER_CONN_PROXY_BYPASS;
+        
         if (enable) {
             options[0].Value.dwValue = PROXY_TYPE_PROXY;
             options[1].Value.pszValue = proxyServerString;
@@ -595,6 +591,7 @@ void SetSystemProxy(BOOL enable) {
             options[1].Value.pszValue = L"";
             options[2].Value.pszValue = L"";
         }
+        
         list.dwSize = sizeof(list);
         list.pszConnection = NULL;
         list.dwOptionCount = 3;
