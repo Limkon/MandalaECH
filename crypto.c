@@ -13,7 +13,7 @@
 
 // 引用 globals.c 中的全局变量
 extern SSL_CTX *g_ssl_ctx;
-extern BOOL g_enableECH; // 引用全局开关
+extern BOOL g_enableECH; 
 
 static BIO_METHOD *method_frag = NULL;
 static INIT_ONCE g_crypto_init_once = INIT_ONCE_STATIC_INIT;
@@ -72,9 +72,9 @@ static char* inject_padding(const char* in, int in_len, int* out_len, int pad_mi
     if (!in || in_len < TLS_HEADER_LEN + HANDSHAKE_HEADER_LEN) return NULL;
     
     unsigned char* data = (unsigned char*)in;
-    if (data[0] != 0x16 || data[5] != 0x01) return NULL; // Must be Handshake(0x16) & ClientHello(0x01)
+    // 检查 Record Type(0x16 Handshake) 和 Handshake Type(0x01 ClientHello)
+    if (data[0] != 0x16 || data[5] != 0x01) return NULL; 
 
-    // 基础长度校验
     int offset = 43; 
     if (in_len < offset + 1) return NULL;
 
@@ -94,6 +94,7 @@ static char* inject_padding(const char* in, int in_len, int* out_len, int pad_mi
     int ext_total_len = (data[offset] << 8) | data[offset+1];
     offset += 2;
     
+    // 严格校验长度，防止解析错误导致的缓冲区溢出
     if (offset + ext_total_len != in_len - TLS_HEADER_LEN) return NULL;
 
     int range = pad_max - pad_min;
@@ -116,6 +117,7 @@ static char* inject_padding(const char* in, int in_len, int* out_len, int pad_mi
     *p++ = (pad_data_len >> 8) & 0xFF; *p++ = pad_data_len & 0xFF;
     memset(p, 0, pad_data_len);
 
+    // 回填长度字段
     unsigned char* ptr = (unsigned char*)new_buf;
     int old_rec_len = (ptr[3] << 8) | ptr[4];
     int new_rec_len = old_rec_len + pad_ext_len;
@@ -291,54 +293,43 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
 
     ctx->ssl = SSL_new(g_ssl_ctx);
     if (!ctx->ssl) return -1;
-    SSL_set_fd(ctx->ssl, (int)ctx->sock);
     
-    // [Safety Fix] 临时禁用 ECH 以排除网络请求崩溃的可能性
-    // ECH 逻辑可能会因为网络阻塞或内存问题导致 Crash
+    // [Fix] 手动创建 BIO_new_socket 并设置为 BIO_NOCLOSE (Socket 由外部 closesocket 管理)
+    // 这避免了 SSL_set_fd 自动创建 BIO 带来的所有权混乱问题
+    BIO *sbio = BIO_new_socket((int)ctx->sock, BIO_NOCLOSE);
+    if (!sbio) { SSL_free(ctx->ssl); ctx->ssl = NULL; return -1; }
+
+    // [Safety Fix] 临时禁用 ECH 功能，排除网络 fetch 导致的崩溃
+    // ECH 逻辑稍后稳定后再开启
     /*
     if (settings && settings->enableECH && g_enableECH) {
-        const char* query_domain = (g_echPublicName && strlen(g_echPublicName)) ? g_echPublicName : (target_sni ? target_sni : target_host);
-        size_t ech_len = 0;
-        // 注意：FetchECHConfig 需要 utils.c 实现，如果未链接会报错
-        unsigned char* ech_config = FetchECHConfig(query_domain, g_echConfigServer, &ech_len);
-        if (ech_config && ech_len > 0) {
-            SSL_set1_ech_config_list(ctx->ssl, ech_config, ech_len);
-            free(ech_config);
-        }
+        // ... (ECH Logic) ...
     }
     */
 
-    // [Critical Fix] 修复 BIO Double Free 问题
     if (method_frag) {
         BIO *frag = BIO_new(method_frag);
-        if (frag) {
-            BIO_set_params(frag, settings);
-            
-            // 1. 获取 Socket Write BIO
-            BIO *wbio = SSL_get_wbio(ctx->ssl);
-            if (wbio) {
-                // 增加引用计数，因为 BIO_push 会让 frag->next 指向 wbio
-                // 我们希望 frag 拥有 wbio 的一个引用
-                BIO_up_ref(wbio);
-                BIO_push(frag, wbio);
-            }
-            
-            // 2. 获取 Socket Read BIO (通常和 Write BIO 是同一个)
-            BIO *rbio = SSL_get_rbio(ctx->ssl);
-            if (rbio) {
-                // 增加引用计数，因为 SSL_set_bio 会消耗一个引用
-                BIO_up_ref(rbio);
-            }
-            
-            // 3. 设置 SSL BIO：读使用 Socket BIO，写使用 Filter BIO (frag)
-            // SSL_set_bio 内部会处理旧 BIO 的释放。
-            // 由于我们正确增加了引用，旧的 Socket BIO 不会被意外销毁。
-            SSL_set_bio(ctx->ssl, rbio, frag);
-        }
+        if (!frag) { BIO_free(sbio); SSL_free(ctx->ssl); ctx->ssl = NULL; return -1; }
+        
+        BIO_set_params(frag, settings);
+        
+        // 链式结构: frag -> sbio
+        BIO_push(frag, sbio);
+        
+        // [Critical Fix] 增加 sbio 引用计数
+        // SSL 需要拥有 Read BIO (sbio) 的所有权 -> Free 时 Ref 2->1
+        // SSL 需要拥有 Write BIO (frag) 的所有权 -> frag Free 时 Free next(sbio) -> Ref 1->0
+        // 如果不增加引用，sbio 会被释放两次 (Double Free)，导致 Windows 7 立即崩溃
+        BIO_up_ref(sbio);
+        
+        SSL_set_bio(ctx->ssl, sbio, frag);
+    } else {
+        // 无分片直接连接
+        SSL_set_bio(ctx->ssl, sbio, sbio);
     }
     
     const char *sni_name = (target_sni && strlen(target_sni)) ? target_sni : target_host;
-    SSL_set_tlsext_host_name(ctx->ssl, sni_name);
+    if(sni_name) SSL_set_tlsext_host_name(ctx->ssl, sni_name);
     
     unsigned char alpn_protos[] = { 8, 'h', 't', 't', 'p', '/', '1', '.', '1' };
     SSL_set_alpn_protos(ctx->ssl, alpn_protos, sizeof(alpn_protos));
@@ -439,7 +430,6 @@ long long check_ws_frame(unsigned char *in, int len, int *head_len, int *payload
         for(int i = 0; i < 8; i++) pl = (pl << 8) | in[2 + i];
     }
     if (in[1] & 0x80) hl += 4; 
-    // MAX_WS_FRAME_SIZE 需在 common.h 定义 (如 8MB)
     if (pl > 8388608) return -1; 
     if ((unsigned long long)len < (unsigned long long)hl + pl) return 0; 
     *head_len = hl; *payload_len = (int)pl; 
