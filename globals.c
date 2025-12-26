@@ -13,7 +13,10 @@ NOTIFYICONDATAW nid = {0};
 HWND hwnd = NULL;
 HMENU hMenu = NULL;
 HMENU hNodeSubMenu = NULL;
-HWND hLogViewerWnd = NULL;
+
+// [Fix] 此处定义日志窗口句柄，gui.c 中仅作 extern 声明，解决 multiple definition 错误
+HWND hLogViewerWnd = NULL; 
+
 HFONT hLogFont = NULL;
 HFONT hAppFont = NULL;
 
@@ -56,6 +59,9 @@ char g_echPublicName[256] = "";
 
 // --- 日志 ---
 BOOL g_enableLog = FALSE;
+
+// --- SSL 上下文 (解决 crypto.c 中的 undefined reference 错误) ---
+SSL_CTX *g_ssl_ctx = NULL;
 
 // --- 线程同步 ---
 CRITICAL_SECTION g_configLock;
