@@ -18,7 +18,6 @@ static HWND hSubWnd = NULL;
 static HWND hNodeMgrWnd = NULL;
 
 // --- 控件 ID 定义 ---
-// [Fix] 移除了与 resource.h 冲突的 ID 定义 (ID_EDIT_TAG 等)
 // 仅保留 resource.h 中没有的订阅窗口专用 ID
 #define ID_SUB_LIST     3000
 #define ID_SUB_ADD_BTN  3001
@@ -751,14 +750,22 @@ LRESULT CALLBACK NodeMgrWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             } else if (LOWORD(wParam) == ID_NODEMGR_DEL) {
                 int count = SendMessage(hList, LB_GETSELCOUNT, 0, 0);
                 if (count > 0) {
-                     int idx = SendMessage(hList, LB_GETCURSEL, 0, 0);
-                     if (idx != LB_ERR) {
-                         int len = SendMessage(hList, LB_GETTEXTLEN, idx, 0);
-                         wchar_t* tag = (wchar_t*)malloc((len+1)*sizeof(wchar_t));
-                         SendMessageW(hList, LB_GETTEXT, idx, (LPARAM)tag);
-                         DeleteNode(tag); free(tag);
-                         SendMessage(hWnd, WM_REFRESH_NODELIST, 0, 0);
+                     int* selIndices = (int*)malloc(sizeof(int) * count);
+                     if (SendMessage(hList, LB_GETSELITEMS, (WPARAM)count, (LPARAM)selIndices) != LB_ERR) {
+                        // 倒序删除，避免索引偏移
+                        for (int i = count - 1; i >= 0; i--) {
+                             int idx = selIndices[i];
+                             int len = SendMessage(hList, LB_GETTEXTLEN, idx, 0);
+                             if (len > 0) {
+                                 wchar_t* tag = (wchar_t*)malloc((len+1)*sizeof(wchar_t));
+                                 SendMessageW(hList, LB_GETTEXT, idx, (LPARAM)tag);
+                                 DeleteNode(tag); 
+                                 free(tag);
+                             }
+                        }
                      }
+                     free(selIndices);
+                     SendMessage(hWnd, WM_REFRESH_NODELIST, 0, 0);
                 }
             }
             break;
@@ -775,7 +782,8 @@ void OpenNodeManager() {
         wc.lpfnWndProc = NodeMgrWndProc; wc.hInstance = GetModuleHandle(NULL); wc.lpszClassName = L"NodeMgr"; wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE+1);
         RegisterClassW(&wc);
     }
-    hNodeMgrWnd = CreateWindowW(L"NodeMgr", L"节点管理", WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU, CW_USEDEFAULT, 0, 450, 270, NULL, NULL, GetModuleHandle(NULL), NULL);
+    // [Fix] 宽度从 450 调整为 445，匹配 ListBox(410) + 左边距(10) + 右边距(25) 的视觉平衡
+    hNodeMgrWnd = CreateWindowW(L"NodeMgr", L"节点管理", WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU, CW_USEDEFAULT, 0, 445, 270, NULL, NULL, GetModuleHandle(NULL), NULL);
     ShowWindow(hNodeMgrWnd, SW_SHOW);
 }
 
@@ -787,6 +795,8 @@ LRESULT CALLBACK LogWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SendMessage(GetDlgItem(hWnd, ID_LOG_CHK), BM_SETCHECK, g_enableLog ? BST_CHECKED : BST_UNCHECKED, 0);
             hEdit = CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_VSCROLL|ES_MULTILINE|ES_READONLY, 0, 30, 0, 0, hWnd, (HMENU)ID_LOGVIEWER_EDIT, NULL, NULL);
             SendMessage(hEdit, WM_SETFONT, (WPARAM)hLogFont, 0); 
+            // [Fix] 应用全局字体到 Checkbox
+            EnumChildWindows(hWnd, EnumSetFont, (LPARAM)hAppFont);
             break;
         case WM_SIZE: MoveWindow(hEdit, 0, 30, LOWORD(lParam), HIWORD(lParam) - 30, TRUE); break;
         case WM_COMMAND: if (LOWORD(wParam) == ID_LOG_CHK) g_enableLog = (IsDlgButtonChecked(hWnd, ID_LOG_CHK) == BST_CHECKED); break;
@@ -931,5 +941,3 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nSho
     DeleteGlobalLocks();
     return 0;
 }
-
-
