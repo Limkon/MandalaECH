@@ -18,18 +18,17 @@
 #include "gui.h" 
 #include "cJSON.h" 
 
-// 链接必要的系统库
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "wininet.lib")
 
 // 全局 SSL_CTX 复用
 static SSL_CTX* g_utils_ctx = NULL;
-// 用于原子初始化的状态变量 (0: 未初始化, 1: 正在初始化, 2: 已完成)
-static volatile LONG g_ctx_init_state = 0;
+// 用于线程安全初始化的原子变量
+static volatile LONG g_ctx_init_flag = 0;
 
 // --------------------------------------------------------------------------
-// 基础工具函数：系统版本判断
+// 基础工具函数
 // --------------------------------------------------------------------------
 BOOL IsWindows8OrGreater() {
     HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
@@ -38,9 +37,9 @@ BOOL IsWindows8OrGreater() {
     return (pFunc != NULL);
 }
 
-// 安全的字符串克隆（解决部分 Win7 环境下 _strdup 的兼容性问题）
+// 安全字符串克隆，确保 Windows 7 上的健壮性
 static char* SafeStrDup(const char* s, int len) {
-    if (!s || len <= 0) return NULL;
+    if (!s || len < 0) return NULL;
     char* d = (char*)malloc(len + 1);
     if (d) {
         memcpy(d, s, len);
@@ -49,9 +48,6 @@ static char* SafeStrDup(const char* s, int len) {
     return d;
 }
 
-// --------------------------------------------------------------------------
-// 日志系统实现
-// --------------------------------------------------------------------------
 void log_msg(const char *format, ...) {
     if (!g_enableLog && strstr(format, "[Fatal]") == NULL) return;
 
@@ -166,7 +162,7 @@ char* GetQueryParam(const char* query, const char* key) {
 }
 
 // --------------------------------------------------------------------------
-// Base64 & Hex 处理
+// Base64 处理
 // --------------------------------------------------------------------------
 static const int b64_table[] = {
     -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
@@ -221,16 +217,14 @@ static int HexToBin(const char* hex, unsigned char* out, int max_len) {
 }
 
 // --------------------------------------------------------------------------
-// ECH (Encrypted Client Hello) 解析
+// ECH (Encrypted Client Hello) 解析实现
 // --------------------------------------------------------------------------
 unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t* out_len) {
     if (!domain || !doh_server) return NULL;
-    char url[2048];
-    snprintf(url, sizeof(url), "%s?name=%s&type=65", doh_server, domain);
+    char url[1024]; snprintf(url, sizeof(url), "%s?name=%s&type=65", doh_server, domain);
 
     char* json_str = Utils_HttpGet(url);
     if (!json_str) return NULL;
-
     cJSON* root = cJSON_Parse(json_str);
     free(json_str);
     if (!root) return NULL;
@@ -265,7 +259,7 @@ unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t
                         int rdata_len = HexToBin(data_str, rdata, sizeof(rdata));
                         if (rdata_len > 5) { 
                             int p = 2; // Priority
-                            while (p < rdata_len) { // TargetName
+                            while (p < rdata_len) { // Skip TargetName
                                 int label_len = rdata[p++];
                                 if (label_len == 0 || p + label_len > rdata_len) break; 
                                 p += label_len;
@@ -288,8 +282,7 @@ unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t
             if (ech_config) break; 
         }
     }
-    cJSON_Delete(root);
-    return ech_config;
+    cJSON_Delete(root); return ech_config;
 }
 
 // --------------------------------------------------------------------------
@@ -318,14 +311,14 @@ static char* InternalHttpsGet(const char* url) {
     URL_COMPONENTS_SIMPLE u;
     if (!ParseUrl(url, &u)) return NULL;
 
-    // [修复] 原子操作安全初始化上下文，彻底解决 Win7 多线程竞争崩溃
+    // [修复] 使用 Interlocked 原子操作进行线程安全初始化，彻底解决 Win7 的内存竞争
     if (g_utils_ctx == NULL) {
-        if (InterlockedCompareExchange(&g_ctx_init_state, 1, 0) == 0) {
+        if (InterlockedCompareExchange(&g_ctx_init_flag, 1, 0) == 0) {
             g_utils_ctx = SSL_CTX_new(TLS_client_method());
             if (g_utils_ctx) SSL_CTX_set_verify(g_utils_ctx, SSL_VERIFY_NONE, NULL);
-            InterlockedExchange(&g_ctx_init_state, 2);
+            InterlockedExchange(&g_ctx_init_flag, 2);
         } else {
-            while (g_ctx_init_state != 2) Sleep(10);
+            while (g_ctx_init_flag != 2) Sleep(10);
         }
     }
     if (!g_utils_ctx) return NULL;
@@ -350,14 +343,15 @@ static char* InternalHttpsGet(const char* url) {
     SSL_set_fd(ssl, (int)s); SSL_set_tlsext_host_name(ssl, u.host);
     if (SSL_connect(ssl) != 1) { SSL_free(ssl); closesocket(s); return NULL; }
 
-    // [修复] 动态判定 Accept 头部，下载订阅时不强制要求 dns-json
+    // [修复] 仅对 DoH 请求发送特定的 Accept 头部，防止订阅服务器返回 406 错误导致崩溃
     const char* accept_header = (strstr(u.path, "dns-query") || strstr(u.path, "name=")) ? 
                                  "Accept: application/dns-json\r\n" : "Accept: */*\r\n";
 
-    // [关键修复] 使用堆分配请求缓冲区，彻底解决 0x40000015 栈溢出错误
+    // [关键修复] 将缓冲区改为堆分配 (malloc)，彻底解决 0x40000015 栈溢出崩溃
     char* req = (char*)malloc(8192);
     if (!req) goto cleanup;
     
+    // 强制 Null 终止，解决 Win7 下 _snprintf 不自动添加终止符的问题
     int req_len = snprintf(req, 8192, 
         "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mandala-Client/1.0\r\n%sConnection: close\r\n\r\n", 
         u.path, u.host, accept_header);
@@ -367,14 +361,13 @@ static char* InternalHttpsGet(const char* url) {
     }
     free(req);
 
-    int total_cap = 65536; int total_len = 0;
+    int total_cap = 131072; int total_len = 0;
     char* buf = (char*)malloc(total_cap);
     if (!buf) goto cleanup;
 
     while (1) {
         if (total_len >= total_cap - 2048) {
-            total_cap *= 2; 
-            char* new_buf = (char*)realloc(buf, total_cap);
+            total_cap *= 2; char* new_buf = (char*)realloc(buf, total_cap);
             if (!new_buf) { free(buf); buf = NULL; goto cleanup; }
             buf = new_buf;
         }
@@ -384,8 +377,7 @@ static char* InternalHttpsGet(const char* url) {
     }
 
     if (buf) {
-        buf[total_len] = 0; 
-        char* body_pos = strstr(buf, "\r\n\r\n");
+        buf[total_len] = 0; char* body_pos = strstr(buf, "\r\n\r\n");
         if (body_pos) { 
             body_pos += 4;
             int body_len = total_len - (int)(body_pos - buf);
