@@ -349,7 +349,10 @@ unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t
 // --- 8. 日志记录 (The Fix) ---
 
 void log_msg(const char* fmt, ...) {
-    if (!g_enableLog && !hLogViewerWnd) return;
+    // 逻辑修复：只有当 g_enableLog 为 TRUE 时，且窗口句柄有效，才进行后续处理
+    if (!g_enableLog || !hLogViewerWnd || !IsWindow(hLogViewerWnd)) {
+        return;
+    }
 
     char buf[1024];
     va_list args;
@@ -360,14 +363,15 @@ void log_msg(const char* fmt, ...) {
     time_t now = time(NULL);
     struct tm* t = localtime(&now);
     wchar_t wMsg[2048];
-    // 使用 %S 处理 char* 字符串
+    // 将 char* 转换为 wchar_t 并添加时间戳
     swprintf_s(wMsg, 2048, L"[%02d:%02d:%02d] %S\r\n", t->tm_hour, t->tm_min, t->tm_sec, buf);
 
     // 发送消息到 GUI 日志窗口
-    if (hLogViewerWnd && IsWindow(hLogViewerWnd)) {
-        wchar_t* msgCopy = _wcsdup(wMsg);
+    wchar_t* msgCopy = _wcsdup(wMsg);
+    if (msgCopy) {
         PostMessageW(hLogViewerWnd, WM_LOG_UPDATE, 0, (LPARAM)msgCopy);
     }
+}
     
     // 如果需要调试控制台输出，可解开下行注释
     // printf("%s\n", buf);
@@ -407,3 +411,4 @@ void SetSystemProxy(BOOL enable) {
         InternetSetOption(NULL, INTERNET_OPTION_REFRESH, NULL, 0);
     }
 }
+
