@@ -534,7 +534,15 @@ cJSON* ParseSocks(const char* link) {
     char* tag = hash ? (char*)malloc(strlen(hash+1)+1) : _strdup("Socks-Import"); if(hash) UrlDecode(tag, hash+1);
     const char* query = qMark ? qMark + 1 : NULL;
     char* sni = GetQueryParam(query, "sni"); if (!sni) sni = GetQueryParam(query, "peer");
-    char* path = GetQueryParam(query, "path"); if (path) { char* d = _strdup(path); UrlDecode(d, path); free(path); path=d; }
+    
+    // 修复 path 截断逻辑
+    char* path = GetQueryParam(query, "path"); 
+    if (path) { 
+        char* hash_in_path = strchr(path, '#');
+        if (hash_in_path) *hash_in_path = '\0';
+        char* d = (char*)malloc(strlen(path) + 1); UrlDecode(d, path); free(path); path=d; 
+    }
+    
     char* type = GetQueryParam(query, "type"); if (!type) type = GetQueryParam(query, "transport");
     char* security = GetQueryParam(query, "security"); char* hostHeader = GetQueryParam(query, "host");
     
@@ -601,7 +609,12 @@ cJSON* ParseShadowsocks(const char* link) {
     if (qMark) {
         char* queryStr = _strdup(qMark+1); if(hash) queryStr[hash-(qMark+1)] = 0;
         char* pluginVal = GetQueryParam(queryStr, "plugin");
-        if (pluginVal) { UrlDecode(pluginVal, pluginVal); ParseSSPlugin(outbound, pluginVal); free(pluginVal); }
+        if (pluginVal) { 
+            UrlDecode(pluginVal, pluginVal); 
+            char* hash_in_plugin = strchr(pluginVal, '#');
+            if (hash_in_plugin) *hash_in_plugin = '\0';
+            ParseSSPlugin(outbound, pluginVal); free(pluginVal); 
+        }
         free(queryStr);
     }
     free(tag); return outbound;
@@ -619,13 +632,22 @@ cJSON* ParseVmess(const char* link) {
     cJSON* net = cJSON_GetObjectItem(vmessJson, "net"); cJSON* host = cJSON_GetObjectItem(vmessJson, "host");
     cJSON* path = cJSON_GetObjectItem(vmessJson, "path"); cJSON* tls = cJSON_GetObjectItem(vmessJson, "tls");
     cJSON* sni = cJSON_GetObjectItem(vmessJson, "sni");
+    
     cJSON_AddStringToObject(outbound, "tag", cJSON_IsString(ps) ? ps->valuestring : "VMess");
     cJSON_AddStringToObject(outbound, "server", cJSON_IsString(add) ? add->valuestring : "");
     cJSON_AddNumberToObject(outbound, "server_port", cJSON_IsNumber(port)?port->valueint:atoi(port->valuestring));
     cJSON_AddStringToObject(outbound, "uuid", cJSON_IsString(id) ? id->valuestring : "");
+    
     if (cJSON_IsString(net) && strcmp(net->valuestring, "ws") == 0) {
         cJSON* t = cJSON_CreateObject(); cJSON_AddStringToObject(t, "type", "ws");
-        if(cJSON_IsString(path)) cJSON_AddStringToObject(t, "path", path->valuestring);
+        if(cJSON_IsString(path)) {
+            // VMess 内部 JSON 的 path 可能也带 #，虽然少见，一并处理
+            char* p_val = _strdup(path->valuestring);
+            char* hash_pos = strchr(p_val, '#');
+            if (hash_pos) *hash_pos = '\0';
+            cJSON_AddStringToObject(t, "path", p_val);
+            free(p_val);
+        }
         if(cJSON_IsString(host) && strlen(host->valuestring)>0) {
             cJSON* h = cJSON_CreateObject(); cJSON_AddStringToObject(h, "Host", host->valuestring);
             cJSON_AddItemToObject(t, "headers", h);
@@ -641,12 +663,13 @@ cJSON* ParseVmess(const char* link) {
     cJSON_Delete(vmessJson); return outbound;
 }
 
-// VLESS / Trojan 解析
+// VLESS / Trojan 解析 (核心修复点)
 cJSON* ParseVlessOrTrojan(const char* link) {
     char protocol[16] = {0};
     if (strncmp(link, "vless://", 8) == 0) strcpy(protocol, "vless");
     else if (strncmp(link, "trojan://", 9) == 0) strcpy(protocol, "trojan");
     else return NULL;
+    
     const char* p = link + strlen(protocol) + 3; const char* at = strchr(p, '@'); if (!at) return NULL;
     int uuidLen = (int)(at - p); char* uuid = (char*)malloc(uuidLen + 1); strncpy(uuid, p, uuidLen); uuid[uuidLen] = 0;
     p = at + 1; const char* colon = strchr(p, ':'); const char* qMark = strchr(p, '?'); const char* hash = strchr(p, '#');
@@ -655,7 +678,15 @@ cJSON* ParseVlessOrTrojan(const char* link) {
     
     int portNum = (colon && colon < hostEnd) ? atoi(colon+1) : 443;
     int hostLen = (int)(hostEnd - p); char* host = (char*)malloc(hostLen + 1); strncpy(host, p, hostLen); host[hostLen] = 0;
-    char* tag = hash ? (char*)malloc(strlen(hash+1)+1) : _strdup(protocol); if(hash) UrlDecode(tag, hash+1);
+    
+    // Tag 解析：UTF-8 解码
+    char* tag = NULL;
+    if (hash) {
+        tag = (char*)malloc(strlen(hash + 1) + 1);
+        UrlDecode(tag, hash + 1); 
+    } else {
+        tag = _strdup(protocol);
+    }
     
     cJSON* outbound = cJSON_CreateObject();
     cJSON_AddStringToObject(outbound, "type", protocol); cJSON_AddStringToObject(outbound, "tag", tag);
@@ -667,19 +698,42 @@ cJSON* ParseVlessOrTrojan(const char* link) {
     char* type = GetQueryParam(query, "type");
     if (type && strcmp(type, "ws") == 0) {
         cJSON* t = cJSON_CreateObject(); cJSON_AddStringToObject(t, "type", "ws");
-        char* path = GetQueryParam(query, "path"); if (path) { char* d=_strdup(path); UrlDecode(d, path); cJSON_AddStringToObject(t, "path", d); free(d); free(path); }
-        char* hHeader = GetQueryParam(query, "host"); if (hHeader) { cJSON* h=cJSON_CreateObject(); cJSON_AddStringToObject(h, "Host", hHeader); cJSON_AddItemToObject(t, "headers", h); free(hHeader); }
+        char* path = GetQueryParam(query, "path"); 
+        if (path) { 
+            // 修复：截断在 # 之前
+            char* hash_in_path = strchr(path, '#');
+            if (hash_in_path) *hash_in_path = '\0';
+            
+            char* d = (char*)malloc(strlen(path) + 1); 
+            UrlDecode(d, path); // 支持中文路径
+            cJSON_AddStringToObject(t, "path", d); 
+            free(d); free(path); 
+        }
+        char* hHeader = GetQueryParam(query, "host"); 
+        if (hHeader) { 
+            char* hash_in_host = strchr(hHeader, '#');
+            if (hash_in_host) *hash_in_host = '\0';
+            cJSON* h=cJSON_CreateObject(); cJSON_AddStringToObject(h, "Host", hHeader); 
+            cJSON_AddItemToObject(t, "headers", h); free(hHeader); 
+        }
         cJSON_AddItemToObject(outbound, "transport", t);
     }
     if (type) free(type);
+    
     char* security = GetQueryParam(query, "security");
     if (security && strcmp(security, "tls") == 0) {
         cJSON* tlsObj = cJSON_CreateObject(); cJSON_AddBoolToObject(tlsObj, "enabled", cJSON_True);
-        char* sni = GetQueryParam(query, "sni"); if (sni) { cJSON_AddStringToObject(tlsObj, "server_name", sni); free(sni); }
+        char* sni = GetQueryParam(query, "sni"); 
+        if (sni) { 
+            char* hash_in_sni = strchr(sni, '#');
+            if (hash_in_sni) *hash_in_sni = '\0';
+            cJSON_AddStringToObject(tlsObj, "server_name", sni); free(sni); 
+        }
         else cJSON_AddStringToObject(tlsObj, "server_name", host);
         cJSON_AddItemToObject(outbound, "tls", tlsObj);
     }
     if (security) free(security);
+    
     free(uuid); free(host); free(tag); return outbound;
 }
 
@@ -694,7 +748,14 @@ cJSON* ParseMandala(const char* link) {
     
     int portNum = (colon && colon < hostEnd) ? atoi(colon+1) : 443;
     int hostLen = (int)(hostEnd - p); char* host = (char*)malloc(hostLen + 1); strncpy(host, p, hostLen); host[hostLen] = 0;
-    char* tag = hash ? (char*)malloc(strlen(hash+1)+1) : _strdup("Mandala"); if(hash) UrlDecode(tag, hash+1);
+    
+    char* tag = NULL;
+    if (hash) {
+        tag = (char*)malloc(strlen(hash + 1) + 1);
+        UrlDecode(tag, hash + 1);
+    } else {
+        tag = _strdup("Mandala");
+    }
     
     cJSON* outbound = cJSON_CreateObject();
     cJSON_AddStringToObject(outbound, "type", "mandala"); cJSON_AddStringToObject(outbound, "tag", tag);
@@ -705,11 +766,25 @@ cJSON* ParseMandala(const char* link) {
     char* type = GetQueryParam(query, "type");
     if (type && strcmp(type, "ws") == 0) {
         cJSON* t = cJSON_CreateObject(); cJSON_AddStringToObject(t, "type", "ws");
-        char* path = GetQueryParam(query, "path"); if (path) { char* d=_strdup(path); UrlDecode(d, path); cJSON_AddStringToObject(t, "path", d); free(d); free(path); }
-        char* hHeader = GetQueryParam(query, "host"); if (hHeader) { cJSON* h=cJSON_CreateObject(); cJSON_AddStringToObject(h, "Host", hHeader); cJSON_AddItemToObject(t, "headers", h); free(hHeader); }
+        char* path = GetQueryParam(query, "path"); 
+        if (path) { 
+            char* hash_in_path = strchr(path, '#');
+            if (hash_in_path) *hash_in_path = '\0';
+            char* d = (char*)malloc(strlen(path) + 1); UrlDecode(d, path); 
+            cJSON_AddStringToObject(t, "path", d); 
+            free(d); free(path); 
+        }
+        char* hHeader = GetQueryParam(query, "host"); 
+        if (hHeader) { 
+            char* hash_in_host = strchr(hHeader, '#');
+            if (hash_in_host) *hash_in_host = '\0';
+            cJSON* h=cJSON_CreateObject(); cJSON_AddStringToObject(h, "Host", hHeader); 
+            cJSON_AddItemToObject(t, "headers", h); free(hHeader); 
+        }
         cJSON_AddItemToObject(outbound, "transport", t);
     }
     if (type) free(type);
+    
     char* security = GetQueryParam(query, "security");
     if (security && strcmp(security, "tls") == 0) {
         cJSON* tlsObj = cJSON_CreateObject(); cJSON_AddBoolToObject(tlsObj, "enabled", cJSON_True);
@@ -718,5 +793,6 @@ cJSON* ParseMandala(const char* link) {
         cJSON_AddItemToObject(outbound, "tls", tlsObj);
     }
     if (security) free(security);
+    
     free(uuid); free(host); free(tag); return outbound;
 }
