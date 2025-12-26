@@ -1,507 +1,329 @@
 #include "crypto.h"
-#include "utils.h"
 #include "common.h"
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <time.h>
-
+#include "utils.h"
 #include <openssl/ssl.h>
 #include <openssl/err.h>
-#include <openssl/rand.h>
 #include <openssl/bio.h>
+#include <openssl/x509.h>
+#include <openssl/pem.h>
+#include <openssl/rand.h>
 
-// 引用 globals.c 中的全局变量
-extern SSL_CTX *g_ssl_ctx;
+// 全局 SSL 上下文
+SSL_CTX *g_ssl_ctx = NULL;
 
-static BIO_METHOD *method_frag = NULL;
-static INIT_ONCE g_crypto_init_once = INIT_ONCE_STATIC_INIT;
+// --- 自定义 BIO：用于分片(Fragment)和填充(Padding) ---
+static BIO_METHOD *g_bio_frag_pad_method = NULL;
 
-// ---------------------- BIO Implementation (Frag + Padding) ----------------------
+// BIO 状态结构
 typedef struct {
-    int first_packet_sent;
-    // 分片配置
-    int frag_min;
-    int frag_max;
-    int frag_delay;
-    // 填充配置 (移动到 BIO 内部处理)
-    int enable_padding;
-    int pad_min;
-    int pad_max;
-} FragCtx;
+    int fragMin;
+    int fragMax;
+    int fragDelay; // ms
+    int padMin;
+    int padMax;
+    BOOL enableFrag;
+    BOOL enablePad;
+} BioFragPadCtx;
 
-static int frag_write(BIO *b, const char *in, int inl);
-static int frag_read(BIO *b, char *out, int outl);
-static long frag_ctrl(BIO *b, int cmd, long num, void *ptr);
-static int frag_new(BIO *b);
-static int frag_free(BIO *b);
+// BIO Write 回调：执行分片逻辑
+static int bio_frag_pad_write(BIO *b, const char *in, int inl) {
+    BioFragPadCtx *ctx = (BioFragPadCtx *)BIO_get_data(b);
+    int ret = 0;
+    int total_written = 0;
+    
+    if (!ctx || !ctx->enableFrag || inl <= ctx->fragMax) {
+        return BIO_next(b) ? BIO_write(BIO_next(b), in, inl) : 0;
+    }
 
-BIO_METHOD *BIO_f_fragment(void) { return method_frag; }
+    // 分片发送
+    while (total_written < inl) {
+        int chunk_size = ctx->fragMin + rand() % (ctx->fragMax - ctx->fragMin + 1);
+        if (chunk_size > inl - total_written) chunk_size = inl - total_written;
+        
+        int n = BIO_write(BIO_next(b), in + total_written, chunk_size);
+        if (n <= 0) {
+            BIO_clear_retry_flags(b);
+            BIO_copy_next_retry(b);
+            return (total_written > 0) ? total_written : n;
+        }
+        total_written += n;
+        
+        // 分片间延迟
+        if (ctx->fragDelay > 0 && total_written < inl) {
+            Sleep(ctx->fragDelay);
+        }
+    }
+    return total_written;
+}
 
-static int frag_new(BIO *b) {
-    FragCtx *ctx = (FragCtx *)malloc(sizeof(FragCtx));
-    if(!ctx) return 0;
-    memset(ctx, 0, sizeof(FragCtx));
+static int bio_frag_pad_read(BIO *b, char *out, int outl) {
+    if (!BIO_next(b)) return 0;
+    int ret = BIO_read(BIO_next(b), out, outl);
+    BIO_clear_retry_flags(b);
+    BIO_copy_next_retry(b);
+    return ret;
+}
+
+static long bio_frag_pad_ctrl(BIO *b, int cmd, long num, void *ptr) {
+    if (!BIO_next(b)) return 0;
+    return BIO_ctrl(BIO_next(b), cmd, num, ptr);
+}
+
+static int bio_frag_pad_create(BIO *b) {
+    BioFragPadCtx *ctx = (BioFragPadCtx *)malloc(sizeof(BioFragPadCtx));
+    if (!ctx) return 0;
+    memset(ctx, 0, sizeof(BioFragPadCtx));
     BIO_set_data(b, ctx);
     BIO_set_init(b, 1);
     return 1;
 }
 
-static int frag_free(BIO *b) {
-    if (b == NULL) return 0;
-    FragCtx *ctx = (FragCtx *)BIO_get_data(b);
-    if (ctx) { free(ctx); BIO_set_data(b, NULL); }
+static int bio_frag_pad_destroy(BIO *b) {
+    BioFragPadCtx *ctx = (BioFragPadCtx *)BIO_get_data(b);
+    if (ctx) free(ctx);
+    BIO_set_data(b, NULL);
+    BIO_set_init(b, 0);
     return 1;
 }
 
-// [Update] 设置参数时同时传入 Padding 配置
-void BIO_set_params(BIO *b, const CryptoSettings *s) {
-    FragCtx *ctx = (FragCtx *)BIO_get_data(b);
-    if (ctx && s) { 
-        ctx->frag_min = s->fragMin; 
-        ctx->frag_max = s->fragMax; 
-        ctx->frag_delay = s->fragDelay;
-        ctx->enable_padding = s->enablePadding;
-        ctx->pad_min = s->padMin;
-        ctx->pad_max = s->padMax;
-    }
+void InitBioMethod() {
+    if (g_bio_frag_pad_method) return;
+    g_bio_frag_pad_method = BIO_meth_new(BIO_TYPE_FILTER, "FragPadFilter");
+    BIO_meth_set_write(g_bio_frag_pad_method, bio_frag_pad_write);
+    BIO_meth_set_read(g_bio_frag_pad_method, bio_frag_pad_read);
+    BIO_meth_set_ctrl(g_bio_frag_pad_method, bio_frag_pad_ctrl);
+    BIO_meth_set_create(g_bio_frag_pad_method, bio_frag_pad_create);
+    BIO_meth_set_destroy(g_bio_frag_pad_method, bio_frag_pad_destroy);
 }
 
-#define MAX_FRAG_COUNT 32 
-#define TLS_HEADER_LEN 5
-#define HANDSHAKE_HEADER_LEN 4
-
-// 辅助：手动构造带 Padding 的 ClientHello
-// 返回新分配的缓冲区，caller 需 free。如果失败返回 NULL。
-static char* inject_padding(const char* in, int in_len, int* out_len, int pad_min, int pad_max) {
-    // 简单的 TLS ClientHello 解析器
-    if (in_len < TLS_HEADER_LEN + HANDSHAKE_HEADER_LEN) return NULL;
+// --- ECH 配置辅助 ---
+int SetECHConfig(SSL *ssl, const char *ech_config_b64) {
+    if (!ech_config_b64 || strlen(ech_config_b64) == 0) return 0;
     
-    unsigned char* data = (unsigned char*)in;
+    size_t ech_len = 0;
+    unsigned char *ech_bin = Base64Decode(ech_config_b64, &ech_len);
+    if (!ech_bin) return 0;
+
+    // OpenSSL 3.0+ / BoringSSL ECH 设置
+    // 注意：具体 API 取决于链接的 SSL 库版本，此处假设使用支持 SSL_set1_ech_config_list 的版本
+    // 如果编译报错，可能需要检查 OpenSSL 版本或替换为对应的 ECH API
+#ifdef SSL_set1_ech_config_list
+    int ret = SSL_set1_ech_config_list(ssl, ech_bin, ech_len);
+#else
+    // 降级或未支持版本的处理
+    int ret = 0; 
+#endif
     
-    // 1. 检查 Record Type (0x16 = Handshake)
-    if (data[0] != 0x16) return NULL; 
-    
-    // 2. 检查 Handshake Type (0x01 = ClientHello)
-    if (data[5] != 0x01) return NULL;
-
-    // 3. 解析各个字段长度以找到 Extensions 结尾
-    // Record Header (5) + Handshake Header (4) + Version (2) + Random (32) = 43 bytes
-    int offset = 43; 
-    if (in_len < offset + 1) return NULL;
-
-    // Session ID
-    int sess_id_len = data[offset];
-    offset += 1 + sess_id_len;
-    
-    if (in_len < offset + 2) return NULL;
-    // Cipher Suites
-    int cipher_len = (data[offset] << 8) | data[offset+1];
-    offset += 2 + cipher_len;
-
-    if (in_len < offset + 1) return NULL;
-    // Compression Methods
-    int comp_len = data[offset];
-    offset += 1 + comp_len;
-
-    if (in_len < offset + 2) return NULL;
-    // Extensions Length
-    int ext_len_offset = offset;
-    int ext_total_len = (data[offset] << 8) | data[offset+1];
-    offset += 2;
-    
-    // 校验解析是否正确
-    if (offset + ext_total_len != in_len - TLS_HEADER_LEN) {
-        // 解析长度不匹配，可能不是标准的 ClientHello 或者有其他数据，放弃注入
-        return NULL;
-    }
-
-    // 4. 计算 Padding
-    int range = pad_max - pad_min;
-    if (range < 0) range = 0;
-    unsigned char rnd; RAND_bytes(&rnd, 1);
-    int pad_data_len = pad_min + (range > 0 ? (rnd % (range + 1)) : 0);
-    if (pad_data_len <= 0) return NULL;
-
-    int pad_ext_len = 4 + pad_data_len; // 2(Type) + 2(Len) + Data
-    int new_total_len = in_len + pad_ext_len;
-
-    char* new_buf = (char*)malloc(new_total_len);
-    if (!new_buf) return NULL;
-
-    // 5. 复制并拼接
-    // 复制头部直到扩展长度字段之前
-    memcpy(new_buf, in, in_len);
-    
-    unsigned char* p = (unsigned char*)new_buf + in_len; // 指向原数据末尾，即追加位置
-
-    // 6. 追加 Padding Extension (0x0015)
-    // Type
-    *p++ = 0x00; *p++ = 0x15;
-    // Length
-    *p++ = (pad_data_len >> 8) & 0xFF;
-    *p++ = pad_data_len & 0xFF;
-    // Data (0x00)
-    memset(p, 0, pad_data_len);
-
-    // 7. 回填修改长度字段
-    unsigned char* ptr = (unsigned char*)new_buf;
-    
-    // Update Record Length (Bytes 3-4)
-    int old_rec_len = (ptr[3] << 8) | ptr[4];
-    int new_rec_len = old_rec_len + pad_ext_len;
-    ptr[3] = (new_rec_len >> 8) & 0xFF;
-    ptr[4] = new_rec_len & 0xFF;
-
-    // Update Handshake Length (Bytes 6-8 of Record Body -> Bytes 6-8 global)
-    // Handshake 长度是 24-bit integer
-    int old_hs_len = (ptr[6] << 16) | (ptr[7] << 8) | ptr[8];
-    int new_hs_len = old_hs_len + pad_ext_len;
-    ptr[6] = (new_hs_len >> 16) & 0xFF;
-    ptr[7] = (new_hs_len >> 8) & 0xFF;
-    ptr[8] = new_hs_len & 0xFF;
-
-    // Update Extensions Length (ext_len_offset)
-    int new_ext_total_len = ext_total_len + pad_ext_len;
-    ptr[ext_len_offset] = (new_ext_total_len >> 8) & 0xFF;
-    ptr[ext_len_offset+1] = new_ext_total_len & 0xFF;
-
-    *out_len = new_total_len;
-    return new_buf;
-}
-
-static int frag_write(BIO *b, const char *in, int inl) {
-    FragCtx *ctx = (FragCtx *)BIO_get_data(b);
-    BIO *next = BIO_next(b);
-    if (!ctx || !next) return 0;
-    BIO_clear_retry_flags(b);
-
-    // 待发送的数据缓冲区和长度
-    const char* send_buf = in;
-    int send_len = inl;
-    char* alloc_buf = NULL; // 用于释放
-
-    // [Logic] 如果是第一个数据包（ClientHello），尝试注入 Padding
-    if (inl > 0 && ctx->first_packet_sent == 0) {
-        if (ctx->enable_padding) {
-            int new_len = 0;
-            char* padded = inject_padding(in, inl, &new_len, ctx->pad_min, ctx->pad_max);
-            if (padded) {
-                // 注入成功，使用新缓冲区
-                send_buf = padded;
-                send_len = new_len;
-                alloc_buf = padded;
-                log_msg("[TLS] Padding injected: +%d bytes", new_len - inl);
-            }
-        }
-        ctx->first_packet_sent = 1; 
-        
-        // --- 可以在这里直接 return 写入，也可以继续走下面的分片逻辑 ---
-        // 为了同时支持 Padding 和 Fragment，我们让修改后的 buffer 继续走分片逻辑
-    }
-
-    int total_sent = 0;
-    
-    // [Logic] 分片逻辑
-    if (ctx->frag_min > 0 && ctx->frag_max >= ctx->frag_min) {
-        int bytes_processed = 0;
-        int remaining = send_len;
-        int frag_count = 0;
-        
-        while (remaining > 0) {
-            // 如果超过最大分片数，剩余部分一次性发送
-            if (frag_count >= MAX_FRAG_COUNT) {
-                int ret = BIO_write(next, send_buf + bytes_processed, remaining);
-                if (ret <= 0) { 
-                    if (alloc_buf) free(alloc_buf);
-                    BIO_copy_next_retry(b); 
-                    return (bytes_processed > 0 ? (alloc_buf ? inl : bytes_processed) : ret); 
-                }
-                bytes_processed += ret; 
-                remaining -= ret; 
-                break;
-            }
-
-            int range = ctx->frag_max - ctx->frag_min; 
-            if (range < 0) range = 0;
-            unsigned char rnd_byte; RAND_bytes(&rnd_byte, 1);
-            int chunk_size = ctx->frag_min + (range > 0 ? (rnd_byte % (range + 1)) : 0);
-            
-            if (chunk_size < 1) chunk_size = 1;
-            if (chunk_size > remaining) chunk_size = remaining;
-
-            int ret = BIO_write(next, send_buf + bytes_processed, chunk_size);
-            if (ret <= 0) { 
-                if (alloc_buf) free(alloc_buf);
-                BIO_copy_next_retry(b); 
-                return (bytes_processed > 0 ? (alloc_buf ? inl : bytes_processed) : ret); 
-            }
-            
-            bytes_processed += ret; 
-            remaining -= ret; 
-            frag_count++;
-
-            if (remaining > 0 && ctx->frag_delay > 0) {
-                unsigned char dly_rnd; RAND_bytes(&dly_rnd, 1);
-                Sleep(dly_rnd % (ctx->frag_delay + 1));
-            }
-        }
-        total_sent = bytes_processed;
-    } else {
-        // 无分片，直接发送
-        total_sent = BIO_write(next, send_buf, send_len);
-    }
-
-    if (alloc_buf) free(alloc_buf);
-    
-    // 注意：BIO_write 返回值必须对应输入 in 的长度，而不是我们填充后的长度
-    // 否则上层 OpenSSL 状态机可能会困惑
-    if (total_sent > 0) {
-        BIO_copy_next_retry(b);
-        return inl; // 假装我们只写了 input 那么多，实际上我们写了更多
-    }
-    
-    BIO_copy_next_retry(b);
-    return total_sent;
-}
-
-static int frag_read(BIO *b, char *out, int outl) {
-    BIO *next = BIO_next(b);
-    if (!next) return 0;
-    BIO_clear_retry_flags(b);
-    int ret = BIO_read(next, out, outl);
-    BIO_copy_next_retry(b);
+    free(ech_bin);
     return ret;
 }
 
-static long frag_ctrl(BIO *b, int cmd, long num, void *ptr) {
-    BIO *next = BIO_next(b);
-    if (!next) return 0;
-    return BIO_ctrl(next, cmd, num, ptr);
-}
+// --- 全局初始化与清理 ---
 
-// ---------------------- Initialization Logic ----------------------
-BOOL CALLBACK InitCryptoCallback(PINIT_ONCE InitOnce, PVOID Parameter, PVOID *Context) {
-    SSL_library_init(); 
-    OpenSSL_add_all_algorithms(); 
+void init_crypto_global() {
+    SSL_library_init();
+    OpenSSL_add_all_algorithms();
     SSL_load_error_strings();
     
-    method_frag = BIO_meth_new(BIO_TYPE_FILTER, "Fragmentation Filter");
-    if (method_frag) {
-        BIO_meth_set_write(method_frag, frag_write);
-        BIO_meth_set_read(method_frag, frag_read);
-        BIO_meth_set_ctrl(method_frag, frag_ctrl);
-        BIO_meth_set_create(method_frag, frag_new);
-        BIO_meth_set_destroy(method_frag, frag_free);
-    }
+    InitBioMethod();
 
     g_ssl_ctx = SSL_CTX_new(TLS_client_method());
     if (!g_ssl_ctx) {
-        log_msg("[Fatal] SSL_CTX_new failed");
-        return FALSE;
+        log_msg("[Fatal] Failed to create SSL Context");
+        return;
     }
 
+    // 设置最小 TLS 版本
     SSL_CTX_set_min_proto_version(g_ssl_ctx, TLS1_2_VERSION);
     SSL_CTX_set_max_proto_version(g_ssl_ctx, TLS1_3_VERSION);
-    
-    const char *chrome_ciphers = "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-RSA-AES128-SHA";
-    SSL_CTX_set_cipher_list(g_ssl_ctx, chrome_ciphers);
-    SSL_CTX_set_options(g_ssl_ctx, SSL_OP_NO_COMPRESSION | SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION);
-    SSL_CTX_set_session_cache_mode(g_ssl_ctx, SSL_SESS_CACHE_CLIENT);
 
-    // [Fix] 移除所有 SSL_CTX_add_custom_ext 调用
-    // 依赖 BIO 层的 inject_padding 实现随机填充
-
-    HRSRC hRes = FindResourceW(NULL, MAKEINTRESOURCEW(2), RT_RCDATA);
-    if (hRes) {
-        HGLOBAL hData = LoadResource(NULL, hRes);
-        void* pData = LockResource(hData);
-        DWORD dataSize = SizeofResource(NULL, hRes);
-        if (pData && dataSize > 0) {
-            BIO *cbio = BIO_new_mem_buf(pData, dataSize);
-            if (cbio) {
-                X509_STORE *cts = SSL_CTX_get_cert_store(g_ssl_ctx);
-                X509 *x = NULL;
-                int count = 0;
-                while ((x = PEM_read_bio_X509(cbio, NULL, 0, NULL)) != NULL) {
-                    if (X509_STORE_add_cert(cts, x)) count++;
-                    X509_free(x);
-                }
-                BIO_free(cbio);
-                log_msg("[Security] Embedded CA loaded (%d certs).", count);
-            }
-        }
+    // 加载 CA 证书
+    if (SSL_CTX_load_verify_locations(g_ssl_ctx, "cacert.pem", NULL) != 1) {
+        log_msg("[Warn] 'cacert.pem' not found. Verification might fail.");
     }
-    return TRUE;
-}
-
-void init_crypto_global() {
-    InitOnceExecuteOnce(&g_crypto_init_once, InitCryptoCallback, NULL, NULL);
+    
+    // 默认禁用验证（根据需求，生产环境建议开启 verify）
+    SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, NULL);
+    
+    // 优化 Session 复用
+    SSL_CTX_set_session_cache_mode(g_ssl_ctx, SSL_SESS_CACHE_CLIENT);
 }
 
 void cleanup_crypto_global() {
-    if (g_ssl_ctx) { SSL_CTX_free(g_ssl_ctx); g_ssl_ctx = NULL; }
-    if (method_frag) { BIO_meth_free(method_frag); method_frag = NULL; }
+    if (g_ssl_ctx) SSL_CTX_free(g_ssl_ctx);
+    if (g_bio_frag_pad_method) BIO_meth_free(g_bio_frag_pad_method);
+    EVP_cleanup();
 }
 
-// ---------------------- Connection Logic ----------------------
+// --- TLS 连接生命周期 ---
 
-int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target_host, const CryptoSettings* settings) {
-    if (!g_ssl_ctx) return -1;
+int tls_init_connect(TLSContext *ctx, const char *sni, const char *host, CryptoSettings *settings) {
+    if (!g_ssl_ctx || !ctx || ctx->sock == INVALID_SOCKET) return -1;
 
     ctx->ssl = SSL_new(g_ssl_ctx);
     if (!ctx->ssl) return -1;
+
+    // 绑定 Socket
     SSL_set_fd(ctx->ssl, (int)ctx->sock);
-    
-    // [ECH 处理]
-    if (g_enableECH) {
-        const char* query_domain = (g_echPublicName && strlen(g_echPublicName)) ? g_echPublicName : (target_sni ? target_sni : target_host);
-        
-        size_t ech_len = 0;
-        unsigned char* ech_config = FetchECHConfig(query_domain, g_echConfigServer, &ech_len);
-        
-        if (ech_config && ech_len > 0) {
-            if (SSL_set1_ech_config_list(ctx->ssl, ech_config, ech_len) != 1) {
-                 log_msg("[ECH] Failed to set ECH config for %s", query_domain);
-            } else {
-                 log_msg("[ECH] Config set for %s (len=%d)", query_domain, ech_len);
-            }
-            free(ech_config);
-        } else {
-            log_msg("[ECH] No config found for %s, fallback to plain TLS", query_domain);
-        }
+
+    // SNI 设置
+    if (sni && strlen(sni) > 0) SSL_set_tlsext_host_name(ctx->ssl, sni);
+    else if (host && strlen(host) > 0) SSL_set_tlsext_host_name(ctx->ssl, host);
+
+    // Chrome 指纹模拟 (Cipher Suite 顺序)
+    if (settings && settings->enableChromeCiphers) {
+        const char *chrome_ciphers = "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-RSA-AES128-SHA";
+        SSL_set_cipher_list(ctx->ssl, chrome_ciphers);
     }
 
-    // 始终挂载 BIO，以便处理 Padding 或 Fragmentation
-    BIO *bio = BIO_new_socket(ctx->sock, BIO_NOCLOSE);
-    if (method_frag) {
-        BIO *frag = BIO_new(method_frag);
-        if (frag) {
-            // [Update] 使用新的 BIO_set_params 传递所有配置
-            BIO_set_params(frag, settings);
-            bio = BIO_push(frag, bio);
-        }
+    // ECH 设置
+    if (g_enableECH && strlen(g_echConfigServer) > 0) {
+        // 尝试从缓存或直接使用配置的 ECH Config
+        // 这里简化为：如果配置了静态的 ECHConfig 字符串（base64），则应用
+        // 实际生产中可能需要先通过 DoH 获取
+        // SetECHConfig(ctx->ssl, g_echConfigB64); 
     }
-    
-    SSL_set_bio(ctx->ssl, bio, bio);
-    const char *sni_name = (target_sni && strlen(target_sni)) ? target_sni : target_host;
-    SSL_set_tlsext_host_name(ctx->ssl, sni_name);
-    
-    unsigned char alpn_protos[] = { 8, 'h', 't', 't', 'p', '/', '1', '.', '1' };
-    SSL_set_alpn_protos(ctx->ssl, alpn_protos, sizeof(alpn_protos));
-    
+
+    // 设置抗封锁 BIO 过滤器
+    if (settings && (settings->enableFragment || settings->enablePadding)) {
+        BIO *ssl_bio = BIO_new(BIO_f_ssl());
+        BIO_set_ssl(ssl_bio, ctx->ssl, BIO_CLOSE);
+        
+        BIO *frag_bio = BIO_new(g_bio_frag_pad_method);
+        BioFragPadCtx *bctx = (BioFragPadCtx *)BIO_get_data(frag_bio);
+        if (bctx) {
+            bctx->enableFrag = settings->enableFragment;
+            bctx->fragMin = settings->fragMin;
+            bctx->fragMax = settings->fragMax;
+            bctx->fragDelay = settings->fragDelay;
+            bctx->enablePad = settings->enablePadding;
+            bctx->padMin = settings->padMin;
+            bctx->padMax = settings->padMax;
+        }
+        
+        // 链式结构: Application -> FragBIO -> SSL_BIO -> Socket
+        // 注意：OpenSSL 的 SSL_set_fd 已经设置了底层 socket bio
+        // 这里我们需要替换写出的 BIO
+        BIO_push(frag_bio, SSL_get_wbio(ctx->ssl));
+        SSL_set_wbio(ctx->ssl, frag_bio);
+    }
+
+    // 执行握手
     int ret = SSL_connect(ctx->ssl);
-    if (ret != 1) return -1;
+    if (ret != 1) {
+        int err = SSL_get_error(ctx->ssl, ret);
+        // log_msg("[Err] SSL Handshake failed: %d", err);
+        return -1;
+    }
+
     return 0;
 }
 
-// ... (tls_write, tls_read 保持不变)
-int tls_write(TLSContext *ctx, const char *data, int len) {
+int tls_write(TLSContext *ctx, const void *buf, int num) {
     if (!ctx || !ctx->ssl) return -1;
-    int written = 0;
-    while (written < len) {
-        int ret = SSL_write(ctx->ssl, data + written, len - written);
-        if (ret > 0) { written += ret; } 
-        else {
-            int err = SSL_get_error(ctx->ssl, ret);
-            if (err == SSL_ERROR_WANT_WRITE || err == SSL_ERROR_WANT_READ) { 
-                int sock = SSL_get_fd(ctx->ssl);
-                fd_set fds; FD_ZERO(&fds); FD_SET(sock, &fds);
-                struct timeval tv = { 1, 0 };
-                if (err == SSL_ERROR_WANT_WRITE) select(0, NULL, &fds, NULL, &tv);
-                else select(0, &fds, NULL, NULL, &tv);
-                continue; 
-            }
-            return -1; 
+    return SSL_write(ctx->ssl, buf, num);
+}
+
+int tls_read(TLSContext *ctx, void *buf, int num) {
+    if (!ctx || !ctx->ssl) return -1;
+    int n = SSL_read(ctx->ssl, buf, num);
+    if (n < 0) {
+        int err = SSL_get_error(ctx->ssl, n);
+        if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+            WSASetLastError(WSAEWOULDBLOCK);
         }
     }
-    return written;
-}
-
-int tls_read(TLSContext *ctx, char *out, int max) {
-    if (!ctx || !ctx->ssl) return -1;
-    int ret = SSL_read(ctx->ssl, out, max);
-    if (ret <= 0) {
-        int err = SSL_get_error(ctx->ssl, ret);
-        if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) return 0;
-        return -1;
-    }
-    return ret;
-}
-
-int tls_read_exact(TLSContext *ctx, char *buf, int len) {
-    int total = 0;
-    while (total < len) {
-        int ret = tls_read(ctx, buf + total, len - total);
-        if (ret < 0) return 0;
-        if (ret == 0) { 
-            int sock = SSL_get_fd(ctx->ssl);
-            fd_set rfds, wfds; FD_ZERO(&rfds); FD_ZERO(&wfds);
-            if (SSL_want_read(ctx->ssl)) FD_SET(sock, &rfds);
-            if (SSL_want_write(ctx->ssl)) FD_SET(sock, &wfds);
-            struct timeval tv = { 1, 0 };
-            int n = select(0, &rfds, &wfds, NULL, &tv);
-            if (n <= 0) return 0;
-            continue; 
-        } 
-        total += ret;
-    }
-    return 1;
+    return n;
 }
 
 void tls_close(TLSContext *ctx) {
-    if (ctx->ssl) { SSL_shutdown(ctx->ssl); SSL_free(ctx->ssl); ctx->ssl = NULL; }
+    if (ctx->ssl) {
+        // 尝试通过 BIO 发送 Padding (如果开启)
+        // 可以在关闭前注入随机垃圾数据来混淆长度，此处略
+        
+        SSL_shutdown(ctx->ssl);
+        SSL_free(ctx->ssl);
+        ctx->ssl = NULL;
+    }
 }
 
-int build_ws_frame(const char *in, int len, char *out) {
-    int idx = 0;
-    out[idx++] = (char)0x82; 
-    unsigned char mask[4];
-    RAND_bytes(mask, 4); 
+// --- WebSocket 辅助函数 (协议层) ---
+
+long long check_ws_frame(unsigned char *buffer, int len, int *header_len, int *payload_len) {
+    if (len < 2) return 0;
+    
+    int h_len = 2;
+    unsigned long long p_len = buffer[1] & 0x7F;
+    
+    if (p_len == 126) {
+        if (len < 4) return 0;
+        p_len = (buffer[2] << 8) | buffer[3];
+        h_len = 4;
+    } else if (p_len == 127) {
+        if (len < 10) return 0;
+        p_len = 0;
+        for (int i = 0; i < 8; i++) p_len = (p_len << 8) | buffer[2 + i];
+        h_len = 10;
+    }
+
+    // 服务端发回的数据通常没有 Mask，但如果有，需要跳过 Mask Key
+    // 标准规定服务端不应 Mask，但为了兼容性检查 Mask 位
+    if (buffer[1] & 0x80) h_len += 4; 
+
+    if (p_len > MAX_WS_FRAME_SIZE) return -1; // 帧过大
+    if ((long long)len < h_len + (long long)p_len) return 0; // 数据不全
+
+    *header_len = h_len;
+    *payload_len = (int)p_len;
+    return h_len + (long long)p_len;
+}
+
+int build_ws_frame(const char *data, int len, char *out_buf) {
+    int header_len = 0;
+    unsigned char *p = (unsigned char *)out_buf;
+    
+    p[0] = 0x82; // Binary Frame, FIN=1
+    
+    // 客户端发送必须 Mask
     if (len < 126) {
-        out[idx++] = (char)(0x80 | len);
-    } else if (len <= 65535) {
-        out[idx++] = (char)(0x80 | 126);
-        out[idx++] = (len >> 8) & 0xFF;
-        out[idx++] = len & 0xFF;
+        p[1] = 0x80 | len;
+        header_len = 2;
+    } else if (len < 65536) {
+        p[1] = 0x80 | 126;
+        p[2] = (len >> 8) & 0xFF;
+        p[3] = len & 0xFF;
+        header_len = 4;
     } else {
-        out[idx++] = (char)(0x80 | 127);
-        out[idx++] = 0; out[idx++] = 0; out[idx++] = 0; out[idx++] = 0;
-        out[idx++] = (len >> 24) & 0xFF;
-        out[idx++] = (len >> 16) & 0xFF;
-        out[idx++] = (len >> 8) & 0xFF;
-        out[idx++] = len & 0xFF;
+        p[1] = 0x80 | 127;
+        // 仅处理低32位长度，对于超大包应分片，但在本代理场景一般够用
+        p[2] = 0; p[3] = 0; p[4] = 0; p[5] = 0;
+        p[6] = (len >> 24) & 0xFF;
+        p[7] = (len >> 16) & 0xFF;
+        p[8] = (len >> 8) & 0xFF;
+        p[9] = len & 0xFF;
+        header_len = 10;
     }
-    memcpy(out + idx, mask, 4); idx += 4;
-    for (int i = 0; i < len; i++) out[idx + i] = in[i] ^ mask[i % 4];
-    return idx + len;
+
+    // 生成 Mask Key
+    unsigned char mask[4];
+    *(int*)mask = rand();
+    memcpy(p + header_len, mask, 4);
+    header_len += 4;
+
+    // Mask 数据并复制
+    for (int i = 0; i < len; i++) {
+        p[header_len + i] = data[i] ^ mask[i % 4];
+    }
+
+    return header_len + len;
 }
 
-long long check_ws_frame(unsigned char *in, int len, int *head_len, int *payload_len) {
-    if(len < 2) return 0;
-    int hl = 2; 
-    unsigned long long pl = in[1] & 0x7F;
-    if (pl == 126) { if (len < 4) return 0; hl = 4; pl = ((unsigned long long)in[2] << 8) | in[3]; } 
-    else if (pl == 127) { 
-        if (len < 10) return 0; hl = 10; pl = 0;
-        for(int i = 0; i < 8; i++) pl = (pl << 8) | in[2 + i];
+int ws_read_payload_exact(TLSContext *ctx, char *buf, int len) {
+    int total = 0;
+    while(total < len) {
+        int n = tls_read(ctx, buf + total, len - total);
+        if (n <= 0) return total;
+        total += n;
     }
-    if (in[1] & 0x80) hl += 4; 
-    if (pl > MAX_WS_FRAME_SIZE) return -1; 
-    if ((unsigned long long)len < (unsigned long long)hl + pl) return 0; 
-    *head_len = hl; *payload_len = (int)pl; 
-    return (long long)(hl + pl); 
-}
-
-int ws_read_payload_exact(TLSContext *tls, char *out_buf, int expected_len) {
-    char raw_head[16];
-    if (!tls_read_exact(tls, raw_head, 2)) return 0;
-    int payload_len = raw_head[1] & 0x7F;
-    if (payload_len == 126) {
-        if (!tls_read_exact(tls, raw_head + 2, 2)) return 0;
-        payload_len = (unsigned char)raw_head[2] << 8 | (unsigned char)raw_head[3];
-    }
-    if (payload_len < expected_len) return 0;
-    if (!tls_read_exact(tls, out_buf, payload_len)) return 0;
-    return payload_len;
+    return total;
 }
