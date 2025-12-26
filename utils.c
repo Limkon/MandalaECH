@@ -9,7 +9,7 @@
 #include <wininet.h>
 #include <ctype.h> 
 
-// 引入 OpenSSL/BoringSSL 头文件
+// 引入 OpenSSL 头文件
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 
@@ -22,7 +22,10 @@
 #pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "wininet.lib")
 
+// 全局 SSL 句柄与同步锁
 static SSL_CTX* g_utils_ctx = NULL;
+static CRITICAL_SECTION g_ctx_lock;
+static BOOL g_lock_init = FALSE;
 
 // --------------------------------------------------------------------------
 // 基础工具函数
@@ -34,12 +37,14 @@ BOOL IsWindows8OrGreater() {
     return (pFunc != NULL);
 }
 
-// 安全的字符串克隆（防止 Win7 CRT Runtime Error）
-static char* SafeStrDup(const char* s) {
-    if (!s) return NULL;
-    size_t len = strlen(s) + 1;
-    char* d = (char*)malloc(len);
-    if (d) memcpy(d, s, len);
+// 线程安全的字符串克隆，防止 Win7 CRT Runtime 异常
+static char* SafeStrDup(const char* s, int len) {
+    if (!s || len <= 0) return NULL;
+    char* d = (char*)malloc(len + 1);
+    if (d) {
+        memcpy(d, s, len);
+        d[len] = 0;
+    }
     return d;
 }
 
@@ -142,7 +147,7 @@ char* GetQueryParam(const char* query, const char* key) {
 }
 
 // --------------------------------------------------------------------------
-// ECH 与 Base64
+// ECH 与 Base64 解析 (Win7 稳定增强版)
 // --------------------------------------------------------------------------
 static const int b64_table[] = {
     -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
@@ -162,7 +167,7 @@ unsigned char* Base64Decode(const char* input, size_t* out_len) {
     if (!out) return NULL;
     size_t i = 0, j = 0;
     while (i < len) {
-        if (input[i] == '\r' || input[i] == '\n') { i++; continue; } 
+        if (input[i] == '\r' || input[i] == '\n' || input[i] == ' ') { i++; continue; } 
         if (input[i] == '=') break; 
         unsigned char a = (unsigned char)input[i];
         unsigned char b = (unsigned char)input[i+1];
@@ -233,8 +238,8 @@ unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t
                         unsigned char rdata[4096];
                         int rdata_len = HexToBin(data_str, rdata, sizeof(rdata));
                         if (rdata_len > 5) { 
-                            int p = 2; // Priority
-                            while (p < rdata_len) { // TargetName
+                            int p = 2; // Skip Priority
+                            while (p < rdata_len) { // Skip TargetName
                                 int label_len = rdata[p++];
                                 if (label_len == 0 || p + label_len > rdata_len) break; 
                                 p += label_len;
@@ -261,7 +266,7 @@ unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t
 }
 
 // --------------------------------------------------------------------------
-// 网络请求实现 (针对 Win7 加固)
+// 网络请求实现 (针对 Win7 加固版)
 // --------------------------------------------------------------------------
 typedef struct { char host[256]; int port; char path[1024]; } URL_COMPONENTS_SIMPLE;
 
@@ -285,11 +290,17 @@ static BOOL ParseUrl(const char* url, URL_COMPONENTS_SIMPLE* out) {
 static char* InternalHttpsGet(const char* url) {
     URL_COMPONENTS_SIMPLE u;
     if (!ParseUrl(url, &u)) return NULL;
+
+    // [关键] 线程安全的上下文初始化，防止多线程同时更新订阅时崩溃
+    if (!g_lock_init) { InitializeCriticalSection(&g_ctx_lock); g_lock_init = TRUE; }
+    EnterCriticalSection(&g_ctx_lock);
     if (!g_utils_ctx) {
         g_utils_ctx = SSL_CTX_new(TLS_client_method());
-        if (!g_utils_ctx) return NULL;
-        SSL_CTX_set_verify(g_utils_ctx, SSL_VERIFY_NONE, NULL);
+        if (g_utils_ctx) SSL_CTX_set_verify(g_utils_ctx, SSL_VERIFY_NONE, NULL);
     }
+    LeaveCriticalSection(&g_ctx_lock);
+    if (!g_utils_ctx) return NULL;
+
     SOCKET s = INVALID_SOCKET; SSL *ssl = NULL; char* result = NULL;
     struct addrinfo hints, *res = NULL;
     memset(&hints, 0, sizeof(hints));
@@ -298,17 +309,19 @@ static char* InternalHttpsGet(const char* url) {
     if (getaddrinfo(u.host, portStr, &hints, &res) != 0) return NULL;
     s = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
     if (s == INVALID_SOCKET) { freeaddrinfo(res); return NULL; }
-    DWORD timeout = 5000;
+    
+    DWORD timeout = 10000; // 增加超时到 10 秒
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
     setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
     if (connect(s, res->ai_addr, (int)res->ai_addrlen) != 0) { closesocket(s); freeaddrinfo(res); return NULL; }
     freeaddrinfo(res);
+
     ssl = SSL_new(g_utils_ctx);
     if (!ssl) { closesocket(s); return NULL; }
     SSL_set_fd(ssl, (int)s); SSL_set_tlsext_host_name(ssl, u.host);
     if (SSL_connect(ssl) != 1) { SSL_free(ssl); closesocket(s); return NULL; }
 
-    // [关键修复] 更新订阅时不要强制 Accept: dns-json，否则部分服务器返回 406 导致崩溃
+    // [优化] 仅当访问 DoH 接口时才发送特定的 Accept 头部，下载订阅使用标准头部
     const char* accept_header = (strstr(u.path, "dns-query") || strstr(u.path, "name=")) ? 
                                  "Accept: application/dns-json\r\n" : "Accept: */*\r\n";
 
@@ -318,11 +331,13 @@ static char* InternalHttpsGet(const char* url) {
         u.path, u.host, accept_header);
     if (SSL_write(ssl, req, (int)strlen(req)) <= 0) goto cleanup;
 
-    int total_cap = 65536; int total_len = 0;
+    int total_cap = 131072; // 初始分配 128KB 减少重分配
+    int total_len = 0;
     char* buf = (char*)malloc(total_cap);
     if (!buf) goto cleanup;
+
     while (1) {
-        if (total_len >= total_cap - 1024) {
+        if (total_len >= total_cap - 2048) {
             total_cap *= 2; char* new_buf = (char*)realloc(buf, total_cap);
             if (!new_buf) { free(buf); buf = NULL; goto cleanup; }
             buf = new_buf;
@@ -331,9 +346,17 @@ static char* InternalHttpsGet(const char* url) {
         if (n <= 0) break;
         total_len += n;
     }
+
     if (buf) {
-        buf[total_len] = 0; char* body = strstr(buf, "\r\n\r\n");
-        if (body) { result = SafeStrDup(body + 4); free(buf); } else { result = buf; }
+        buf[total_len] = 0; char* body_pos = strstr(buf, "\r\n\r\n");
+        if (body_pos) { 
+            body_pos += 4;
+            int body_len = total_len - (int)(body_pos - buf);
+            result = SafeStrDup(body_pos, body_len); // 二进制安全拷贝
+            free(buf); 
+        } else { 
+            result = buf; // 没找到头则返回全部
+        }
     }
 cleanup:
     if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); }
@@ -351,7 +374,8 @@ char* GetClipboardText() {
     HANDLE hData = GetClipboardData(CF_TEXT);
     if (!hData) { CloseClipboard(); return NULL; }
     char* pszText = (char*)GlobalLock(hData);
-    char* text = SafeStrDup(pszText);
+    char* text = NULL;
+    if (pszText) text = SafeStrDup(pszText, (int)strlen(pszText));
     GlobalUnlock(hData); CloseClipboard();
     return text;
 }
