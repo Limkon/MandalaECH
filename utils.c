@@ -22,10 +22,10 @@
 #pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "wininet.lib")
 
-// 全局 SSL 句柄与同步锁
+// 全局 SSL 句柄
 static SSL_CTX* g_utils_ctx = NULL;
-static CRITICAL_SECTION g_ctx_lock;
-static BOOL g_lock_init = FALSE;
+// 用于原子初始化
+static volatile LONG g_ctx_initializing = 0;
 
 // --------------------------------------------------------------------------
 // 基础工具函数
@@ -37,7 +37,7 @@ BOOL IsWindows8OrGreater() {
     return (pFunc != NULL);
 }
 
-// 线程安全的字符串克隆，防止 Win7 CRT Runtime 异常
+// 安全的字符串克隆
 static char* SafeStrDup(const char* s, int len) {
     if (!s || len <= 0) return NULL;
     char* d = (char*)malloc(len + 1);
@@ -75,7 +75,7 @@ void log_msg(const char *format, ...) {
 }
 
 // --------------------------------------------------------------------------
-// 文件 IO 与 字符串处理
+// 文件 IO 操作
 // --------------------------------------------------------------------------
 BOOL ReadFileToBuffer(const wchar_t* filename, char** buffer, long* size) {
     FILE* f = _wfopen(filename, L"rb");
@@ -101,6 +101,9 @@ BOOL WriteBufferToFile(const wchar_t* filename, const char* buffer) {
     return TRUE;
 }
 
+// --------------------------------------------------------------------------
+// 字符串处理工具
+// --------------------------------------------------------------------------
 void TrimString(char* str) {
     if (!str) return;
     char* p = str;
@@ -147,7 +150,7 @@ char* GetQueryParam(const char* query, const char* key) {
 }
 
 // --------------------------------------------------------------------------
-// ECH 与 Base64 解析 (Win7 稳定增强版)
+// Base64 解码实现
 // --------------------------------------------------------------------------
 static const int b64_table[] = {
     -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
@@ -201,14 +204,21 @@ static int HexToBin(const char* hex, unsigned char* out, int max_len) {
     return len;
 }
 
+// --------------------------------------------------------------------------
+// ECH 配置获取逻辑
+// --------------------------------------------------------------------------
 unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t* out_len) {
     if (!domain || !doh_server) return NULL;
-    char url[1024]; snprintf(url, sizeof(url), "%s?name=%s&type=65", doh_server, domain);
+    char url[2048]; // 增大缓冲区
+    snprintf(url, sizeof(url), "%s?name=%s&type=65", doh_server, domain);
+    url[sizeof(url)-1] = 0; // 强制 Null 终止
+
     char* json_str = Utils_HttpGet(url);
     if (!json_str) return NULL;
     cJSON* root = cJSON_Parse(json_str);
     free(json_str);
     if (!root) return NULL;
+
     unsigned char* ech_config = NULL; *out_len = 0;
     cJSON* answer = cJSON_GetObjectItem(root, "Answer");
     if (answer && cJSON_IsArray(answer)) {
@@ -238,8 +248,8 @@ unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t
                         unsigned char rdata[4096];
                         int rdata_len = HexToBin(data_str, rdata, sizeof(rdata));
                         if (rdata_len > 5) { 
-                            int p = 2; // Skip Priority
-                            while (p < rdata_len) { // Skip TargetName
+                            int p = 2; 
+                            while (p < rdata_len) { 
                                 int label_len = rdata[p++];
                                 if (label_len == 0 || p + label_len > rdata_len) break; 
                                 p += label_len;
@@ -266,7 +276,7 @@ unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t
 }
 
 // --------------------------------------------------------------------------
-// 网络请求实现 (针对 Win7 加固版)
+// 核心网络请求实现 (Windows 7 稳定修复版)
 // --------------------------------------------------------------------------
 typedef struct { char host[256]; int port; char path[1024]; } URL_COMPONENTS_SIMPLE;
 
@@ -291,14 +301,18 @@ static char* InternalHttpsGet(const char* url) {
     URL_COMPONENTS_SIMPLE u;
     if (!ParseUrl(url, &u)) return NULL;
 
-    // [关键] 线程安全的上下文初始化，防止多线程同时更新订阅时崩溃
-    if (!g_lock_init) { InitializeCriticalSection(&g_ctx_lock); g_lock_init = TRUE; }
-    EnterCriticalSection(&g_ctx_lock);
-    if (!g_utils_ctx) {
-        g_utils_ctx = SSL_CTX_new(TLS_client_method());
-        if (g_utils_ctx) SSL_CTX_set_verify(g_utils_ctx, SSL_VERIFY_NONE, NULL);
+    // [修复] 原子操作安全初始化上下文，彻底解决 Win7 下的锁初始化竞争崩溃
+    if (g_utils_ctx == NULL) {
+        if (InterlockedCompareExchange(&g_ctx_initializing, 1, 0) == 0) {
+            if (g_utils_ctx == NULL) {
+                g_utils_ctx = SSL_CTX_new(TLS_client_method());
+                if (g_utils_ctx) SSL_CTX_set_verify(g_utils_ctx, SSL_VERIFY_NONE, NULL);
+            }
+            InterlockedExchange(&g_ctx_initializing, 0);
+        } else {
+            while (g_utils_ctx == NULL && g_ctx_initializing == 1) Sleep(10);
+        }
     }
-    LeaveCriticalSection(&g_ctx_lock);
     if (!g_utils_ctx) return NULL;
 
     SOCKET s = INVALID_SOCKET; SSL *ssl = NULL; char* result = NULL;
@@ -310,7 +324,7 @@ static char* InternalHttpsGet(const char* url) {
     s = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
     if (s == INVALID_SOCKET) { freeaddrinfo(res); return NULL; }
     
-    DWORD timeout = 10000; // 增加超时到 10 秒
+    DWORD timeout = 10000;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
     setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
     if (connect(s, res->ai_addr, (int)res->ai_addrlen) != 0) { closesocket(s); freeaddrinfo(res); return NULL; }
@@ -321,24 +335,28 @@ static char* InternalHttpsGet(const char* url) {
     SSL_set_fd(ssl, (int)s); SSL_set_tlsext_host_name(ssl, u.host);
     if (SSL_connect(ssl) != 1) { SSL_free(ssl); closesocket(s); return NULL; }
 
-    // [优化] 仅当访问 DoH 接口时才发送特定的 Accept 头部，下载订阅使用标准头部
+    // [修复] 动态判定 Accept 头部，下载订阅时不强制要求 dns-json，防止部分服务器解析冲突
     const char* accept_header = (strstr(u.path, "dns-query") || strstr(u.path, "name=")) ? 
                                  "Accept: application/dns-json\r\n" : "Accept: */*\r\n";
 
-    char req[2048];
-    snprintf(req, sizeof(req), 
+    char req[4096]; // 增大请求缓冲区
+    int req_len = snprintf(req, sizeof(req), 
         "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mandala-Client/1.0\r\n%sConnection: close\r\n\r\n", 
         u.path, u.host, accept_header);
-    if (SSL_write(ssl, req, (int)strlen(req)) <= 0) goto cleanup;
+    
+    if (req_len < 0 || req_len >= sizeof(req)) goto cleanup; // 长度异常保护
+    
+    if (SSL_write(ssl, req, req_len) <= 0) goto cleanup;
 
-    int total_cap = 131072; // 初始分配 128KB 减少重分配
+    int total_cap = 131072; 
     int total_len = 0;
     char* buf = (char*)malloc(total_cap);
     if (!buf) goto cleanup;
 
     while (1) {
         if (total_len >= total_cap - 2048) {
-            total_cap *= 2; char* new_buf = (char*)realloc(buf, total_cap);
+            total_cap *= 2; 
+            char* new_buf = (char*)realloc(buf, total_cap);
             if (!new_buf) { free(buf); buf = NULL; goto cleanup; }
             buf = new_buf;
         }
@@ -348,14 +366,15 @@ static char* InternalHttpsGet(const char* url) {
     }
 
     if (buf) {
-        buf[total_len] = 0; char* body_pos = strstr(buf, "\r\n\r\n");
+        buf[total_len] = 0; 
+        char* body_pos = strstr(buf, "\r\n\r\n");
         if (body_pos) { 
             body_pos += 4;
             int body_len = total_len - (int)(body_pos - buf);
-            result = SafeStrDup(body_pos, body_len); // 二进制安全拷贝
+            result = SafeStrDup(body_pos, body_len); // 安全内存拷贝
             free(buf); 
         } else { 
-            result = buf; // 没找到头则返回全部
+            result = buf; 
         }
     }
 cleanup:
@@ -369,6 +388,9 @@ char* Utils_HttpGet(const char* url) {
     return InternalHttpsGet(url);
 }
 
+// --------------------------------------------------------------------------
+// 剪贴板工具
+// --------------------------------------------------------------------------
 char* GetClipboardText() {
     if (!OpenClipboard(NULL)) return NULL;
     HANDLE hData = GetClipboardData(CF_TEXT);
@@ -381,7 +403,7 @@ char* GetClipboardText() {
 }
 
 // --------------------------------------------------------------------------
-// 代理设置与查询
+// 代理设置逻辑 (保持不变)
 // --------------------------------------------------------------------------
 void SetSystemProxy(BOOL enable) {
     extern int g_localPort;
