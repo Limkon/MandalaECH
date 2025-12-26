@@ -415,7 +415,10 @@ BOOL AddNodeToConfig(cJSON* newNode) {
     char* uniqueTag = GetUniqueTagName(outbounds, typeStr, originalTag);
     if (cJSON_HasObjectItem(newNode, "tag")) cJSON_ReplaceItemInObject(newNode, "tag", cJSON_CreateString(uniqueTag));
     else cJSON_AddStringToObject(newNode, "tag", uniqueTag);
-    cJSON_AddItemToObject(outbounds, newNode);
+    
+    // [Fix] 使用 cJSON_AddItemToArray 替代 cJSON_AddItemToObject，修复编译错误
+    cJSON_AddItemToArray(outbounds, newNode);
+    
     char* out = cJSON_Print(root); BOOL ret = WriteBufferToFile(CONFIG_FILE, out); free(out); cJSON_Delete(root);
     return ret;
 }
@@ -461,7 +464,9 @@ int Internal_BatchAddNodesFromText(const char* text, cJSON* outbounds) {
                     char* uniqueTag = GetUniqueTagName(outbounds, typeStr, originalTag);
                     if (cJSON_HasObjectItem(node, "tag")) cJSON_ReplaceItemInObject(node, "tag", cJSON_CreateString(uniqueTag));
                     else cJSON_AddStringToObject(node, "tag", uniqueTag);
-                    cJSON_AddItemToObject(outbounds, node); count++;
+                    
+                    // [Fix] 使用 cJSON_AddItemToArray 替代 cJSON_AddItemToObject，修复编译错误
+                    cJSON_AddItemToArray(outbounds, node); count++;
                 }
             }
             free(line);
