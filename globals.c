@@ -70,7 +70,7 @@ char g_userAgentStr[512] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKi
 // 1. 默认开启 ECH
 // 2. 默认 DoH 改为 Cloudflare (兼容性更好)
 // 3. 默认 Public Name 改为 cloudflare-ech.com
-BOOL g_enableECH = TRUE; 
+BOOL g_enableECH = FALSE; 
 char g_echConfigServer[256] = "https://1.1.1.1/dns-query"; 
 char g_echPublicName[256] = "cloudflare-ech.com"; 
 
