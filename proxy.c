@@ -3,7 +3,9 @@
 #include "utils.h"
 #include "common.h"
 #include <openssl/sha.h>
+#include <openssl/rand.h> // [Fix] 引入 RAND_bytes
 #include <stdio.h>
+#include <process.h>      // [Fix] 引入 process.h
 
 static volatile LONG g_active_connections = 0;
 
@@ -83,7 +85,8 @@ void base64_encode_key(const unsigned char* src, char* dst) {
     *(dst-1) = '='; *dst = 0;
 }
 
-DWORD WINAPI client_handler(LPVOID p) {
+// [Fix] 使用 unsigned __stdcall 匹配 _beginthreadex
+unsigned __stdcall client_handler(void* p) {
     InterlockedIncrement(&g_active_connections);
     ClientContext* ctx = (ClientContext*)p;
     if (!ctx) { InterlockedDecrement(&g_active_connections); return 0; }
@@ -167,7 +170,9 @@ DWORD WINAPI client_handler(LPVOID p) {
     const char* sni_val = (strlen(localConfig.sni) > 0) ? localConfig.sni : localConfig.host;
     const char* req_path = (strlen(localConfig.path) > 0) ? localConfig.path : "/";
     unsigned char rnd_key[16]; char ws_key_str[32];
-    for(int i=0; i<16; i++) rnd_key[i] = rand() % 256;
+    
+    // [Fix] 使用 RAND_bytes 替代 rand()，更安全且避免 CRT 状态问题
+    RAND_bytes(rnd_key, 16);
     base64_encode_key(rnd_key, ws_key_str);
 
     int offset = snprintf(ws_send_buf, IO_BUFFER_SIZE, "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n", req_path, sni_val, localUserAgent, ws_key_str);
@@ -201,9 +206,16 @@ DWORD WINAPI client_handler(LPVOID p) {
         char hex_pass[128]; trojan_password_hash(localConfig.pass, hex_pass);
         if (is_mandala) { 
             unsigned char salt[4], plaintext[2048]; int p_len = 0;
-            for(int i=0; i<4; i++) salt[i] = rand() % 256;
+            // [Fix] 使用 RAND_bytes
+            RAND_bytes(salt, 4);
             memcpy(plaintext, hex_pass, 56); p_len = 56;
-            int pad = rand() % 16; plaintext[p_len++] = (unsigned char)pad; for(int i=0; i<pad; i++) plaintext[p_len++] = rand() % 256;
+            unsigned char pad_byte; RAND_bytes(&pad_byte, 1);
+            int pad = pad_byte % 16; plaintext[p_len++] = (unsigned char)pad; 
+            if(pad > 0) {
+                unsigned char pad_buf[16]; RAND_bytes(pad_buf, pad);
+                memcpy(plaintext + p_len, pad_buf, pad); p_len += pad;
+            }
+            
             plaintext[p_len++] = 0x01; 
             if (inet_pton(AF_INET, host, &ip4) == 1) { plaintext[p_len++] = 0x01; memcpy(plaintext + p_len, &ip4, 4); p_len += 4; } 
             else if (inet_pton(AF_INET6, host, &ip6) == 1) { plaintext[p_len++] = 0x04; memcpy(plaintext + p_len, &ip6, 16); p_len += 16; } 
@@ -325,7 +337,8 @@ cl_end:
     return 0;
 }
 
-DWORD WINAPI server_thread(LPVOID p) {
+// [Fix] 使用 unsigned __stdcall 匹配 _beginthreadex
+unsigned __stdcall server_thread(void* p) {
     g_listen_sock = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET; addr.sin_port = htons(g_localPort); addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -354,7 +367,9 @@ DWORD WINAPI server_thread(LPVOID p) {
                 ctx->cryptoSettings.enableChromeCiphers = g_enableChromeCiphers;
                 ctx->cryptoSettings.enableECH = g_enableECH;
                 LeaveCriticalSection(&g_configLock);
-                HANDLE hClient = CreateThread(NULL, 0, client_handler, (LPVOID)ctx, 0, NULL);
+                
+                // [Fix] 使用 _beginthreadex 创建线程，确保 CRT 初始化
+                HANDLE hClient = (HANDLE)_beginthreadex(NULL, 0, client_handler, (void*)ctx, 0, NULL);
                 if (hClient) CloseHandle(hClient); else { free(ctx); closesocket(c); }
             } else { closesocket(c); }
         } else break;
@@ -365,7 +380,8 @@ DWORD WINAPI server_thread(LPVOID p) {
 void StartProxyCore() {
     if (g_proxyRunning) return;
     g_proxyRunning = TRUE;
-    hProxyThread = CreateThread(NULL, 0, server_thread, NULL, 0, NULL);
+    // [Fix] 使用 _beginthreadex
+    hProxyThread = (HANDLE)_beginthreadex(NULL, 0, server_thread, NULL, 0, NULL);
     if (!hProxyThread) g_proxyRunning = FALSE;
 }
 
