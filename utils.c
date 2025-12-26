@@ -1,84 +1,107 @@
 #include "utils.h"
+#include "common.h"
+#include "cJSON.h"
+#include <windows.h>
+#include <wininet.h>
+#include <shlobj.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <windows.h>
-#include <wininet.h>
-#include <ctype.h> 
 
-// 引入 BoringSSL/OpenSSL 头文件
-#include <openssl/ssl.h>
-#include <openssl/err.h>
-
-#include "crypto.h"
-#include "common.h"
-#include "gui.h" 
-#include "cJSON.h" 
-
-#pragma comment(lib, "ws2_32.lib")
-#pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "wininet.lib")
+#pragma comment(lib, "user32.lib")
 
-// [Fix] 修复部分 MinGW 环境缺少宏定义导致的编译错误
-#ifndef INTERNET_OPTION_SECURITY_PROTOCOLS
-#define INTERNET_OPTION_SECURITY_PROTOCOLS 31
-#endif
+// --- 字符编码转换工具 ---
 
-// 全局 SSL 上下文与原子锁
-static SSL_CTX* g_utils_ctx = NULL;
-static volatile LONG g_ctx_init_state = 0; // 0:未初始化, 1:初始化中, 2:已完成
-
-// --------------------------------------------------------------------------
-// 基础工具函数
-// --------------------------------------------------------------------------
-
-BOOL IsWindows8OrGreater() {
-    HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
-    if (hKernel32 == NULL) return FALSE;
-    FARPROC pFunc = GetProcAddress(hKernel32, "SetProcessMitigationPolicy");
-    return (pFunc != NULL);
+wchar_t* UTF8ToWide(const char* str) {
+    if (!str) return NULL;
+    int len = MultiByteToWideChar(CP_UTF8, 0, str, -1, NULL, 0);
+    if (len == 0) return NULL;
+    wchar_t* wstr = (wchar_t*)malloc(len * sizeof(wchar_t));
+    if (wstr) MultiByteToWideChar(CP_UTF8, 0, str, -1, wstr, len);
+    return wstr;
 }
 
-// 兼容旧版系统的安全内存拷贝
-static char* SafeStrDup(const char* s, int len) {
-    if (!s || len < 0) return NULL;
-    char* d = (char*)malloc(len + 1);
-    if (d) {
-        memcpy(d, s, len);
-        d[len] = 0;
+char* WideToUTF8(const wchar_t* wstr) {
+    if (!wstr) return NULL;
+    int len = WideCharToMultiByte(CP_UTF8, 0, wstr, -1, NULL, 0, NULL, NULL);
+    if (len == 0) return NULL;
+    char* str = (char*)malloc(len);
+    if (str) WideCharToMultiByte(CP_UTF8, 0, wstr, -1, str, len, NULL, NULL);
+    return str;
+}
+
+// --- Base64 工具 (支持标准和 URL-Safe) ---
+
+static const char base64_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+char* Base64Encode(const unsigned char* data, size_t input_length) {
+    size_t output_length = 4 * ((input_length + 2) / 3);
+    char* encoded_data = (char*)malloc(output_length + 1);
+    if (encoded_data == NULL) return NULL;
+
+    for (size_t i = 0, j = 0; i < input_length;) {
+        uint32_t octet_a = i < input_length ? (unsigned char)data[i++] : 0;
+        uint32_t octet_b = i < input_length ? (unsigned char)data[i++] : 0;
+        uint32_t octet_c = i < input_length ? (unsigned char)data[i++] : 0;
+        uint32_t triple = (octet_a << 0x10) + (octet_b << 0x08) + octet_c;
+
+        encoded_data[j++] = base64_chars[(triple >> 3 * 6) & 0x3F];
+        encoded_data[j++] = base64_chars[(triple >> 2 * 6) & 0x3F];
+        encoded_data[j++] = base64_chars[(triple >> 1 * 6) & 0x3F];
+        encoded_data[j++] = base64_chars[(triple >> 0 * 6) & 0x3F];
     }
-    return d;
+
+    for (int i = 0; i < (int)(3 - input_length % 3) % 3; i++)
+        encoded_data[output_length - 1 - i] = '=';
+
+    encoded_data[output_length] = '\0';
+    return encoded_data;
 }
 
-void log_msg(const char *format, ...) {
-    if (!g_enableLog && strstr(format, "[Fatal]") == NULL) return;
-    char buf[2048]; char time_buf[64]; SYSTEMTIME st;
-    GetLocalTime(&st);
-    snprintf(time_buf, sizeof(time_buf), "[%02d:%02d:%02d] ", st.wHour, st.wMinute, st.wSecond);
-    va_list args; va_start(args, format);
-    vsnprintf(buf, sizeof(buf) - 64, format, args);
-    va_end(args);
-    char final_msg[2200];
-    snprintf(final_msg, sizeof(final_msg), "%s%s\r\n", time_buf, buf);
-    OutputDebugStringA(final_msg);
-    extern HWND hLogViewerWnd; 
-    if (hLogViewerWnd && IsWindow(hLogViewerWnd)) {
-        int wLen = MultiByteToWideChar(CP_UTF8, 0, final_msg, -1, NULL, 0);
-        wchar_t* wBuf = (wchar_t*)malloc((wLen + 1) * sizeof(wchar_t));
-        if (wBuf) {
-            MultiByteToWideChar(CP_UTF8, 0, final_msg, -1, wBuf, wLen);
-            wBuf[wLen] = 0;
-            PostMessageW(hLogViewerWnd, WM_LOG_UPDATE, 0, (LPARAM)wBuf);
-        }
+static int is_base64(unsigned char c) {
+    return (isalnum(c) || (c == '+') || (c == '/'));
+}
+
+unsigned char* Base64Decode(const char* data, size_t* out_len) {
+    if (!data) return NULL;
+    size_t input_length = strlen(data);
+    
+    // URL-Safe Base64 兼容处理 (- -> +, _ -> /)
+    char* temp_data = _strdup(data);
+    if (!temp_data) return NULL;
+    for (size_t i = 0; i < input_length; i++) {
+        if (temp_data[i] == '-') temp_data[i] = '+';
+        else if (temp_data[i] == '_') temp_data[i] = '/';
     }
+
+    int padding = 0;
+    if (input_length > 0 && temp_data[input_length - 1] == '=') padding++;
+    if (input_length > 1 && temp_data[input_length - 2] == '=') padding++;
+
+    size_t output_length = (input_length / 4) * 3 - padding;
+    unsigned char* decoded_data = (unsigned char*)malloc(output_length + 1);
+    if (decoded_data == NULL) { free(temp_data); return NULL; }
+
+    for (size_t i = 0, j = 0; i < input_length;) {
+        uint32_t sextet_a = data[i] == '=' ? 0 & i++ : strchr(base64_chars, temp_data[i++]) - base64_chars;
+        uint32_t sextet_b = data[i] == '=' ? 0 & i++ : strchr(base64_chars, temp_data[i++]) - base64_chars;
+        uint32_t sextet_c = data[i] == '=' ? 0 & i++ : strchr(base64_chars, temp_data[i++]) - base64_chars;
+        uint32_t sextet_d = data[i] == '=' ? 0 & i++ : strchr(base64_chars, temp_data[i++]) - base64_chars;
+        uint32_t triple = (sextet_a << 3 * 6) + (sextet_b << 2 * 6) + (sextet_c << 1 * 6) + (sextet_d << 0 * 6);
+
+        if (j < output_length) decoded_data[j++] = (triple >> 2 * 8) & 0xFF;
+        if (j < output_length) decoded_data[j++] = (triple >> 1 * 8) & 0xFF;
+        if (j < output_length) decoded_data[j++] = (triple >> 0 * 8) & 0xFF;
+    }
+
+    decoded_data[output_length] = '\0';
+    if (out_len) *out_len = output_length;
+    free(temp_data);
+    return decoded_data;
 }
 
-// --------------------------------------------------------------------------
-// 文件 IO 操作
-// --------------------------------------------------------------------------
+// --- 文件操作 ---
 
 BOOL ReadFileToBuffer(const wchar_t* filename, char** buffer, long* size) {
     FILE* f = _wfopen(filename, L"rb");
@@ -86,349 +109,251 @@ BOOL ReadFileToBuffer(const wchar_t* filename, char** buffer, long* size) {
     fseek(f, 0, SEEK_END);
     long fsize = ftell(f);
     fseek(f, 0, SEEK_SET);
+    
     *buffer = (char*)malloc(fsize + 1);
     if (!*buffer) { fclose(f); return FALSE; }
+    
     fread(*buffer, 1, fsize, f);
     (*buffer)[fsize] = 0;
-    if (size) *size = fsize;
     fclose(f);
+    if (size) *size = fsize;
     return TRUE;
 }
 
 BOOL WriteBufferToFile(const wchar_t* filename, const char* buffer) {
     FILE* f = _wfopen(filename, L"wb");
     if (!f) return FALSE;
-    size_t len = strlen(buffer);
-    fwrite(buffer, 1, len, f);
+    fwrite(buffer, 1, strlen(buffer), f);
     fclose(f);
     return TRUE;
 }
 
-// --------------------------------------------------------------------------
-// 字符串处理工具
-// --------------------------------------------------------------------------
+// --- 剪贴板 ---
+
+char* GetClipboardText() {
+    if (!OpenClipboard(NULL)) return NULL;
+    HANDLE hData = GetClipboardData(CF_TEXT);
+    if (hData == NULL) { CloseClipboard(); return NULL; }
+    char* pszText = (char*)GlobalLock(hData);
+    if (pszText == NULL) { CloseClipboard(); return NULL; }
+    char* text = _strdup(pszText);
+    GlobalUnlock(hData);
+    CloseClipboard();
+    return text;
+}
+
+// --- 字符串与 URL 处理 ---
 
 void TrimString(char* str) {
     if (!str) return;
     char* p = str;
-    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
-    if (p > str) memmove(str, p, strlen(p) + 1);
-    char* pEnd = str + strlen(str) - 1;
-    while (pEnd >= str && (*pEnd == ' ' || *pEnd == '\t' || *pEnd == '\r' || *pEnd == '\n')) *pEnd-- = 0;
+    char* l = str + strlen(str) - 1;
+    while(isspace(*p)) p++;
+    while(l > p && isspace(*l)) l--;
+    *(l + 1) = 0;
+    if(p != str) memmove(str, p, strlen(p) + 1);
 }
 
+// 简易 URL 解码 ( %xx -> char )
 void UrlDecode(char* dst, const char* src) {
     char a, b;
     while (*src) {
-        if ((*src == '%') && ((a = src[1]) && (b = src[2])) && (isxdigit(a) && isxdigit(b))) {
-            if (a >= 'a') a -= 'a' - 10; else if (a >= 'A') a -= 'A' - 10; else a -= '0';
-            if (b >= 'a') b -= 'a' - 10; else if (b >= 'A') b -= 'A' - 10; else b -= '0';
-            *dst++ = 16 * a + b; src += 3;
-        } else if (*src == '+') { *dst++ = ' '; src++; }
-        else { *dst++ = *src++; }
+        if ((*src == '%') &&
+            ((a = src[1]) && (b = src[2])) &&
+            (isxdigit(a) && isxdigit(b))) {
+            if (a >= 'a') a -= 'a' - 'A';
+            if (a >= 'A') a -= ('A' - 10);
+            else a -= '0';
+            if (b >= 'a') b -= 'a' - 'A';
+            if (b >= 'A') b -= ('A' - 10);
+            else b -= '0';
+            *dst++ = 16 * a + b;
+            src += 3;
+        } else if (*src == '+') {
+            *dst++ = ' ';
+            src++;
+        } else {
+            *dst++ = *src++;
+        }
     }
     *dst++ = '\0';
 }
 
 char* GetQueryParam(const char* query, const char* key) {
     if (!query || !key) return NULL;
-    char search[128]; snprintf(search, sizeof(search), "%s=", key);
-    const char* p = strstr(query, search);
-    if (!p) return NULL;
-    if (p != query && *(p-1) != '&' && *(p-1) != '?') return NULL; 
-    p += strlen(search);
-    const char* end_amp = strchr(p, '&');
-    const char* end_hash = strchr(p, '#');
-    const char* end = (end_amp && end_hash) ? (end_amp < end_hash ? end_amp : end_hash) : (end_amp ? end_amp : end_hash);
-    int len = end ? (int)(end - p) : (int)strlen(p);
-    if (len <= 0) return NULL;
-    char* val = (char*)malloc(len + 1);
-    if (val) { strncpy(val, p, len); val[len] = 0; }
-    return val;
+    char keyEq[64]; snprintf(keyEq, 64, "%s=", key);
+    const char* start = query;
+    while ((start = strstr(start, keyEq)) != NULL) {
+        if (start == query || *(start-1) == '&' || *(start-1) == '?') {
+            start += strlen(keyEq);
+            const char* end = strpbrk(start, "&");
+            int len = end ? (int)(end - start) : (int)strlen(start);
+            char* val = (char*)malloc(len + 1);
+            strncpy(val, start, len); val[len] = 0;
+            return val;
+        }
+        start++;
+    }
+    return NULL;
 }
 
-// --------------------------------------------------------------------------
-// ECH / Base64 / Hex 核心工具
-// --------------------------------------------------------------------------
+// --- 网络请求 (WinInet) ---
 
-static const int b64_table[] = {
-    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
-    52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1,
-    -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
-    15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
-    -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
-    41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1
-};
+char* Utils_HttpGet(const char* url) {
+    HINTERNET hInet, hFile;
+    char* result = NULL;
+    
+    // 使用全局配置的 UserAgent
+    char ua[512];
+    strncpy(ua, g_userAgentStr, 511); ua[511] = 0;
+    if (strlen(ua) == 0) strcpy(ua, "Mandala/1.0");
 
-unsigned char* Base64Decode(const char* input, size_t* out_len) {
-    size_t len = strlen(input);
-    size_t out_size = len / 4 * 3;
-    unsigned char* out = (unsigned char*)malloc(out_size + 1);
-    if (!out) return NULL;
-    size_t i = 0, j = 0;
-    while (i < len) {
-        if (input[i] == '\r' || input[i] == '\n' || input[i] == ' ') { i++; continue; } 
-        if (input[i] == '=') break; 
-        unsigned char a = (unsigned char)input[i];
-        unsigned char b = (unsigned char)input[i+1];
-        unsigned char c = (unsigned char)input[i+2];
-        unsigned char d = (unsigned char)input[i+3];
-        if (i + 1 >= len) break;
-        if (a > 127 || b64_table[a] == -1 || b > 127 || b64_table[b] == -1) break;
-        uint32_t n = (b64_table[a] << 18) | (b64_table[b] << 12);
-        out[j++] = (n >> 16) & 0xFF;
-        if (i + 2 < len && c != '=' && c < 128 && b64_table[c] != -1) {
-            n |= (b64_table[c] << 6); out[j++] = (n >> 8) & 0xFF;
-            if (i + 3 < len && d != '=' && d < 128 && b64_table[d] != -1) {
-                n |= b64_table[d]; out[j++] = n & 0xFF;
+    hInet = InternetOpenA(ua, INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
+    if (!hInet) return NULL;
+
+    DWORD timeout = 5000;
+    InternetSetOption(hInet, INTERNET_OPTION_CONNECT_TIMEOUT, &timeout, sizeof(DWORD));
+    InternetSetOption(hInet, INTERNET_OPTION_RECEIVE_TIMEOUT, &timeout, sizeof(DWORD));
+
+    // 强制使用 TLS 1.2/1.3
+    DWORD flags = INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_SECURE;
+    hFile = InternetOpenUrlA(hInet, url, NULL, 0, flags, 0);
+    if (hFile) {
+        DWORD read = 0;
+        DWORD size = 0;
+        DWORD capacity = 4096;
+        result = (char*)malloc(capacity);
+        
+        while (InternetReadFile(hFile, result + size, 2048, &read) && read > 0) {
+            size += read;
+            if (size + 2048 > capacity) {
+                capacity *= 2;
+                char* temp = (char*)realloc(result, capacity);
+                if (!temp) { free(result); result = NULL; break; }
+                result = temp;
             }
         }
-        i += 4;
+        if (result) result[size] = 0;
+        InternetCloseHandle(hFile);
+    } else {
+        // Log Error?
     }
-    out[j] = 0; if (out_len) *out_len = j;
-    return out;
+    InternetCloseHandle(hInet);
+    return result;
 }
 
-static int HexToBin(const char* hex, unsigned char* out, int max_len) {
-    int len = 0;
-    while (*hex && len < max_len) {
-        if (!isxdigit(*hex)) { hex++; continue; }
-        int v1 = isdigit(*hex) ? *hex - '0' : tolower(*hex) - 'a' + 10;
-        hex++; if (!*hex) break;
-        int v2 = isdigit(*hex) ? *hex - '0' : tolower(*hex) - 'a' + 10;
-        out[len++] = (v1 << 4) | v2; hex++;
+// --- ECH 配置获取 (DoH) ---
+
+// 辅助：解析 Hex 字符串
+static unsigned char* hex_to_bytes(const char* hex, int* out_len) {
+    if (!hex) return NULL;
+    int len = strlen(hex);
+    if (len % 2 != 0) return NULL;
+    *out_len = len / 2;
+    unsigned char* buf = (unsigned char*)malloc(*out_len);
+    for (int i = 0; i < *out_len; i++) {
+        sscanf(hex + i*2, "%2hhx", &buf[i]);
     }
-    return len;
+    return buf;
 }
 
+// 解析 HTTPS (Type 65) 记录中的 ECH Config
+// 格式通常为: \# <len> <hex_data>
+// hex_data 结构 (RFC 9460): [Priority 2B] [TargetName (Root=00)] [Params...]
+// Param Key 5 = ECH
+static unsigned char* ExtractECHFromDoHAnswer(const char* rdata_hex, size_t* out_ech_len) {
+    int rdata_len = 0;
+    unsigned char* rdata = hex_to_bytes(rdata_hex, &rdata_len);
+    if (!rdata) return NULL;
+
+    unsigned char* p = rdata;
+    unsigned char* end = rdata + rdata_len;
+    unsigned char* result = NULL;
+
+    // Skip Priority (2)
+    if (p + 2 > end) goto cleanup;
+    p += 2;
+
+    // Skip Target Name (假设是 Root 0x00，或者简单的 format)
+    // 实际上 TargetName 是 wire-format domain name。如果第一字节是 0，则为 root。
+    if (p >= end) goto cleanup;
+    if (*p == 0) {
+        p++; // Root
+    } else {
+        // 简单跳过：循环直到 0 或指针越界 (注意：这种跳过不严谨，但处理常见 DoH 响应足够)
+        while(p < end && *p != 0) {
+            int label_len = *p;
+            if (p + 1 + label_len > end) goto cleanup;
+            p += 1 + label_len;
+        }
+        if (p < end) p++; // Skip null terminator
+    }
+
+    // Parse Params (Key=2B, Len=2B, Value)
+    while (p + 4 <= end) {
+        int key = (p[0] << 8) | p[1];
+        int vlen = (p[2] << 8) | p[3];
+        p += 4;
+        
+        if (p + vlen > end) goto cleanup;
+
+        if (key == 5) { // ECH Config Key
+            result = (unsigned char*)malloc(vlen);
+            if (result) {
+                memcpy(result, p, vlen);
+                *out_ech_len = vlen;
+            }
+            goto cleanup; // Found
+        }
+        p += vlen;
+    }
+
+cleanup:
+    free(rdata);
+    return result;
+}
+
+// 通过 DoH 获取 ECH 配置
+// 返回 raw bytes，caller 需 free
 unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t* out_len) {
     if (!domain || !doh_server) return NULL;
-    char url[2048]; snprintf(url, sizeof(url), "%s?name=%s&type=65", doh_server, domain);
-    char* json_str = Utils_HttpGet(url);
-    if (!json_str) return NULL;
-    cJSON* root = cJSON_Parse(json_str); free(json_str);
-    if (!root) return NULL;
-    unsigned char* ech_config = NULL; *out_len = 0;
-    cJSON* answer = cJSON_GetObjectItem(root, "Answer");
-    if (answer && cJSON_IsArray(answer)) {
-        int array_size = cJSON_GetArraySize(answer);
-        for (int i = 0; i < array_size; i++) {
-            cJSON* record = cJSON_GetArrayItem(answer, i);
-            if (!record) continue;
-            cJSON* type = cJSON_GetObjectItem(record, "type");
-            if (type && type->valueint == 65) { 
-                cJSON* data = cJSON_GetObjectItem(record, "data");
-                if (data && data->valuestring) {
-                    const char* data_str = data->valuestring;
-                    const char* ech_pos = strstr(data_str, "ech=\"");
-                    if (ech_pos) {
-                        ech_pos += 5; const char* end_quote = strchr(ech_pos, '\"');
-                        if (end_quote) {
-                            size_t b64_len = end_quote - ech_pos;
-                            char* b64_str = (char*)malloc(b64_len + 1);
-                            if (b64_str) {
-                                strncpy(b64_str, ech_pos, b64_len); b64_str[b64_len] = 0;
-                                ech_config = Base64Decode(b64_str, out_len); free(b64_str);
-                                if (ech_config) break; 
-                            }
-                        }
-                    }
-                    if (!ech_config) {
-                        unsigned char rdata[4096];
-                        int rdata_len = HexToBin(data_str, rdata, sizeof(rdata));
-                        if (rdata_len > 5) { 
-                            int p = 2; 
-                            while (p < rdata_len) { 
-                                int label_len = rdata[p++];
-                                if (label_len == 0 || p + label_len > rdata_len) break; 
-                                p += label_len;
-                            }
-                            while (p + 4 <= rdata_len) {
-                                int key = (rdata[p] << 8) | rdata[p+1];
-                                int len = (rdata[p+2] << 8) | rdata[p+3];
-                                p += 4;
-                                if (key == 5 && p + len <= rdata_len) { 
-                                    ech_config = (unsigned char*)malloc(len);
-                                    if (ech_config) { memcpy(ech_config, rdata + p, len); *out_len = len; }
-                                    break; 
-                                }
-                                p += len;
+    
+    char url[1024];
+    // 使用 Google/Cloudflare JSON DNS API 格式
+    // type=65 (HTTPS)
+    snprintf(url, sizeof(url), "%s?name=%s&type=65&ct=application/dns-json", doh_server, domain);
+    
+    char* json_res = Utils_HttpGet(url);
+    if (!json_res) return NULL;
+    
+    unsigned char* ech_config = NULL;
+    cJSON* root = cJSON_Parse(json_res);
+    if (root) {
+        cJSON* answers = cJSON_GetObjectItem(root, "Answer");
+        if (cJSON_IsArray(answers)) {
+            cJSON* item = NULL;
+            cJSON_ArrayForEach(item, answers) {
+                cJSON* type = cJSON_GetObjectItem(item, "type");
+                if (type && type->valueint == 65) {
+                    cJSON* data = cJSON_GetObjectItem(item, "data");
+                    if (data && cJSON_IsString(data)) {
+                        const char* txt = data->valuestring;
+                        // Cloudflare JSON 格式: "\# <length> <hex>"
+                        if (strncmp(txt, "\\#", 2) == 0) {
+                            const char* hex_start = strrchr(txt, ' ');
+                            if (hex_start) {
+                                hex_start++; // Skip space
+                                ech_config = ExtractECHFromDoHAnswer(hex_start, out_len);
+                                if (ech_config) break;
                             }
                         }
                     }
                 }
             }
-            if (ech_config) break; 
         }
+        cJSON_Delete(root);
     }
-    cJSON_Delete(root); return ech_config;
-}
-
-// --------------------------------------------------------------------------
-// 双网络引擎实现 (核心兼容方案)
-// --------------------------------------------------------------------------
-
-typedef struct { char host[256]; int port; char path[1024]; } URL_COMPONENTS_SIMPLE;
-
-static BOOL ParseUrl(const char* url, URL_COMPONENTS_SIMPLE* out) {
-    if (!url || !out) return FALSE;
-    memset(out, 0, sizeof(URL_COMPONENTS_SIMPLE));
-    const char* p = url;
-    if (strncmp(p, "http://", 7) == 0) { p += 7; out->port = 80; }
-    else if (strncmp(p, "https://", 8) == 0) { p += 8; out->port = 443; }
-    else return FALSE;
-    const char* slash = strchr(p, '/');
-    int hostLen = slash ? (int)(slash - p) : (int)strlen(p);
-    if (hostLen >= (int)sizeof(out->host)) return FALSE;
-    strncpy(out->host, p, hostLen); out->host[hostLen] = 0;
-    char* colon = strchr(out->host, ':');
-    if (colon) { *colon = 0; out->port = atoi(colon + 1); }
-    if (slash) strncpy(out->path, slash, sizeof(out->path)-1); else strcpy(out->path, "/");
-    return TRUE;
-}
-
-// 引擎 A：WinInet 引擎，专用于 Windows 7 下载大型订阅，绝对稳定
-static char* InternalWinInetGet(const char* url) {
-    char* result = NULL;
-    HINTERNET hInternet = InternetOpenW(L"Mandala/1.0", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
-    if (!hInternet) return NULL;
-
-    // [核心修复] 强制 Windows 7 开启 TLS 1.1 和 TLS 1.2 支持，解决返回 0 节点问题
-    DWORD protocols = 0x00000080 | 0x00000200 | 0x00000800; // TLS 1.0, 1.1, 1.2
-    InternetSetOptionW(hInternet, INTERNET_OPTION_SECURITY_PROTOCOLS, &protocols, sizeof(protocols));
-
-    DWORD timeout = 10000;
-    InternetSetOptionW(hInternet, INTERNET_OPTION_CONNECT_TIMEOUT, &timeout, sizeof(DWORD));
-
-    HINTERNET hFile = InternetOpenUrlA(hInternet, url, NULL, 0, 
-        INTERNET_FLAG_RELOAD | INTERNET_FLAG_SECURE | INTERNET_FLAG_IGNORE_CERT_CN_INVALID, 0);
     
-    if (hFile) {
-        int capacity = 256 * 1024; // 256KB 初始缓冲
-        char* buf = (char*)malloc(capacity);
-        DWORD bytesRead = 0, totalRead = 0;
-        
-        while (InternetReadFile(hFile, buf + totalRead, capacity - totalRead - 1, &bytesRead) && bytesRead > 0) {
-            totalRead += bytesRead;
-            if (totalRead >= (DWORD)capacity - 1024) {
-                capacity *= 2;
-                char* newBuf = (char*)realloc(buf, capacity);
-                if (!newBuf) { free(buf); buf = NULL; break; }
-                buf = newBuf;
-            }
-        }
-        if (buf) { buf[totalRead] = 0; result = SafeStrDup(buf, totalRead); free(buf); }
-        InternetCloseHandle(hFile);
-    }
-    InternetCloseHandle(hInternet);
-    return result;
-}
-
-// 引擎 B：BoringSSL 引擎，仅用于 DoH 查询 (支持自定义头部)
-static char* InternalBoringSSLGet(const char* url) {
-    URL_COMPONENTS_SIMPLE u;
-    if (!ParseUrl(url, &u)) return NULL;
-
-    if (g_utils_ctx == NULL) {
-        if (InterlockedCompareExchange(&g_ctx_init_state, 1, 0) == 0) {
-            g_utils_ctx = SSL_CTX_new(TLS_client_method());
-            if (g_utils_ctx) SSL_CTX_set_verify(g_utils_ctx, SSL_VERIFY_NONE, NULL);
-            InterlockedExchange(&g_ctx_init_state, 2);
-        } else { while (g_ctx_init_state != 2) Sleep(10); }
-    }
-    if (!g_utils_ctx) return NULL;
-
-    SOCKET s = INVALID_SOCKET; SSL *ssl = NULL; char* result = NULL;
-    struct addrinfo hints, *res = NULL;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM;
-    char portStr[16]; snprintf(portStr, 16, "%d", u.port);
-    if (getaddrinfo(u.host, portStr, &hints, &res) != 0) return NULL;
-    s = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (s == INVALID_SOCKET) { freeaddrinfo(res); return NULL; }
-    
-    DWORD timeout = 5000;
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
-    if (connect(s, res->ai_addr, (int)res->ai_addrlen) != 0) { closesocket(s); freeaddrinfo(res); return NULL; }
-    freeaddrinfo(res);
-
-    ssl = SSL_new(g_utils_ctx);
-    if (!ssl) { closesocket(s); return NULL; }
-    SSL_set_fd(ssl, (int)s); SSL_set_tlsext_host_name(ssl, u.host);
-    if (SSL_connect(ssl) != 1) { SSL_free(ssl); closesocket(s); return NULL; }
-
-    char* req = (char*)malloc(4096);
-    int req_len = snprintf(req, 4096, "GET %s HTTP/1.1\r\nHost: %s\r\nAccept: application/dns-json\r\nConnection: close\r\n\r\n", u.path, u.host);
-    SSL_write(ssl, req, req_len); free(req);
-
-    int t_cap = 65536, t_len = 0; char* buf = (char*)malloc(t_cap);
-    while (buf) {
-        int n = SSL_read(ssl, buf + t_len, t_cap - t_len - 1);
-        if (n <= 0) break;
-        t_len += n;
-    }
-    if (buf) {
-        buf[t_len] = 0; char* body = strstr(buf, "\r\n\r\n");
-        if (body) { result = SafeStrDup(body + 4, t_len - (int)(body + 4 - buf)); free(buf); } else result = buf;
-    }
-    SSL_shutdown(ssl); SSL_free(ssl); closesocket(s);
-    return result;
-}
-
-// 统一入口：根据 URL 特征分发引擎
-char* Utils_HttpGet(const char* url) {
-    if (!url || strncmp(url, "http", 4) != 0) return NULL;
-    // 只有明确包含 dns-query 的才使用 BoringSSL 引擎
-    if (strstr(url, "/dns-query")) return InternalBoringSSLGet(url);
-    // 其余一律走 WinInet 引擎以保证 Win7 稳定性与 TLS 支持
-    return InternalWinInetGet(url);
-}
-
-// --------------------------------------------------------------------------
-// 其它工具函数
-// --------------------------------------------------------------------------
-
-char* GetClipboardText() {
-    if (!OpenClipboard(NULL)) return NULL;
-    HANDLE hData = GetClipboardData(CF_TEXT);
-    if (!hData) { CloseClipboard(); return NULL; }
-    char* pszText = (char*)GlobalLock(hData);
-    char* text = pszText ? SafeStrDup(pszText, (int)strlen(pszText)) : NULL;
-    GlobalUnlock(hData); CloseClipboard();
-    return text;
-}
-
-void SetSystemProxy(BOOL enable) {
-    extern int g_localPort; if (g_localPort <= 0) g_localPort = 1080;
-    wchar_t proxyServer[256]; swprintf_s(proxyServer, 256, L"127.0.0.1:%d", g_localPort);
-    if (IsWindows8OrGreater()) {
-        HKEY hKey; if (RegCreateKeyExW(HKEY_CURRENT_USER, REG_PATH_PROXY, 0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
-            DWORD dwEn = enable ? 1 : 0; RegSetValueExW(hKey, L"ProxyEnable", 0, REG_DWORD, (BYTE*)&dwEn, sizeof(dwEn));
-            if (enable) {
-                RegSetValueExW(hKey, L"ProxyServer", 0, REG_SZ, (BYTE*)proxyServer, (DWORD)(wcslen(proxyServer)+1)*2);
-                RegSetValueExW(hKey, L"ProxyOverride", 0, REG_SZ, (BYTE*)L"<local>", 16);
-            }
-            RegCloseKey(hKey);
-        }
-    } else {
-        INTERNET_PER_CONN_OPTION_LISTW list; INTERNET_PER_CONN_OPTIONW opts[3];
-        opts[0].dwOption = INTERNET_PER_CONN_FLAGS; opts[0].Value.dwValue = enable ? PROXY_TYPE_PROXY : PROXY_TYPE_DIRECT;
-        opts[1].dwOption = INTERNET_PER_CONN_PROXY_SERVER; opts[1].Value.pszValue = enable ? proxyServer : L"";
-        opts[2].dwOption = INTERNET_PER_CONN_PROXY_BYPASS; opts[2].Value.pszValue = L"<local>";
-        list.dwSize = sizeof(list); list.pszConnection = NULL; list.dwOptionCount = 3; list.pOptions = opts;
-        InternetSetOptionW(NULL, INTERNET_OPTION_PER_CONNECTION_OPTION, &list, sizeof(list));
-    }
-    InternetSetOptionW(NULL, INTERNET_OPTION_SETTINGS_CHANGED, NULL, 0);
-    InternetSetOptionW(NULL, INTERNET_OPTION_REFRESH, NULL, 0);
-}
-
-BOOL IsSystemProxyEnabled() {
-    extern int g_localPort; BOOL en = FALSE; HKEY hKey; DWORD dwEn = 0, dwSz = 4;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_PATH_PROXY, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-        if (RegQueryValueExW(hKey, L"ProxyEnable", NULL, NULL, (BYTE*)&dwEn, &dwSz) == ERROR_SUCCESS && dwEn == 1) en = TRUE;
-        RegCloseKey(hKey);
-    }
-    return en;
+    free(json_res);
+    return ech_config;
 }
