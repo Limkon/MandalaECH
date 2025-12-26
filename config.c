@@ -1,3 +1,7 @@
+{
+type: uploaded file
+fileName: limkon/mandalaech/MandalaECH-7122d9407b2017143273b69534ed549be4b54d52/config.c
+fullContent:
 #include "config.h"
 #include "utils.h"
 #include "proxy.h" 
@@ -144,7 +148,9 @@ void LoadSettings() {
 
     wchar_t wUABuf[512] = {0}; 
     GetPrivateProfileStringW(L"Settings", L"UserAgent", L"", wUABuf, 512, g_iniFilePath);
-    if (wcslen(wUABuf) > 5) WideCharToMultiByte(CP_UTF8, 0, wUABuf, -1, g_userAgentStr, sizeof(g_userAgentStr), NULL, NULL);
+    // [Fix] 这里的 sizeof 是正确的，但为了稳健，确保 NULL 结尾
+    memset(g_userAgentStr, 0, sizeof(g_userAgentStr));
+    if (wcslen(wUABuf) > 5) WideCharToMultiByte(CP_UTF8, 0, wUABuf, -1, g_userAgentStr, sizeof(g_userAgentStr)-1, NULL, NULL);
     else SafeStrCpy(g_userAgentStr, sizeof(g_userAgentStr), UA_TEMPLATES[0]);
 
     GetPrivateProfileStringW(L"Settings", L"LastNode", L"", currentNode, 64, g_iniFilePath);
@@ -265,7 +271,8 @@ void ParseTags() {
 }
 
 char* GetUniqueTagName(cJSON* outbounds, const char* type, const char* base_name) {
-    static char final_tag[512]; char candidate[450];
+    static char final_tag[1024]; // [Fix] 扩大静态缓冲区
+    char candidate[768]; // [Fix] 扩大候选缓冲区
     const char* safe_name = (base_name && strlen(base_name) > 0) ? base_name : "Unnamed";
     char prefix[64]; snprintf(prefix, sizeof(prefix), "%s-", type);
     if (_strnicmp(safe_name, prefix, strlen(prefix)) == 0) snprintf(candidate, sizeof(candidate), "%s", safe_name);
@@ -343,11 +350,15 @@ void SwitchNode(const wchar_t* tag) {
     
     cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
     cJSON* targetNode = NULL;
-    char tagUtf8[256]; WideCharToMultiByte(CP_UTF8, 0, tag, -1, tagUtf8, 256, NULL, NULL);
+    
+    // [Fix] 扩大缓冲区并初始化，防止 UTF-8 转换溢出导致的崩溃
+    char tagUtf8[1024] = {0}; 
+    WideCharToMultiByte(CP_UTF8, 0, tag, -1, tagUtf8, sizeof(tagUtf8) - 1, NULL, NULL);
+    
     cJSON* node;
     cJSON_ArrayForEach(node, outbounds) {
         cJSON* t = cJSON_GetObjectItem(node, "tag");
-        if (t && strcmp(t->valuestring, tagUtf8) == 0) { targetNode = node; break; }
+        if (t && t->valuestring && strcmp(t->valuestring, tagUtf8) == 0) { targetNode = node; break; }
     }
     
     if (targetNode) {
@@ -368,11 +379,15 @@ void DeleteNode(const wchar_t* tag) {
     cJSON* root = cJSON_Parse(buffer); free(buffer);
     if (!root) return;
     cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
-    char tagUtf8[256]; WideCharToMultiByte(CP_UTF8, 0, tag, -1, tagUtf8, 256, NULL, NULL);
+    
+    // [Fix] 扩大缓冲区并初始化
+    char tagUtf8[1024] = {0}; 
+    WideCharToMultiByte(CP_UTF8, 0, tag, -1, tagUtf8, sizeof(tagUtf8) - 1, NULL, NULL);
+    
     int idx = 0; cJSON* node;
     cJSON_ArrayForEach(node, outbounds) {
         cJSON* t = cJSON_GetObjectItem(node, "tag");
-        if (t && strcmp(t->valuestring, tagUtf8) == 0) { cJSON_DeleteItemFromArray(outbounds, idx); break; }
+        if (t && t->valuestring && strcmp(t->valuestring, tagUtf8) == 0) { cJSON_DeleteItemFromArray(outbounds, idx); break; }
         idx++;
     }
     char* out = cJSON_Print(root); WriteBufferToFile(CONFIG_FILE, out); free(out); cJSON_Delete(root);
@@ -795,4 +810,6 @@ cJSON* ParseMandala(const char* link) {
     if (security) free(security);
     
     free(uuid); free(host); free(tag); return outbound;
+}
+
 }
