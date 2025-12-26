@@ -72,7 +72,6 @@ static char* inject_padding(const char* in, int in_len, int* out_len, int pad_mi
     if (!in || in_len < TLS_HEADER_LEN + HANDSHAKE_HEADER_LEN) return NULL;
     
     unsigned char* data = (unsigned char*)in;
-    // 检查 Record Type(0x16 Handshake) 和 Handshake Type(0x01 ClientHello)
     if (data[0] != 0x16 || data[5] != 0x01) return NULL; 
 
     int offset = 43; 
@@ -94,7 +93,6 @@ static char* inject_padding(const char* in, int in_len, int* out_len, int pad_mi
     int ext_total_len = (data[offset] << 8) | data[offset+1];
     offset += 2;
     
-    // 严格校验长度，防止解析错误导致的缓冲区溢出
     if (offset + ext_total_len != in_len - TLS_HEADER_LEN) return NULL;
 
     int range = pad_max - pad_min;
@@ -112,12 +110,10 @@ static char* inject_padding(const char* in, int in_len, int* out_len, int pad_mi
     memcpy(new_buf, in, in_len);
     unsigned char* p = (unsigned char*)new_buf + in_len; 
 
-    // 0x0015 = Padding Extension
     *p++ = 0x00; *p++ = 0x15;
     *p++ = (pad_data_len >> 8) & 0xFF; *p++ = pad_data_len & 0xFF;
     memset(p, 0, pad_data_len);
 
-    // 回填长度字段
     unsigned char* ptr = (unsigned char*)new_buf;
     int old_rec_len = (ptr[3] << 8) | ptr[4];
     int new_rec_len = old_rec_len + pad_ext_len;
@@ -294,17 +290,13 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
     ctx->ssl = SSL_new(g_ssl_ctx);
     if (!ctx->ssl) return -1;
     
-    // [Fix] 手动创建 BIO_new_socket 并设置为 BIO_NOCLOSE (Socket 由外部 closesocket 管理)
-    // 这避免了 SSL_set_fd 自动创建 BIO 带来的所有权混乱问题
+    // [Fix] 手动创建 BIO_new_socket 并设置为 BIO_NOCLOSE
     BIO *sbio = BIO_new_socket((int)ctx->sock, BIO_NOCLOSE);
     if (!sbio) { SSL_free(ctx->ssl); ctx->ssl = NULL; return -1; }
 
-    // [Safety Fix] 临时禁用 ECH 功能，排除网络 fetch 导致的崩溃
-    // ECH 逻辑稍后稳定后再开启
+    // [Safety Fix] 临时禁用 ECH
     /*
-    if (settings && settings->enableECH && g_enableECH) {
-        // ... (ECH Logic) ...
-    }
+    if (settings && settings->enableECH && g_enableECH) { ... }
     */
 
     if (method_frag) {
@@ -313,18 +305,15 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
         
         BIO_set_params(frag, settings);
         
-        // 链式结构: frag -> sbio
+        // [Simplified Chaining Fix]
+        // 1. frag -> sbio (frag owns sbio)
         BIO_push(frag, sbio);
         
-        // [Critical Fix] 增加 sbio 引用计数
-        // SSL 需要拥有 Read BIO (sbio) 的所有权 -> Free 时 Ref 2->1
-        // SSL 需要拥有 Write BIO (frag) 的所有权 -> frag Free 时 Free next(sbio) -> Ref 1->0
-        // 如果不增加引用，sbio 会被释放两次 (Double Free)，导致 Windows 7 立即崩溃
-        BIO_up_ref(sbio);
-        
-        SSL_set_bio(ctx->ssl, sbio, frag);
+        // 2. SSL uses frag for both R/W.
+        // SSL_set_bio automatically handles ref counting for shared BIOs.
+        // It increases frag's ref count correctly.
+        SSL_set_bio(ctx->ssl, frag, frag);
     } else {
-        // 无分片直接连接
         SSL_set_bio(ctx->ssl, sbio, sbio);
     }
     
