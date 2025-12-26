@@ -1,1 +1,0 @@
-gcc main.c resource.res -o limbox.exe -I"C:\Program Files\OpenSSL-Win64\include" -L"C:\Program Files\OpenSSL-Win64\lib\VC\x64\MTd" -l:libssl.lib -l:libcrypto.lib -lws2_32 -lgdi32 -lcomctl32 -lwininet -lcrypt32 -luser32 -mwindows -municode -finput-charset=UTF-8 -static>log.txt 2>&1
