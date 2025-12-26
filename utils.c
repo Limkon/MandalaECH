@@ -7,11 +7,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #pragma comment(lib, "wininet.lib")
 #pragma comment(lib, "user32.lib")
 
-// --- 字符编码转换工具 ---
+// --- 1. 字符编码转换工具 ---
 
 wchar_t* UTF8ToWide(const char* str) {
     if (!str) return NULL;
@@ -31,7 +32,7 @@ char* WideToUTF8(const wchar_t* wstr) {
     return str;
 }
 
-// --- Base64 工具 (支持标准和 URL-Safe) ---
+// --- 2. Base64 工具 (支持标准和 URL-Safe) ---
 
 static const char base64_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -57,10 +58,6 @@ char* Base64Encode(const unsigned char* data, size_t input_length) {
 
     encoded_data[output_length] = '\0';
     return encoded_data;
-}
-
-static int is_base64(unsigned char c) {
-    return (isalnum(c) || (c == '+') || (c == '/'));
 }
 
 unsigned char* Base64Decode(const char* data, size_t* out_len) {
@@ -101,7 +98,7 @@ unsigned char* Base64Decode(const char* data, size_t* out_len) {
     return decoded_data;
 }
 
-// --- 文件操作 ---
+// --- 3. 文件操作 ---
 
 BOOL ReadFileToBuffer(const wchar_t* filename, char** buffer, long* size) {
     FILE* f = _wfopen(filename, L"rb");
@@ -128,7 +125,7 @@ BOOL WriteBufferToFile(const wchar_t* filename, const char* buffer) {
     return TRUE;
 }
 
-// --- 剪贴板 ---
+// --- 4. 剪贴板 ---
 
 char* GetClipboardText() {
     if (!OpenClipboard(NULL)) return NULL;
@@ -142,7 +139,7 @@ char* GetClipboardText() {
     return text;
 }
 
-// --- 字符串与 URL 处理 ---
+// --- 5. 字符串与 URL 处理 ---
 
 void TrimString(char* str) {
     if (!str) return;
@@ -154,7 +151,6 @@ void TrimString(char* str) {
     if(p != str) memmove(str, p, strlen(p) + 1);
 }
 
-// 简易 URL 解码 ( %xx -> char )
 void UrlDecode(char* dst, const char* src) {
     char a, b;
     while (*src) {
@@ -197,7 +193,7 @@ char* GetQueryParam(const char* query, const char* key) {
     return NULL;
 }
 
-// --- 网络请求 (WinInet) ---
+// --- 6. 网络请求 (WinInet) ---
 
 char* Utils_HttpGet(const char* url) {
     HINTERNET hInet, hFile;
@@ -242,7 +238,7 @@ char* Utils_HttpGet(const char* url) {
     return result;
 }
 
-// --- ECH 配置获取 (DoH) ---
+// --- 7. ECH 配置获取 (DoH) ---
 
 // 辅助：解析 Hex 字符串
 static unsigned char* hex_to_bytes(const char* hex, int* out_len) {
@@ -258,9 +254,6 @@ static unsigned char* hex_to_bytes(const char* hex, int* out_len) {
 }
 
 // 解析 HTTPS (Type 65) 记录中的 ECH Config
-// 格式通常为: \# <len> <hex_data>
-// hex_data 结构 (RFC 9460): [Priority 2B] [TargetName (Root=00)] [Params...]
-// Param Key 5 = ECH
 static unsigned char* ExtractECHFromDoHAnswer(const char* rdata_hex, size_t* out_ech_len) {
     int rdata_len = 0;
     unsigned char* rdata = hex_to_bytes(rdata_hex, &rdata_len);
@@ -274,13 +267,11 @@ static unsigned char* ExtractECHFromDoHAnswer(const char* rdata_hex, size_t* out
     if (p + 2 > end) goto cleanup;
     p += 2;
 
-    // Skip Target Name (假设是 Root 0x00，或者简单的 format)
-    // 实际上 TargetName 是 wire-format domain name。如果第一字节是 0，则为 root。
+    // Skip Target Name (wire format)
     if (p >= end) goto cleanup;
     if (*p == 0) {
         p++; // Root
     } else {
-        // 简单跳过：循环直到 0 或指针越界 (注意：这种跳过不严谨，但处理常见 DoH 响应足够)
         while(p < end && *p != 0) {
             int label_len = *p;
             if (p + 1 + label_len > end) goto cleanup;
@@ -314,13 +305,10 @@ cleanup:
 }
 
 // 通过 DoH 获取 ECH 配置
-// 返回 raw bytes，caller 需 free
 unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t* out_len) {
     if (!domain || !doh_server) return NULL;
     
     char url[1024];
-    // 使用 Google/Cloudflare JSON DNS API 格式
-    // type=65 (HTTPS)
     snprintf(url, sizeof(url), "%s?name=%s&type=65&ct=application/dns-json", doh_server, domain);
     
     char* json_res = Utils_HttpGet(url);
@@ -338,7 +326,7 @@ unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t
                     cJSON* data = cJSON_GetObjectItem(item, "data");
                     if (data && cJSON_IsString(data)) {
                         const char* txt = data->valuestring;
-                        // Cloudflare JSON 格式: "\# <length> <hex>"
+                        // Cloudflare JSON format: "\# <length> <hex>"
                         if (strncmp(txt, "\\#", 2) == 0) {
                             const char* hex_start = strrchr(txt, ' ');
                             if (hex_start) {
@@ -356,4 +344,66 @@ unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t
     
     free(json_res);
     return ech_config;
+}
+
+// --- 8. 日志记录 (The Fix) ---
+
+void log_msg(const char* fmt, ...) {
+    if (!g_enableLog && !hLogViewerWnd) return;
+
+    char buf[1024];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+
+    time_t now = time(NULL);
+    struct tm* t = localtime(&now);
+    wchar_t wMsg[2048];
+    // 使用 %S 处理 char* 字符串
+    swprintf_s(wMsg, 2048, L"[%02d:%02d:%02d] %S\r\n", t->tm_hour, t->tm_min, t->tm_sec, buf);
+
+    // 发送消息到 GUI 日志窗口
+    if (hLogViewerWnd && IsWindow(hLogViewerWnd)) {
+        wchar_t* msgCopy = _wcsdup(wMsg);
+        PostMessageW(hLogViewerWnd, WM_LOG_UPDATE, 0, (LPARAM)msgCopy);
+    }
+    
+    // 如果需要调试控制台输出，可解开下行注释
+    // printf("%s\n", buf);
+}
+
+// --- 9. 系统代理设置 (The Fix) ---
+
+BOOL IsSystemProxyEnabled() {
+    HKEY hKey;
+    DWORD data = 0, size = sizeof(DWORD);
+    // REG_PATH_PROXY 在 common.h 中定义
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_PATH_PROXY, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        RegQueryValueExW(hKey, L"ProxyEnable", NULL, NULL, (LPBYTE)&data, &size);
+        RegCloseKey(hKey);
+    }
+    return (data == 1);
+}
+
+void SetSystemProxy(BOOL enable) {
+    HKEY hKey;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_PATH_PROXY, 0, KEY_WRITE, &hKey) == ERROR_SUCCESS) {
+        DWORD dEnable = enable ? 1 : 0;
+        RegSetValueExW(hKey, L"ProxyEnable", 0, REG_DWORD, (LPBYTE)&dEnable, sizeof(DWORD));
+
+        if (enable) {
+            wchar_t server[64];
+            swprintf_s(server, 64, L"127.0.0.1:%d", g_localPort);
+            RegSetValueExW(hKey, L"ProxyServer", 0, REG_SZ, (LPBYTE)server, (DWORD)(wcslen(server)+1)*sizeof(wchar_t));
+            
+            const wchar_t* override = L"<local>";
+            RegSetValueExW(hKey, L"ProxyOverride", 0, REG_SZ, (LPBYTE)override, (DWORD)(wcslen(override)+1)*sizeof(wchar_t));
+        }
+        RegCloseKey(hKey);
+
+        // 通知系统刷新设置
+        InternetSetOption(NULL, INTERNET_OPTION_SETTINGS_CHANGED, NULL, 0);
+        InternetSetOption(NULL, INTERNET_OPTION_REFRESH, NULL, 0);
+    }
 }
