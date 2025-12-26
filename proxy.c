@@ -5,14 +5,10 @@
 #include <openssl/sha.h>
 #include <stdio.h>
 
-// [Fix] 补充 ECH 全局变量声明 (如果在 common.h 中未声明)
-extern int g_enableECH; 
-
 // [Safety] 全局活跃连接计数器
 static volatile LONG g_active_connections = 0;
 
 // [Concurrency] 客户端线程上下文
-// 确保 Worker 线程使用独立的配置副本
 typedef struct {
     SOCKET clientSock;
     ProxyConfig config;          
@@ -138,7 +134,7 @@ DWORD WINAPI client_handler(LPVOID p) {
     SOCKET r = INVALID_SOCKET;      
     char *c_buf = NULL, *ws_read_buf = NULL, *ws_send_buf = NULL; 
     
-    // [Fix] 移除 proxy_malloc，使用标准 malloc，避免 InterlockedAdd64 导致的崩溃
+    // 移除 proxy_malloc，使用标准 malloc
     int ws_read_buf_cap = IO_BUFFER_SIZE; 
     int ws_buf_len = 0; 
     
@@ -540,7 +536,7 @@ DWORD WINAPI server_thread(LPVOID p) {
                 strncpy(ctx->userAgent, g_userAgentStr, sizeof(ctx->userAgent)-1);
                 ctx->userAgent[sizeof(ctx->userAgent)-1] = 0;
                 
-                // [Fix] 补全所有加密配置，防止 ECH 选项未初始化导致崩溃
+                // [Fix] 补全加密配置
                 ctx->cryptoSettings.enableFragment = g_enableFragment;
                 ctx->cryptoSettings.fragMin = g_fragSizeMin;
                 ctx->cryptoSettings.fragMax = g_fragSizeMax;
@@ -549,8 +545,6 @@ DWORD WINAPI server_thread(LPVOID p) {
                 ctx->cryptoSettings.padMin = g_padSizeMin;
                 ctx->cryptoSettings.padMax = g_padSizeMax;
                 ctx->cryptoSettings.enableChromeCiphers = g_enableChromeCiphers;
-                
-                // [Fix] 关键：复制 ECH 开关
                 ctx->cryptoSettings.enableECH = g_enableECH;
 
                 LeaveCriticalSection(&g_configLock);
