@@ -9,6 +9,7 @@
 #include <time.h> 
 
 // --- 全局变量声明 ---
+// 注意：g_enableECH 等变量在 globals.c 中定义，此处直接使用
 Subscription g_subs[MAX_SUBS];
 int g_subCount = 0;
 
@@ -25,15 +26,14 @@ cJSON* ParseShadowsocks(const char* link);
 cJSON* ParseVlessOrTrojan(const char* link);
 cJSON* ParseSocks(const char* link);
 
-// [Helper] 安全字符串复制 (模拟 strncpy 但保证 NULL 结尾)
+// [Security Fix] 使用 snprintf 替代 strcpy_s，避免 Runtime Error 0x40000015
 static void SafeStrCpy(char* dest, size_t destSize, const char* src) {
     if (!dest || destSize == 0) return;
     if (!src) { dest[0] = '\0'; return; }
-    // 使用 snprintf 替代 strcpy_s/strncpy，避免 CRT 崩溃
     snprintf(dest, destSize, "%s", src);
 }
 
-// [Helper] 安全获取或创建 JSON 对象
+// --- 辅助：安全获取或创建 JSON 对象 ---
 static cJSON* GetOrCreateObj(cJSON* parent, const char* name) {
     cJSON* item = cJSON_GetObjectItem(parent, name);
     if (!item) {
@@ -109,7 +109,7 @@ void LoadSettings() {
     int padMax = GetPrivateProfileIntW(L"Settings", L"PadMax", 500, g_iniFilePath);
     int uaIdx = GetPrivateProfileIntW(L"Settings", L"UAPlatform", 0, g_iniFilePath);
 
-    // ECH 配置 (MandalaECH 特有)
+    // [ECH 特有逻辑]
     int enableECH = GetPrivateProfileIntW(L"Settings", L"EnableECH", 0, g_iniFilePath);
     wchar_t wEchServer[256] = {0}, wEchPub[256] = {0};
     GetPrivateProfileStringW(L"Settings", L"ECHServer", L"https://cloudflare-dns.com/dns-query", wEchServer, 256, g_iniFilePath);
@@ -137,7 +137,7 @@ void LoadSettings() {
     if (g_fragDelayMs < 0) g_fragDelayMs = 0; 
     if (g_padSizeMin < 0) g_padSizeMin = 0; if (g_padSizeMax < g_padSizeMin) g_padSizeMax = g_padSizeMin;
 
-    // ECH 设置加载
+    // [ECH 赋值]
     g_enableECH = enableECH;
     WideCharToMultiByte(CP_UTF8, 0, wEchServer, -1, g_echConfigServer, sizeof(g_echConfigServer), NULL, NULL);
     WideCharToMultiByte(CP_UTF8, 0, wEchPub, -1, g_echPublicName, sizeof(g_echPublicName), NULL, NULL);
@@ -148,7 +148,6 @@ void LoadSettings() {
     wchar_t wUABuf[512] = {0}; 
     GetPrivateProfileStringW(L"Settings", L"UserAgent", L"", wUABuf, 512, g_iniFilePath);
     
-    // 显式初始化 UserAgent 缓冲区
     memset(g_userAgentStr, 0, sizeof(g_userAgentStr));
     if (wcslen(wUABuf) > 5) WideCharToMultiByte(CP_UTF8, 0, wUABuf, -1, g_userAgentStr, sizeof(g_userAgentStr)-1, NULL, NULL);
     else SafeStrCpy(g_userAgentStr, sizeof(g_userAgentStr), UA_TEMPLATES[0]);
@@ -159,7 +158,6 @@ void LoadSettings() {
     if (g_subCount > MAX_SUBS) g_subCount = MAX_SUBS;
     for (int i = 0; i < g_subCount; i++) {
         wchar_t wKeyEn[32], wKeyUrl[32], wUrl[512];
-        // 使用 _snwprintf 替代 swprintf_s
         _snwprintf(wKeyEn, 32, L"Sub%d_Enabled", i); 
         _snwprintf(wKeyUrl, 32, L"Sub%d_Url", i);
         g_subs[i].enabled = GetPrivateProfileIntW(L"Subscriptions", wKeyEn, 1, g_iniFilePath);
@@ -174,7 +172,7 @@ void SaveSettings() {
     EnterCriticalSection(&g_configLock);
 
     wchar_t buffer[32];
-    // 使用 _snwprintf 替代 swprintf_s 避免 Invalid Parameter Handler 崩溃
+    // [Fix] 使用 _snwprintf 替代 swprintf_s
     _snwprintf(buffer, 32, L"%u", g_hotkeyModifiers); WritePrivateProfileStringW(L"Settings", L"Modifiers", buffer, g_iniFilePath);
     _snwprintf(buffer, 32, L"%u", g_hotkeyVk); WritePrivateProfileStringW(L"Settings", L"VK", buffer, g_iniFilePath);
     _snwprintf(buffer, 32, L"%d", g_localPort); WritePrivateProfileStringW(L"Settings", L"LocalPort", buffer, g_iniFilePath);
@@ -191,7 +189,7 @@ void SaveSettings() {
     _snwprintf(buffer, 32, L"%d", g_padSizeMax); WritePrivateProfileStringW(L"Settings", L"PadMax", buffer, g_iniFilePath);
     _snwprintf(buffer, 32, L"%d", g_uaPlatformIndex); WritePrivateProfileStringW(L"Settings", L"UAPlatform", buffer, g_iniFilePath);
     
-    // ECH 保存
+    // [ECH 保存]
     _snwprintf(buffer, 32, L"%d", g_enableECH); WritePrivateProfileStringW(L"Settings", L"EnableECH", buffer, g_iniFilePath);
     
     wchar_t wEchServerOut[256] = {0}, wEchPubOut[256] = {0};
@@ -205,9 +203,8 @@ void SaveSettings() {
     WritePrivateProfileStringW(L"Settings", L"UserAgent", wUABuf, g_iniFilePath);
 
     WritePrivateProfileStringW(L"Settings", L"LastNode", currentNode, g_iniFilePath);
-    WritePrivateProfileStringW(L"Subscriptions", NULL, NULL, g_iniFilePath); // Clear section
+    WritePrivateProfileStringW(L"Subscriptions", NULL, NULL, g_iniFilePath); 
     
-    // 使用 long long 格式化
     _snwprintf(buffer, 32, L"%lld", g_lastUpdateTime);
     WritePrivateProfileStringW(L"Subscriptions", L"LastUpdateTime", buffer, g_iniFilePath);
 
@@ -357,7 +354,7 @@ void SwitchNode(const wchar_t* tag) {
     cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
     cJSON* targetNode = NULL;
     
-    // [Fix] 扩大缓冲区并初始化，且保持逻辑简单
+    // [Security Fix] 使用大缓冲区和标准初始化，避免 UTF-8 转换溢出
     char tagUtf8[1024] = {0}; 
     WideCharToMultiByte(CP_UTF8, 0, tag, -1, tagUtf8, sizeof(tagUtf8) - 1, NULL, NULL);
     
@@ -373,7 +370,7 @@ void SwitchNode(const wchar_t* tag) {
         SaveSettings();   
         
         wchar_t tip[128]; 
-        // 使用 _snwprintf
+        // [Fix] 使用 _snwprintf
         _snwprintf(tip, 128, L"已切换: %s", tag);
         wcsncpy(nid.szInfo, tip, 127); wcsncpy(nid.szInfoTitle, L"Mandala Client", 63); nid.uFlags |= NIF_INFO;
         Shell_NotifyIconW(NIM_MODIFY, &nid);
@@ -416,7 +413,7 @@ BOOL AddNodeToConfig(cJSON* newNode) {
     if (cJSON_HasObjectItem(newNode, "tag")) cJSON_ReplaceItemInObject(newNode, "tag", cJSON_CreateString(uniqueTag));
     else cJSON_AddStringToObject(newNode, "tag", uniqueTag);
     
-    // [Fix] 使用 cJSON_AddItemToArray 替代 cJSON_AddItemToObject，修复编译错误
+    // [Fix] 修复编译错误：向数组添加使用 cJSON_AddItemToArray
     cJSON_AddItemToArray(outbounds, newNode);
     
     char* out = cJSON_Print(root); BOOL ret = WriteBufferToFile(CONFIG_FILE, out); free(out); cJSON_Delete(root);
@@ -465,7 +462,7 @@ int Internal_BatchAddNodesFromText(const char* text, cJSON* outbounds) {
                     if (cJSON_HasObjectItem(node, "tag")) cJSON_ReplaceItemInObject(node, "tag", cJSON_CreateString(uniqueTag));
                     else cJSON_AddStringToObject(node, "tag", uniqueTag);
                     
-                    // [Fix] 使用 cJSON_AddItemToArray 替代 cJSON_AddItemToObject，修复编译错误
+                    // [Fix] 修复编译错误
                     cJSON_AddItemToArray(outbounds, node); count++;
                 }
             }
@@ -541,7 +538,7 @@ void ToggleTrayIcon() {
     SaveSettings(); 
 }
 
-// --- 协议解析实现 (Vmess/Vless/Trojan/Shadowsocks/Socks/Mandala) ---
+// --- 协议解析实现 ---
 
 // SOCKS 解析
 cJSON* ParseSocks(const char* link) {
