@@ -22,10 +22,10 @@
 #pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "wininet.lib")
 
-// 全局 SSL_CTX 复用
+// 全局 SSL 上下文
 static SSL_CTX* g_utils_ctx = NULL;
-// 用于线程安全初始化的原子变量
-static volatile LONG g_ctx_init_flag = 0;
+// 用于线程安全初始化的标志 (0:未初始, 1:初始化中, 2:已完成)
+static volatile LONG g_ctx_init_state = 0;
 
 // --------------------------------------------------------------------------
 // 基础工具函数
@@ -37,9 +37,9 @@ BOOL IsWindows8OrGreater() {
     return (pFunc != NULL);
 }
 
-// 安全字符串克隆，确保 Windows 7 上的健壮性
+// 兼容 Win7 的安全字符串克隆
 static char* SafeStrDup(const char* s, int len) {
-    if (!s || len < 0) return NULL;
+    if (!s || len <= 0) return NULL;
     char* d = (char*)malloc(len + 1);
     if (d) {
         memcpy(d, s, len);
@@ -50,23 +50,18 @@ static char* SafeStrDup(const char* s, int len) {
 
 void log_msg(const char *format, ...) {
     if (!g_enableLog && strstr(format, "[Fatal]") == NULL) return;
-
     char buf[2048]; 
     char time_buf[64]; 
     SYSTEMTIME st; 
-    
     GetLocalTime(&st);
     snprintf(time_buf, sizeof(time_buf), "[%02d:%02d:%02d] ", st.wHour, st.wMinute, st.wSecond);
-    
     va_list args; 
     va_start(args, format); 
     vsnprintf(buf, sizeof(buf) - 64, format, args); 
     va_end(args);
-    
     char final_msg[2200]; 
     snprintf(final_msg, sizeof(final_msg), "%s%s\r\n", time_buf, buf);
     OutputDebugStringA(final_msg);
-    
     extern HWND hLogViewerWnd; 
     if (hLogViewerWnd && IsWindow(hLogViewerWnd)) {
         int wLen = MultiByteToWideChar(CP_UTF8, 0, final_msg, -1, NULL, 0);
@@ -85,21 +80,14 @@ void log_msg(const char *format, ...) {
 BOOL ReadFileToBuffer(const wchar_t* filename, char** buffer, long* size) {
     FILE* f = _wfopen(filename, L"rb");
     if (!f) return FALSE;
-    
     fseek(f, 0, SEEK_END);
     long fsize = ftell(f);
     fseek(f, 0, SEEK_SET);
-    
     *buffer = (char*)malloc(fsize + 1);
-    if (!*buffer) { 
-        fclose(f); 
-        return FALSE; 
-    }
-    
+    if (!*buffer) { fclose(f); return FALSE; }
     fread(*buffer, 1, fsize, f);
     (*buffer)[fsize] = 0; 
     if (size) *size = fsize;
-    
     fclose(f);
     return TRUE;
 }
@@ -162,7 +150,7 @@ char* GetQueryParam(const char* query, const char* key) {
 }
 
 // --------------------------------------------------------------------------
-// Base64 处理
+// ECH 相关支持函数
 // --------------------------------------------------------------------------
 static const int b64_table[] = {
     -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
@@ -216,19 +204,14 @@ static int HexToBin(const char* hex, unsigned char* out, int max_len) {
     return len;
 }
 
-// --------------------------------------------------------------------------
-// ECH (Encrypted Client Hello) 解析实现
-// --------------------------------------------------------------------------
 unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t* out_len) {
     if (!domain || !doh_server) return NULL;
-    char url[1024]; snprintf(url, sizeof(url), "%s?name=%s&type=65", doh_server, domain);
-
+    char url[2048]; snprintf(url, sizeof(url), "%s?name=%s&type=65", doh_server, domain);
     char* json_str = Utils_HttpGet(url);
     if (!json_str) return NULL;
     cJSON* root = cJSON_Parse(json_str);
     free(json_str);
     if (!root) return NULL;
-
     unsigned char* ech_config = NULL; *out_len = 0;
     cJSON* answer = cJSON_GetObjectItem(root, "Answer");
     if (answer && cJSON_IsArray(answer)) {
@@ -259,7 +242,7 @@ unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t
                         int rdata_len = HexToBin(data_str, rdata, sizeof(rdata));
                         if (rdata_len > 5) { 
                             int p = 2; // Priority
-                            while (p < rdata_len) { // Skip TargetName
+                            while (p < rdata_len) { // TargetName
                                 int label_len = rdata[p++];
                                 if (label_len == 0 || p + label_len > rdata_len) break; 
                                 p += label_len;
@@ -286,7 +269,7 @@ unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t
 }
 
 // --------------------------------------------------------------------------
-// 网络请求与 HTTPS 实现 (针对 Windows 7 深度加固)
+// 核心网络请求实现 (深度加固版)
 // --------------------------------------------------------------------------
 typedef struct { char host[256]; int port; char path[1024]; } URL_COMPONENTS_SIMPLE;
 
@@ -311,14 +294,14 @@ static char* InternalHttpsGet(const char* url) {
     URL_COMPONENTS_SIMPLE u;
     if (!ParseUrl(url, &u)) return NULL;
 
-    // [修复] 使用 Interlocked 原子操作进行线程安全初始化，彻底解决 Win7 的内存竞争
+    // [修复] 原子化初始化 SSL 上下文，防止在 Win7 下竞争崩溃
     if (g_utils_ctx == NULL) {
-        if (InterlockedCompareExchange(&g_ctx_init_flag, 1, 0) == 0) {
+        if (InterlockedCompareExchange(&g_ctx_init_state, 1, 0) == 0) {
             g_utils_ctx = SSL_CTX_new(TLS_client_method());
             if (g_utils_ctx) SSL_CTX_set_verify(g_utils_ctx, SSL_VERIFY_NONE, NULL);
-            InterlockedExchange(&g_ctx_init_flag, 2);
+            InterlockedExchange(&g_ctx_init_state, 2);
         } else {
-            while (g_ctx_init_flag != 2) Sleep(10);
+            while (g_ctx_init_state != 2) Sleep(10);
         }
     }
     if (!g_utils_ctx) return NULL;
@@ -343,15 +326,14 @@ static char* InternalHttpsGet(const char* url) {
     SSL_set_fd(ssl, (int)s); SSL_set_tlsext_host_name(ssl, u.host);
     if (SSL_connect(ssl) != 1) { SSL_free(ssl); closesocket(s); return NULL; }
 
-    // [修复] 仅对 DoH 请求发送特定的 Accept 头部，防止订阅服务器返回 406 错误导致崩溃
+    // [关键修复] 下载订阅时不发送 dns-json 头部，仅在 DoH 查询时添加，防止服务器返回 406 导致崩溃
     const char* accept_header = (strstr(u.path, "dns-query") || strstr(u.path, "name=")) ? 
                                  "Accept: application/dns-json\r\n" : "Accept: */*\r\n";
 
-    // [关键修复] 将缓冲区改为堆分配 (malloc)，彻底解决 0x40000015 栈溢出崩溃
+    // [关键修复] 使用堆分配缓冲区，彻底消除栈溢出导致的 0x40000015 错误
     char* req = (char*)malloc(8192);
     if (!req) goto cleanup;
     
-    // 强制 Null 终止，解决 Win7 下 _snprintf 不自动添加终止符的问题
     int req_len = snprintf(req, 8192, 
         "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mandala-Client/1.0\r\n%sConnection: close\r\n\r\n", 
         u.path, u.host, accept_header);
@@ -361,7 +343,7 @@ static char* InternalHttpsGet(const char* url) {
     }
     free(req);
 
-    int total_cap = 131072; int total_len = 0;
+    int total_cap = 65536; int total_len = 0;
     char* buf = (char*)malloc(total_cap);
     if (!buf) goto cleanup;
 
@@ -377,11 +359,12 @@ static char* InternalHttpsGet(const char* url) {
     }
 
     if (buf) {
-        buf[total_len] = 0; char* body_pos = strstr(buf, "\r\n\r\n");
+        buf[total_len] = 0; 
+        char* body_pos = strstr(buf, "\r\n\r\n");
         if (body_pos) { 
             body_pos += 4;
             int body_len = total_len - (int)(body_pos - buf);
-            result = SafeStrDup(body_pos, body_len);
+            result = SafeStrDup(body_pos, body_len); // 二进制安全拷贝
             free(buf); 
         } else { 
             result = buf; 
@@ -399,7 +382,7 @@ char* Utils_HttpGet(const char* url) {
 }
 
 // --------------------------------------------------------------------------
-// 剪贴板操作
+// 其它工具函数
 // --------------------------------------------------------------------------
 char* GetClipboardText() {
     if (!OpenClipboard(NULL)) return NULL;
@@ -412,16 +395,12 @@ char* GetClipboardText() {
     return text;
 }
 
-// --------------------------------------------------------------------------
-// 系统代理设置
-// --------------------------------------------------------------------------
 void SetSystemProxy(BOOL enable) {
     extern int g_localPort;
     if (g_localPort <= 0) g_localPort = 1080; 
     wchar_t proxyServerString[256] = {0};
     wchar_t proxyBypassString[64] = L"<local>";
     if (enable) swprintf_s(proxyServerString, 256, L"127.0.0.1:%d", g_localPort);
-
     if (IsWindows8OrGreater()) {
         HKEY hKey;
         if (RegCreateKeyExW(HKEY_CURRENT_USER, REG_PATH_PROXY, 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
