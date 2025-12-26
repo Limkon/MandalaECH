@@ -22,9 +22,14 @@
 #pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "wininet.lib")
 
+// [Fix] 修复部分 MinGW 环境缺少宏定义导致的编译错误
+#ifndef INTERNET_OPTION_SECURITY_PROTOCOLS
+#define INTERNET_OPTION_SECURITY_PROTOCOLS 31
+#endif
+
 // 全局 SSL 上下文与原子锁
 static SSL_CTX* g_utils_ctx = NULL;
-static volatile LONG g_ctx_init_state = 0; 
+static volatile LONG g_ctx_init_state = 0; // 0:未初始化, 1:初始化中, 2:已完成
 
 // --------------------------------------------------------------------------
 // 基础工具函数
@@ -37,6 +42,7 @@ BOOL IsWindows8OrGreater() {
     return (pFunc != NULL);
 }
 
+// 兼容旧版系统的安全内存拷贝
 static char* SafeStrDup(const char* s, int len) {
     if (!s || len < 0) return NULL;
     char* d = (char*)malloc(len + 1);
@@ -131,7 +137,9 @@ char* GetQueryParam(const char* query, const char* key) {
     if (!p) return NULL;
     if (p != query && *(p-1) != '&' && *(p-1) != '?') return NULL; 
     p += strlen(search);
-    const char* end = strpbrk(p, "&#");
+    const char* end_amp = strchr(p, '&');
+    const char* end_hash = strchr(p, '#');
+    const char* end = (end_amp && end_hash) ? (end_amp < end_hash ? end_amp : end_hash) : (end_amp ? end_amp : end_hash);
     int len = end ? (int)(end - p) : (int)strlen(p);
     if (len <= 0) return NULL;
     char* val = (char*)malloc(len + 1);
@@ -227,6 +235,29 @@ unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t
                             }
                         }
                     }
+                    if (!ech_config) {
+                        unsigned char rdata[4096];
+                        int rdata_len = HexToBin(data_str, rdata, sizeof(rdata));
+                        if (rdata_len > 5) { 
+                            int p = 2; 
+                            while (p < rdata_len) { 
+                                int label_len = rdata[p++];
+                                if (label_len == 0 || p + label_len > rdata_len) break; 
+                                p += label_len;
+                            }
+                            while (p + 4 <= rdata_len) {
+                                int key = (rdata[p] << 8) | rdata[p+1];
+                                int len = (rdata[p+2] << 8) | rdata[p+3];
+                                p += 4;
+                                if (key == 5 && p + len <= rdata_len) { 
+                                    ech_config = (unsigned char*)malloc(len);
+                                    if (ech_config) { memcpy(ech_config, rdata + p, len); *out_len = len; }
+                                    break; 
+                                }
+                                p += len;
+                            }
+                        }
+                    }
                 }
             }
             if (ech_config) break; 
@@ -236,7 +267,7 @@ unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t
 }
 
 // --------------------------------------------------------------------------
-// 双网络引擎实现 (核心全兼容方案)
+// 双网络引擎实现 (核心兼容方案)
 // --------------------------------------------------------------------------
 
 typedef struct { char host[256]; int port; char path[1024]; } URL_COMPONENTS_SIMPLE;
@@ -258,45 +289,44 @@ static BOOL ParseUrl(const char* url, URL_COMPONENTS_SIMPLE* out) {
     return TRUE;
 }
 
-// 引擎 A: WinInet - 针对 Win7 优化，强制开启 TLS 1.2
+// 引擎 A：WinInet 引擎，专用于 Windows 7 下载大型订阅，绝对稳定
 static char* InternalWinInetGet(const char* url) {
     char* result = NULL;
     HINTERNET hInternet = InternetOpenW(L"Mandala/1.0", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
     if (!hInternet) return NULL;
 
-    // [核心修复] 强制 Windows 7 开启 TLS 1.1 和 TLS 1.2 支持
-    DWORD protocols = 0x00000080 | 0x00000200 | 0x00000800; 
+    // [核心修复] 强制 Windows 7 开启 TLS 1.1 和 TLS 1.2 支持，解决返回 0 节点问题
+    DWORD protocols = 0x00000080 | 0x00000200 | 0x00000800; // TLS 1.0, 1.1, 1.2
     InternetSetOptionW(hInternet, INTERNET_OPTION_SECURITY_PROTOCOLS, &protocols, sizeof(protocols));
 
     DWORD timeout = 10000;
     InternetSetOptionW(hInternet, INTERNET_OPTION_CONNECT_TIMEOUT, &timeout, sizeof(DWORD));
 
     HINTERNET hFile = InternetOpenUrlA(hInternet, url, NULL, 0, 
-        INTERNET_FLAG_RELOAD | INTERNET_FLAG_SECURE | INTERNET_FLAG_IGNORE_CERT_CN_INVALID | INTERNET_FLAG_IGNORE_CERT_DATE_INVALID, 0);
+        INTERNET_FLAG_RELOAD | INTERNET_FLAG_SECURE | INTERNET_FLAG_IGNORE_CERT_CN_INVALID, 0);
     
     if (hFile) {
-        int capacity = 512 * 1024; // 512KB 初始缓冲
+        int capacity = 256 * 1024; // 256KB 初始缓冲
         char* buf = (char*)malloc(capacity);
         DWORD bytesRead = 0, totalRead = 0;
         
         while (InternetReadFile(hFile, buf + totalRead, capacity - totalRead - 1, &bytesRead) && bytesRead > 0) {
             totalRead += bytesRead;
-            if (totalRead >= (DWORD)capacity - 2048) {
+            if (totalRead >= (DWORD)capacity - 1024) {
                 capacity *= 2;
                 char* newBuf = (char*)realloc(buf, capacity);
                 if (!newBuf) { free(buf); buf = NULL; break; }
                 buf = newBuf;
             }
         }
-        if (buf && totalRead > 0) { buf[totalRead] = 0; result = SafeStrDup(buf, totalRead); }
-        if (buf) free(buf);
+        if (buf) { buf[totalRead] = 0; result = SafeStrDup(buf, totalRead); free(buf); }
         InternetCloseHandle(hFile);
     }
     InternetCloseHandle(hInternet);
     return result;
 }
 
-// 引擎 B: BoringSSL - 仅用于获取 ECH Config
+// 引擎 B：BoringSSL 引擎，仅用于 DoH 查询 (支持自定义头部)
 static char* InternalBoringSSLGet(const char* url) {
     URL_COMPONENTS_SIMPLE u;
     if (!ParseUrl(url, &u)) return NULL;
@@ -312,14 +342,20 @@ static char* InternalBoringSSLGet(const char* url) {
 
     SOCKET s = INVALID_SOCKET; SSL *ssl = NULL; char* result = NULL;
     struct addrinfo hints, *res = NULL;
-    memset(&hints, 0, sizeof(hints)); hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM;
     char portStr[16]; snprintf(portStr, 16, "%d", u.port);
     if (getaddrinfo(u.host, portStr, &hints, &res) != 0) return NULL;
     s = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (s == INVALID_SOCKET) { freeaddrinfo(res); return NULL; }
+    
+    DWORD timeout = 5000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
     if (connect(s, res->ai_addr, (int)res->ai_addrlen) != 0) { closesocket(s); freeaddrinfo(res); return NULL; }
     freeaddrinfo(res);
 
     ssl = SSL_new(g_utils_ctx);
+    if (!ssl) { closesocket(s); return NULL; }
     SSL_set_fd(ssl, (int)s); SSL_set_tlsext_host_name(ssl, u.host);
     if (SSL_connect(ssl) != 1) { SSL_free(ssl); closesocket(s); return NULL; }
 
@@ -328,32 +364,32 @@ static char* InternalBoringSSLGet(const char* url) {
     SSL_write(ssl, req, req_len); free(req);
 
     int t_cap = 65536, t_len = 0; char* buf = (char*)malloc(t_cap);
-    while (1) {
+    while (buf) {
         int n = SSL_read(ssl, buf + t_len, t_cap - t_len - 1);
         if (n <= 0) break;
         t_len += n;
     }
     if (buf) {
         buf[t_len] = 0; char* body = strstr(buf, "\r\n\r\n");
-        if (body) result = SafeStrDup(body + 4, t_len - (int)(body + 4 - buf));
-        free(buf);
+        if (body) { result = SafeStrDup(body + 4, t_len - (int)(body + 4 - buf)); free(buf); } else result = buf;
     }
     SSL_shutdown(ssl); SSL_free(ssl); closesocket(s);
     return result;
 }
 
-// 统一入口：修正判定逻辑，防止订阅链接误入 BoringSSL
+// 统一入口：根据 URL 特征分发引擎
 char* Utils_HttpGet(const char* url) {
     if (!url || strncmp(url, "http", 4) != 0) return NULL;
-    // 仅当明确是 DoH 请求时才用 BoringSSL
+    // 只有明确包含 dns-query 的才使用 BoringSSL 引擎
     if (strstr(url, "/dns-query")) return InternalBoringSSLGet(url);
-    // 其余一律走稳定引擎
+    // 其余一律走 WinInet 引擎以保证 Win7 稳定性与 TLS 支持
     return InternalWinInetGet(url);
 }
 
 // --------------------------------------------------------------------------
-// 其它工具函数保持不变
+// 其它工具函数
 // --------------------------------------------------------------------------
+
 char* GetClipboardText() {
     if (!OpenClipboard(NULL)) return NULL;
     HANDLE hData = GetClipboardData(CF_TEXT);
@@ -389,7 +425,7 @@ void SetSystemProxy(BOOL enable) {
 }
 
 BOOL IsSystemProxyEnabled() {
-    BOOL en = FALSE; HKEY hKey; DWORD dwEn = 0, dwSz = 4;
+    extern int g_localPort; BOOL en = FALSE; HKEY hKey; DWORD dwEn = 0, dwSz = 4;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_PATH_PROXY, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
         if (RegQueryValueExW(hKey, L"ProxyEnable", NULL, NULL, (BYTE*)&dwEn, &dwSz) == ERROR_SUCCESS && dwEn == 1) en = TRUE;
         RegCloseKey(hKey);
