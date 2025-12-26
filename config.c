@@ -1,7 +1,3 @@
-{
-type: uploaded file
-fileName: limkon/mandalaech/MandalaECH-7122d9407b2017143273b69534ed549be4b54d52/config.c
-fullContent:
 #include "config.h"
 #include "utils.h"
 #include "proxy.h" 
@@ -810,6 +806,4 @@ cJSON* ParseMandala(const char* link) {
     if (security) free(security);
     
     free(uuid); free(host); free(tag); return outbound;
-}
-
 }
