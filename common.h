@@ -8,7 +8,7 @@
 #define _UNICODE
 #endif
 
-// 防止旧版 SDK 警告
+// 防止旧版 SDK 警告，锁定最低支持 Windows 7 (0x0601)
 #ifndef _WIN32_IE
 #define _WIN32_IE 0x0601
 #endif
@@ -19,10 +19,19 @@
 
 #define WIN32_LEAN_AND_MEAN
 
-// 尝试阻止 windows.h 包含 wincrypt.h
+// 尝试阻止 windows.h 包含 wincrypt.h 以避免与 OpenSSL 冲突
 #define NOCRYPT 
 
+// --- 生产环境限制参数 ---
 #define MAX_CONNECTIONS 512
+#define IO_BUFFER_SIZE 16384 
+// 允许的最大单帧大小 (8MB)，但在处理时将增加更严苛的内存水位检查
+#define MAX_WS_FRAME_SIZE 8388608 
+// 生产环境建议：单个进程用于网络缓冲的最大内存总量 (如 512MB)，防止 OOM
+#define MAX_TOTAL_MEMORY_USAGE (512 * 1024 * 1024)
+
+// --- 调试与安全配置 ---
+#define LOG_DESENSITIZE TRUE  // 开启日志脱敏，隐藏密码和敏感 Host
 
 // --- 1. Windows 系统头文件 ---
 #include <windows.h>
@@ -33,12 +42,10 @@
 #include <shlobj.h>
 #include <wininet.h>
 
-// --- 2. 引入资源头文件 (解决重定义警告) ---
-// [Fix] 必须包含此文件以获取 GUI 控件 ID (ID_CHK_FRAG 等)
-// 确保 common.h 中的 ID 与 resource.rc 使用的 ID 一致
+// --- 2. 引入资源头文件 ---
 #include "resource.h"
 
-// --- 3. 清理 Windows 宏污染 ---
+// --- 3. 清理 Windows 宏污染 (解决与 OpenSSL 的命名冲突) ---
 #ifdef X509_NAME
 #undef X509_NAME
 #endif
@@ -82,15 +89,12 @@
 #define REG_PATH_PROXY L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings"
 #define CONFIG_FILE L"config.json"
 
-#define IO_BUFFER_SIZE 16384 
-#define MAX_WS_FRAME_SIZE 8388608 
-
 // Windows Messages
 #define WM_TRAY (WM_USER + 1)
 #define WM_LOG_UPDATE (WM_USER + 2)
 #define WM_REFRESH_NODELIST (WM_USER + 50)
 
-// Command IDs (这些通常不在 resource.h 中，保留)
+// Command IDs
 #define ID_TRAY_EXIT 1001
 #define ID_TRAY_AUTORUN 1002
 #define ID_TRAY_SYSTEM_PROXY 1003
@@ -102,10 +106,7 @@
 #define ID_GLOBAL_HOTKEY 9001
 #define ID_TRAY_NODE_BASE 2000
 
-// [Fix] 下面的 ID 已在 resource.h 中定义，此处移除以消除警告
-// ID_LOGVIEWER_EDIT, ID_LOG_CHK, ID_NODEMGR_... 等已由 #include "resource.h" 提供
-
-// ECH 设置控件 ID (如果在 resource.h 中未定义，则保留；如果未来报错重定义，请删除)
+// ECH 设置控件 ID
 #define ID_CHK_ECH         7022
 #define ID_EDIT_ECH_SERVER 7023
 #define ID_EDIT_ECH_DOMAIN 7024
@@ -126,7 +127,7 @@ typedef struct {
     char type[32]; 
 } ProxyConfig;
 
-// --- 全局变量声明 (extern) ---
+// --- 全局变量声明 ---
 extern ProxyConfig g_proxyConfig;
 extern volatile BOOL g_proxyRunning;
 extern SOCKET g_listen_sock;
@@ -174,6 +175,9 @@ extern const wchar_t* UA_PLATFORMS[];
 extern const char* UA_TEMPLATES[];
 
 extern BOOL g_enableLog;
+
+// 内存水位管理变量 (由 proxy.c 维护)
+extern volatile LONG64 g_total_allocated_mem;
 
 extern CRITICAL_SECTION g_configLock; 
 void InitGlobalLocks();
