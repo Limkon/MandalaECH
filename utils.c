@@ -231,8 +231,6 @@ char* Utils_HttpGet(const char* url) {
         }
         if (result) result[size] = 0;
         InternetCloseHandle(hFile);
-    } else {
-        // Log Error?
     }
     InternetCloseHandle(hInet);
     return result;
@@ -240,7 +238,6 @@ char* Utils_HttpGet(const char* url) {
 
 // --- 7. ECH 配置获取 (DoH) ---
 
-// 辅助：解析 Hex 字符串
 static unsigned char* hex_to_bytes(const char* hex, int* out_len) {
     if (!hex) return NULL;
     int len = strlen(hex);
@@ -253,7 +250,6 @@ static unsigned char* hex_to_bytes(const char* hex, int* out_len) {
     return buf;
 }
 
-// 解析 HTTPS (Type 65) 记录中的 ECH Config
 static unsigned char* ExtractECHFromDoHAnswer(const char* rdata_hex, size_t* out_ech_len) {
     int rdata_len = 0;
     unsigned char* rdata = hex_to_bytes(rdata_hex, &rdata_len);
@@ -263,24 +259,21 @@ static unsigned char* ExtractECHFromDoHAnswer(const char* rdata_hex, size_t* out
     unsigned char* end = rdata + rdata_len;
     unsigned char* result = NULL;
 
-    // Skip Priority (2)
     if (p + 2 > end) goto cleanup;
     p += 2;
 
-    // Skip Target Name (wire format)
     if (p >= end) goto cleanup;
     if (*p == 0) {
-        p++; // Root
+        p++;
     } else {
         while(p < end && *p != 0) {
             int label_len = *p;
             if (p + 1 + label_len > end) goto cleanup;
             p += 1 + label_len;
         }
-        if (p < end) p++; // Skip null terminator
+        if (p < end) p++;
     }
 
-    // Parse Params (Key=2B, Len=2B, Value)
     while (p + 4 <= end) {
         int key = (p[0] << 8) | p[1];
         int vlen = (p[2] << 8) | p[3];
@@ -288,13 +281,13 @@ static unsigned char* ExtractECHFromDoHAnswer(const char* rdata_hex, size_t* out
         
         if (p + vlen > end) goto cleanup;
 
-        if (key == 5) { // ECH Config Key
+        if (key == 5) {
             result = (unsigned char*)malloc(vlen);
             if (result) {
                 memcpy(result, p, vlen);
                 *out_ech_len = vlen;
             }
-            goto cleanup; // Found
+            goto cleanup;
         }
         p += vlen;
     }
@@ -304,7 +297,6 @@ cleanup:
     return result;
 }
 
-// 通过 DoH 获取 ECH 配置
 unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t* out_len) {
     if (!domain || !doh_server) return NULL;
     
@@ -326,11 +318,10 @@ unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t
                     cJSON* data = cJSON_GetObjectItem(item, "data");
                     if (data && cJSON_IsString(data)) {
                         const char* txt = data->valuestring;
-                        // Cloudflare JSON format: "\# <length> <hex>"
                         if (strncmp(txt, "\\#", 2) == 0) {
                             const char* hex_start = strrchr(txt, ' ');
                             if (hex_start) {
-                                hex_start++; // Skip space
+                                hex_start++;
                                 ech_config = ExtractECHFromDoHAnswer(hex_start, out_len);
                                 if (ech_config) break;
                             }
@@ -346,10 +337,10 @@ unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t
     return ech_config;
 }
 
-// --- 8. 日志记录 (The Fix) ---
+// --- 8. 日志记录 (修复版) ---
 
 void log_msg(const char* fmt, ...) {
-    // 逻辑修复：只有当 g_enableLog 为 TRUE 时，且窗口句柄有效，才进行后续处理
+    // 逻辑修复：仅当全局开关开启 且 窗口句柄有效 且 窗口存在时才执行记录
     if (!g_enableLog || !hLogViewerWnd || !IsWindow(hLogViewerWnd)) {
         return;
     }
@@ -363,26 +354,21 @@ void log_msg(const char* fmt, ...) {
     time_t now = time(NULL);
     struct tm* t = localtime(&now);
     wchar_t wMsg[2048];
-    // 将 char* 转换为 wchar_t 并添加时间戳
+    // 使用简体中文格式化时间戳
     swprintf_s(wMsg, 2048, L"[%02d:%02d:%02d] %S\r\n", t->tm_hour, t->tm_min, t->tm_sec, buf);
 
-    // 发送消息到 GUI 日志窗口
+    // 通过异步消息发送到 GUI 线程
     wchar_t* msgCopy = _wcsdup(wMsg);
     if (msgCopy) {
         PostMessageW(hLogViewerWnd, WM_LOG_UPDATE, 0, (LPARAM)msgCopy);
     }
 }
-    
-    // 如果需要调试控制台输出，可解开下行注释
-    // printf("%s\n", buf);
-}
 
-// --- 9. 系统代理设置 (The Fix) ---
+// --- 9. 系统代理设置 ---
 
 BOOL IsSystemProxyEnabled() {
     HKEY hKey;
     DWORD data = 0, size = sizeof(DWORD);
-    // REG_PATH_PROXY 在 common.h 中定义
     if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_PATH_PROXY, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
         RegQueryValueExW(hKey, L"ProxyEnable", NULL, NULL, (LPBYTE)&data, &size);
         RegCloseKey(hKey);
@@ -406,9 +392,7 @@ void SetSystemProxy(BOOL enable) {
         }
         RegCloseKey(hKey);
 
-        // 通知系统刷新设置
         InternetSetOption(NULL, INTERNET_OPTION_SETTINGS_CHANGED, NULL, 0);
         InternetSetOption(NULL, INTERNET_OPTION_REFRESH, NULL, 0);
     }
 }
-
