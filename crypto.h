@@ -3,6 +3,18 @@
 
 #include "common.h"
 
+// [Fix] 定义 CryptoSettings 结构体，必须放在函数声明之前
+typedef struct {
+    int enableFragment;
+    int fragMin;
+    int fragMax;
+    int fragDelay;
+    int enablePadding;
+    int padMin;
+    int padMax;
+    int enableChromeCiphers;
+} CryptoSettings;
+
 // --- 初始化与清理 ---
 void init_crypto_global();
 void cleanup_crypto_global();
@@ -22,7 +34,7 @@ void tls_close(TLSContext *ctx);
 int build_ws_frame(const char *in, int len, char *out);
 long long check_ws_frame(unsigned char *in, int len, int *head_len, int *payload_len);
 
-// [Fix] 增加 max_len 参数防止缓冲区溢出
+// [Security] 增加 max_len 参数防止缓冲区溢出
 int ws_read_payload_exact(TLSContext *tls, char *out_buf, int expected_len, int max_len);
 
 #endif // CRYPTO_H
