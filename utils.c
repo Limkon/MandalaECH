@@ -37,7 +37,8 @@ BOOL IsWindows8OrGreater() {
     return (pFunc != NULL);
 }
 
-static char* SafeStrDup(const char* s, int len) {
+// [Fix] 移除 static，使其可被外部调用
+char* SafeStrDup(const char* s, int len) {
     if (!s || len < 0) return NULL;
     char* d = (char*)malloc(len + 1);
     if (d) { memcpy(d, s, len); d[len] = 0; }
@@ -387,18 +388,15 @@ BOOL ReadFileToBuffer(const wchar_t* filename, char** buffer, long* size) {
 }
 
 // [Production Fix] 原子写入文件
-// 逻辑：将内存中的 buffer 写入 .tmp 文件，校验无误后，原子覆盖原文件
 BOOL WriteBufferToFile(const wchar_t* filename, const char* buffer) {
     wchar_t tempPath[MAX_PATH];
-    wchar_t bakPath[MAX_PATH]; // 用于可选的安全备份
+    wchar_t bakPath[MAX_PATH]; 
 
     if (!filename || !buffer) return FALSE;
 
-    // 1. 构造文件名
     swprintf(tempPath, MAX_PATH, L"%s.tmp", filename);
     swprintf(bakPath, MAX_PATH, L"%s.bak", filename);
 
-    // 2. 写入临时文件 (写入过程完全与原文件隔离)
     FILE* f = _wfopen(tempPath, L"wb");
     if (!f) {
         log_msg("[Config] Failed to create temp file: %ls", tempPath);
@@ -412,18 +410,13 @@ BOOL WriteBufferToFile(const wchar_t* filename, const char* buffer) {
         DeleteFileW(tempPath);
         return FALSE;
     }
-    fflush(f); // 确保数据落盘
+    fflush(f);
     fclose(f);
 
-    // 3. (可选) 创建 .bak 备份，防止逻辑错误导致配置归零
-    // 这不会影响 .tmp -> .json 的原子性
     if (GetFileAttributesW(filename) != INVALID_FILE_ATTRIBUTES) {
         CopyFileW(filename, bakPath, FALSE);
     }
 
-    // 4. 原子替换 (Atomic Replace)
-    // MOVEFILE_REPLACE_EXISTING: 如果目标文件存在，直接替换
-    // 操作系统保证此操作在文件系统层面是原子的：要么替换成功，要么失败，不会出现半个文件
     if (!MoveFileExW(tempPath, filename, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
          log_msg("[Config] Atomic swap failed, err=%d", GetLastError());
          DeleteFileW(tempPath);
@@ -487,7 +480,7 @@ char* GetClipboardText() {
 }
 
 // --------------------------------------------------------------------------
-// 系统代理设置 (兼容新旧系统)
+// 系统代理设置
 // --------------------------------------------------------------------------
 
 void SetSystemProxy(BOOL enable) {
@@ -563,7 +556,6 @@ void CleanupMemoryPool() {
 }
 
 void* Pool_Alloc_16K() {
-    // 1. 尝试从池中获取
     PSLIST_ENTRY pEntry = InterlockedPopEntrySList(&g_PoolHeader);
     if (pEntry) {
         InterlockedDecrement(&g_PoolSize);
@@ -571,7 +563,6 @@ void* Pool_Alloc_16K() {
         return pBlock->Data;
     }
 
-    // 2. 池为空，向 OS 申请 (对齐内存)
     MEMORY_BLOCK* pNewBlock = (MEMORY_BLOCK*)_aligned_malloc(sizeof(MEMORY_BLOCK), 16);
     if (!pNewBlock) {
         log_msg("[Fatal] OOM in Pool_Alloc_16K");
