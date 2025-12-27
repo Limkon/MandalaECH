@@ -272,8 +272,8 @@ char* Utils_HttpGet(const char* url) {
     return InternalHttpsGet(url);
 }
 
-// ECH 配置获取 (修复版)
-// 增加对 HTTPS RR 记录的解析逻辑，提取 ECH Config 参数 (Key=5)
+// ECH 配置获取 (修复版 v2)
+// 修复 RFC 3597 格式解析 bug：严格分离长度字段和 Hex 数据
 unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t* out_len) {
     if (!domain || !doh_server) return NULL;
     char url[2048]; snprintf(url, sizeof(url), "%s?name=%s&type=65", doh_server, domain);
@@ -297,15 +297,22 @@ unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t
                 cJSON* data = cJSON_GetObjectItem(record, "data");
                 if (data && data->valuestring) {
                     const char* data_str = data->valuestring;
-                    
-                    // 1. 处理可能存在的 RFC 3597 格式前缀 (e.g., "\# 123 <hex>")
+                    log_msg("[ECH] Raw RR: %s", data_str); // Debug: 打印原始记录
+
                     const char* p_hex = data_str;
+                    
+                    // 1. 严格处理 RFC 3597 格式前缀 (e.g., "\# 123 <hex>")
                     if (strncmp(p_hex, "\\#", 2) == 0) {
                         p_hex += 2;
-                        while (*p_hex && (*p_hex == ' ' || isdigit(*p_hex))) p_hex++; // 跳过长度和空格
+                        // Skip spaces
+                        while (*p_hex && isspace((unsigned char)*p_hex)) p_hex++;
+                        // Skip length digits
+                        while (*p_hex && isdigit((unsigned char)*p_hex)) p_hex++;
+                        // Skip separator spaces
+                        while (*p_hex && isspace((unsigned char)*p_hex)) p_hex++;
                     }
 
-                    // 2. 将数据转换为二进制 (假设是 HEX 格式)
+                    // 2. 将数据转换为二进制
                     unsigned char rdata[4096];
                     int rdata_len = HexToBin(p_hex, rdata, sizeof(rdata));
                     
@@ -315,15 +322,22 @@ unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t
                         unsigned char* ptr = rdata;
                         unsigned char* end = rdata + rdata_len;
                         
-                        // Skip Priority (2 bytes)
+                        // Priority
                         if (ptr + 2 > end) continue;
+                        int priority = (ptr[0] << 8) | ptr[1];
                         ptr += 2;
                         
+                        // 如果优先级为 0 (AliasMode)，则没有参数，直接跳过
+                        if (priority == 0) {
+                            log_msg("[ECH] Skipped AliasMode RR");
+                            continue;
+                        }
+
                         // Skip Target Name (Wire-format DNS name)
                         while (ptr < end && *ptr != 0) {
                             int label_len = *ptr;
                             ptr++;
-                            if (ptr + label_len > end) { ptr = end; break; } // Error
+                            if (ptr + label_len > end) { ptr = end; break; }
                             ptr += label_len;
                         }
                         if (ptr >= end) continue; 
@@ -344,7 +358,7 @@ unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t
                                 if (ech_config) {
                                     memcpy(ech_config, ptr, val_len);
                                     *out_len = val_len;
-                                    log_msg("[ECH] Found config in HTTPS record, len=%d", val_len);
+                                    log_msg("[ECH] Found config, len=%d", val_len);
                                 }
                                 break;
                             }
@@ -483,3 +497,4 @@ BOOL IsSystemProxyEnabled() {
     }
     return en;
 }
+
