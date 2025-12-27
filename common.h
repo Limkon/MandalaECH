@@ -1,3 +1,4 @@
+// common.h
 #ifndef COMMON_H
 #define COMMON_H
 
@@ -8,47 +9,43 @@
 #define _UNICODE
 #endif
 
-// 防止旧版 SDK 警告，锁定最低支持 Windows 7 (0x0601)
+// 防止旧版 SDK 警告
 #ifndef _WIN32_IE
 #define _WIN32_IE 0x0601
 #endif
-
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0601
 #endif
 
 #define WIN32_LEAN_AND_MEAN
-
-// 尝试阻止 windows.h 包含 wincrypt.h 以避免与 OpenSSL 冲突
 #define NOCRYPT 
 
 // --- 生产环境限制参数 ---
-#define MAX_CONNECTIONS 512
+// [IOCP] 连接数限制主要受内存限制，可大幅提高
+#define MAX_CONNECTIONS 10000
 #define IO_BUFFER_SIZE 16384 
-// 允许的最大单帧大小 (8MB)，但在处理时将增加更严苛的内存水位检查
 #define MAX_WS_FRAME_SIZE 8388608 
-// 生产环境建议：单个进程用于网络缓冲的最大内存总量 (如 512MB)，防止 OOM
-#define MAX_TOTAL_MEMORY_USAGE (512 * 1024 * 1024)
+#define MAX_TOTAL_MEMORY_USAGE (1024LL * 1024 * 1024) // 1GB
 
-// --- 调试与安全配置 ---
-#define LOG_DESENSITIZE TRUE  // 开启日志脱敏，隐藏密码和敏感 Host
+#define LOG_DESENSITIZE TRUE
 
-// --- 1. Windows 系统头文件 ---
+// --- Windows 头文件 ---
 #include <windows.h>
 #include <shellapi.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <mswsock.h> // AcceptEx, GetAcceptExSockaddrs
 #include <commctrl.h>
 #include <shlobj.h>
 #include <wininet.h>
 
-// --- 2. 引入资源头文件 ---
 #include "resource.h"
 
-// --- 3. 清理 Windows 宏污染 (解决与 OpenSSL 的命名冲突) ---
+// --- OpenSSL ---
 #ifdef X509_NAME
 #undef X509_NAME
 #endif
+// ... (保留原有的宏清理) ...
 #ifdef X509_EXTENSIONS
 #undef X509_EXTENSIONS
 #endif
@@ -68,15 +65,6 @@
 #undef OCSP_RESPONSE
 #endif
 
-// --- 4. 标准 C 头文件 ---
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <wchar.h>
-#include <time.h>
-#include <ctype.h>
-
-// --- 5. OpenSSL/BoringSSL 头文件 ---
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/bio.h>
@@ -105,13 +93,55 @@
 #define ID_TRAY_SETTINGS 1010
 #define ID_GLOBAL_HOTKEY 9001
 #define ID_TRAY_NODE_BASE 2000
-
-// ECH 设置控件 ID
 #define ID_CHK_ECH         7022
 #define ID_EDIT_ECH_SERVER 7023
 #define ID_EDIT_ECH_DOMAIN 7024
 
-// --- 结构体定义 ---
+// --- [IOCP] 结构体定义 ---
+
+// 操作类型
+typedef enum {
+    IO_READ_CLIENT,
+    IO_WRITE_CLIENT,
+    IO_READ_REMOTE,
+    IO_WRITE_REMOTE
+} IO_OPERATION_TYPE;
+
+// 单次 IO 操作的上下文 (继承自 OVERLAPPED)
+typedef struct {
+    OVERLAPPED overlapped;
+    IO_OPERATION_TYPE opType;
+    WSABUF wsaBuf;
+    char buffer[IO_BUFFER_SIZE]; // 每个操作独立的缓冲区
+    DWORD bytesTransferred;
+} IO_CONTEXT;
+
+// 每个连接的上下文
+typedef struct {
+    SOCKET clientSock;
+    SOCKET remoteSock;
+    SSL *ssl;
+    
+    // IOCP 使用 Memory BIO
+    BIO *io_in;  // 写加密数据供 SSL_read
+    BIO *io_out; // 读加密数据供发送
+    
+    // 用于 WS 解析的残留缓冲区
+    char *ws_frag_buf;
+    int ws_frag_len;
+    int ws_frag_cap;
+
+    // 两个方向的 IO 上下文
+    IO_CONTEXT rxClient; // 从 Client 读 (明文)
+    IO_CONTEXT rxRemote; // 从 Remote 读 (密文)
+    
+    // 发送通常是即时提交的，但也需要 Context 追踪完成
+    // 简化起见，我们在 Worker 中动态分配 Write Context 或使用对象池
+    // 这里保留引用计数以决定何时释放 Connection
+    volatile LONG refCount; 
+    BOOL closing;
+} CONNECTION_CONTEXT;
+
 typedef struct { 
     SOCKET sock; 
     SSL *ssl; 
@@ -131,6 +161,9 @@ typedef struct {
 extern ProxyConfig g_proxyConfig;
 extern volatile BOOL g_proxyRunning;
 extern SOCKET g_listen_sock;
+extern HANDLE hIOCP; // IOCP 句柄
+
+// ... (保留原有全局变量) ...
 extern SSL_CTX *g_ssl_ctx;
 extern HANDLE hProxyThread;
 extern NOTIFYICONDATAW nid;
@@ -153,7 +186,6 @@ extern WNDPROC g_oldListBoxProc;
 extern int g_nEditScrollPos;
 extern int g_nEditContentHeight;
 
-// 抗封锁配置
 extern BOOL g_enableChromeCiphers;
 extern BOOL g_enableALPN;
 extern BOOL g_enableFragment;
@@ -166,7 +198,6 @@ extern int g_padSizeMax;
 extern int g_uaPlatformIndex; 
 extern char g_userAgentStr[512];
 
-// ECH 全局配置变量
 extern BOOL g_enableECH;
 extern char g_echConfigServer[256]; 
 extern char g_echPublicName[256];   
@@ -175,11 +206,9 @@ extern const wchar_t* UA_PLATFORMS[];
 extern const char* UA_TEMPLATES[];
 
 extern BOOL g_enableLog;
-
-// 内存水位管理变量 (由 proxy.c 维护)
 extern volatile LONG64 g_total_allocated_mem;
-
 extern CRITICAL_SECTION g_configLock; 
+
 void InitGlobalLocks();
 void DeleteGlobalLocks();
 
