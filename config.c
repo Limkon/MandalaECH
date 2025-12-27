@@ -335,14 +335,22 @@ void ParseNodeConfigToGlobal(cJSON *node) {
 }
 
 void SwitchNode(const wchar_t* tag) {
+    // [Fix: Race Condition] 全程加锁，防止切换期间文件被篡改
     EnterCriticalSection(&g_configLock);
+    
     wcsncpy(currentNode, tag, 63);
-    LeaveCriticalSection(&g_configLock);
 
     char* buffer = NULL; long size = 0;
-    if (!ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) return;
+    if (!ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) {
+        LeaveCriticalSection(&g_configLock);
+        return;
+    }
+    
     cJSON* root = cJSON_Parse(buffer); free(buffer);
-    if (!root) return;
+    if (!root) {
+        LeaveCriticalSection(&g_configLock);
+        return;
+    }
     
     cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
     cJSON* targetNode = NULL;
@@ -354,6 +362,7 @@ void SwitchNode(const wchar_t* tag) {
     }
     
     if (targetNode) {
+        // ParseNodeConfigToGlobal 内部有锁，递归锁允许
         ParseNodeConfigToGlobal(targetNode); 
         StartProxyCore(); 
         SaveSettings();   
@@ -363,13 +372,24 @@ void SwitchNode(const wchar_t* tag) {
         Shell_NotifyIconW(NIM_MODIFY, &nid);
     }
     cJSON_Delete(root);
+    
+    LeaveCriticalSection(&g_configLock);
 }
 
 void DeleteNode(const wchar_t* tag) {
+    // [Fix: Race Condition] 加锁保护文件读写原子性
+    EnterCriticalSection(&g_configLock);
+
     char* buffer = NULL; long size = 0;
-    if (!ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) return;
+    if (!ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) {
+        LeaveCriticalSection(&g_configLock);
+        return;
+    }
     cJSON* root = cJSON_Parse(buffer); free(buffer);
-    if (!root) return;
+    if (!root) {
+        LeaveCriticalSection(&g_configLock);
+        return;
+    }
     cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
     char tagUtf8[256]; WideCharToMultiByte(CP_UTF8, 0, tag, -1, tagUtf8, 256, NULL, NULL);
     int idx = 0; cJSON* node;
@@ -379,25 +399,43 @@ void DeleteNode(const wchar_t* tag) {
         idx++;
     }
     char* out = cJSON_Print(root); WriteBufferToFile(CONFIG_FILE, out); free(out); cJSON_Delete(root);
+    
+    LeaveCriticalSection(&g_configLock);
+    
+    // 锁外更新内存缓存，避免锁嵌套过深
     ParseTags(); 
 }
 
 BOOL AddNodeToConfig(cJSON* newNode) {
     if (!newNode) return FALSE;
+    BOOL ret = FALSE;
+    
+    // [Fix: Race Condition] 加锁
+    EnterCriticalSection(&g_configLock);
+
     char* buffer = NULL; long size = 0; cJSON* root = NULL;
     if (ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) { root = cJSON_Parse(buffer); free(buffer); }
     if (!root) { root = cJSON_CreateObject(); cJSON_AddItemToObject(root, "outbounds", cJSON_CreateArray()); }
+    
     cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
     if (!outbounds) { outbounds = cJSON_CreateArray(); cJSON_AddItemToObject(root, "outbounds", outbounds); }
+    
     cJSON* jsonType = cJSON_GetObjectItem(newNode, "type");
     const char* typeStr = (jsonType && jsonType->valuestring) ? jsonType->valuestring : "proxy";
     cJSON* jsonTag = cJSON_GetObjectItem(newNode, "tag");
     const char* originalTag = (jsonTag && jsonTag->valuestring) ? jsonTag->valuestring : "NewNode";
+    
     char* uniqueTag = GetUniqueTagName(outbounds, typeStr, originalTag);
     if (cJSON_HasObjectItem(newNode, "tag")) cJSON_ReplaceItemInObject(newNode, "tag", cJSON_CreateString(uniqueTag));
     else cJSON_AddStringToObject(newNode, "tag", uniqueTag);
+    
     cJSON_AddItemToArray(outbounds, newNode);
-    char* out = cJSON_Print(root); BOOL ret = WriteBufferToFile(CONFIG_FILE, out); free(out); cJSON_Delete(root);
+    char* out = cJSON_Print(root); 
+    ret = WriteBufferToFile(CONFIG_FILE, out); 
+    free(out); cJSON_Delete(root);
+    
+    LeaveCriticalSection(&g_configLock);
+    
     return ret;
 }
 
@@ -471,34 +509,58 @@ int Internal_BatchAddNodesFromText(const char* text, cJSON* outbounds) {
 
 int ImportFromClipboard() {
     char* text = GetClipboardText(); if (!text) return 0;
+    int successCount = 0;
+    
+    // [Fix: Race Condition] 加锁
+    EnterCriticalSection(&g_configLock);
+    
     char* buffer = NULL; long size = 0; cJSON* root = NULL;
     if (ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) { root = cJSON_Parse(buffer); free(buffer); }
     if (!root) { root = cJSON_CreateObject(); cJSON_AddItemToObject(root, "outbounds", cJSON_CreateArray()); }
+    
     cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
     if (!outbounds) { outbounds = cJSON_CreateArray(); cJSON_AddItemToObject(root, "outbounds", outbounds); }
-    int successCount = Internal_BatchAddNodesFromText(text, outbounds);
-    if (successCount > 0) { char* out = cJSON_Print(root); WriteBufferToFile(CONFIG_FILE, out); free(out); ParseTags(); }
-    cJSON_Delete(root); free(text); return successCount;
+    
+    successCount = Internal_BatchAddNodesFromText(text, outbounds);
+    
+    if (successCount > 0) { 
+        char* out = cJSON_Print(root); 
+        WriteBufferToFile(CONFIG_FILE, out); 
+        free(out); 
+    }
+    cJSON_Delete(root); 
+    
+    LeaveCriticalSection(&g_configLock);
+    
+    if (successCount > 0) ParseTags(); 
+    free(text); 
+    return successCount;
 }
 
 int UpdateAllSubscriptions(BOOL forceMsg) {
     int activeSubs = 0;
+    // 1. 获取订阅列表快照
     EnterCriticalSection(&g_configLock);
     for(int i=0; i<g_subCount; i++) if(g_subs[i].enabled && strlen(g_subs[i].url) > 4) activeSubs++;
-    LeaveCriticalSection(&g_configLock);
-
-    if (activeSubs == 0) { if (forceMsg) log_msg("[Sub] No active subscriptions."); return 0; }
-    log_msg("[Sub] Updating %d subscriptions...", activeSubs);
-    char* rawData[MAX_SUBS] = {0}; int downloadSuccess = 0;
+    if (activeSubs == 0) { 
+        if (forceMsg) log_msg("[Sub] No active subscriptions."); 
+        LeaveCriticalSection(&g_configLock); 
+        return 0; 
+    }
     
-    char subUrls[MAX_SUBS][512]; int subIndices[MAX_SUBS]; int count = 0;
-    EnterCriticalSection(&g_configLock);
+    char subUrls[MAX_SUBS][512]; 
+    int count = 0;
     for (int i = 0; i < g_subCount; i++) {
         if (g_subs[i].enabled && strlen(g_subs[i].url) > 4) {
-            strncpy(subUrls[count], g_subs[i].url, 512); subIndices[count] = i; count++;
+            strncpy(subUrls[count], g_subs[i].url, 512); count++;
         }
     }
     LeaveCriticalSection(&g_configLock);
+
+    // 2. 网络下载 (耗时操作，不加锁)
+    log_msg("[Sub] Updating %d subscriptions...", activeSubs);
+    char* rawData[MAX_SUBS] = {0}; 
+    int downloadSuccess = 0;
 
     for (int i = 0; i < count; i++) {
         log_msg("[Sub] DL (%d/%d): %s", i+1, count, subUrls[i]);
@@ -514,9 +576,14 @@ int UpdateAllSubscriptions(BOOL forceMsg) {
 
     if (downloadSuccess == 0) { log_msg("[Err] All downloads failed."); return 0; }
     
+    // 3. 解析并写入文件 (加锁，防止与 UI 操作冲突)
+    EnterCriticalSection(&g_configLock);
+
     char* buffer = NULL; long size = 0; cJSON* root = NULL;
     if (ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) { root = cJSON_Parse(buffer); free(buffer); }
     if (!root) { root = cJSON_CreateObject(); }
+    
+    // 策略：覆盖旧节点
     if (cJSON_HasObjectItem(root, "outbounds")) cJSON_DeleteItemFromObject(root, "outbounds");
     cJSON* outbounds = cJSON_CreateArray(); cJSON_AddItemToObject(root, "outbounds", outbounds);
     
@@ -531,9 +598,13 @@ int UpdateAllSubscriptions(BOOL forceMsg) {
     }
     
     char* out = cJSON_Print(root); WriteBufferToFile(CONFIG_FILE, out); free(out); cJSON_Delete(root);
-    ParseTags(); 
+    
     // 即使解析出 0 个节点，只要下载成功也算更新了一次，避免死循环重试
     if (downloadSuccess > 0) { g_lastUpdateTime = (long long)time(NULL); SaveSettings(); }
+    
+    LeaveCriticalSection(&g_configLock);
+    
+    ParseTags(); 
     log_msg("[Sub] Update done. Total nodes: %d", totalNewNodes);
     return totalNewNodes;
 }
@@ -547,7 +618,6 @@ void ToggleTrayIcon() {
 }
 
 // --- 协议解析实现 (Vmess/Vless/Trojan/Shadowsocks/Socks/Mandala) ---
-// 下面的解析函数已在之前的版本中进行了完善，本次保持一致
 
 // SOCKS 解析
 cJSON* ParseSocks(const char* link) {
