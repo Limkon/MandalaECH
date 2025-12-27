@@ -22,14 +22,13 @@
 #pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "wininet.lib")
 
-// [Fix] 修复部分 MinGW 环境缺少宏定义导致的编译错误
 #ifndef INTERNET_OPTION_SECURITY_PROTOCOLS
 #define INTERNET_OPTION_SECURITY_PROTOCOLS 31
 #endif
 
 // 全局 SSL 上下文与原子锁
 static SSL_CTX* g_utils_ctx = NULL;
-static volatile LONG g_ctx_init_state = 0; // 0:未初始化, 1:初始化中, 2:已完成
+static volatile LONG g_ctx_init_state = 0; 
 
 // --------------------------------------------------------------------------
 // 基础工具函数
@@ -38,12 +37,10 @@ static volatile LONG g_ctx_init_state = 0; // 0:未初始化, 1:初始化中, 2:
 BOOL IsWindows8OrGreater() {
     HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
     if (hKernel32 == NULL) return FALSE;
-    // Windows 8 开始才支持此 API
     FARPROC pFunc = GetProcAddress(hKernel32, "SetProcessMitigationPolicy");
     return (pFunc != NULL);
 }
 
-// 兼容旧版系统的安全内存拷贝
 static char* SafeStrDup(const char* s, int len) {
     if (!s || len < 0) return NULL;
     char* d = (char*)malloc(len + 1);
@@ -55,22 +52,16 @@ static char* SafeStrDup(const char* s, int len) {
 }
 
 void log_msg(const char *format, ...) {
-    // 逻辑修复：仅当全局开关开启，或是致命错误时才执行记录
     if (!g_enableLog && strstr(format, "[Fatal]") == NULL) return;
-    
     char buf[2048]; char time_buf[64]; SYSTEMTIME st;
     GetLocalTime(&st);
     snprintf(time_buf, sizeof(time_buf), "[%02d:%02d:%02d] ", st.wHour, st.wMinute, st.wSecond);
-    
     va_list args; va_start(args, format);
     vsnprintf(buf, sizeof(buf) - 64, format, args);
     va_end(args);
-    
     char final_msg[2200];
     snprintf(final_msg, sizeof(final_msg), "%s%s\r\n", time_buf, buf);
-    
     OutputDebugStringA(final_msg);
-    
     extern HWND hLogViewerWnd; 
     if (hLogViewerWnd && IsWindow(hLogViewerWnd)) {
         int wLen = MultiByteToWideChar(CP_UTF8, 0, final_msg, -1, NULL, 0);
@@ -155,80 +146,41 @@ char* GetQueryParam(const char* query, const char* key) {
 }
 
 // --------------------------------------------------------------------------
-// ECH / Base64 / Hex 核心工具
+// ECH / Base64 / Hex 核心工具 (重写版)
 // --------------------------------------------------------------------------
 
-static const int b64_table[] = {
-    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,62,-1,63, // 修正：支持 + 和 - (43, 45 -> 62)
-    52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1,
-    -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
-    15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,63, // 修正：支持 _ (95 -> 63)
-    -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
-    41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1
-};
-
-// [Fixed] 增强版 Base64 解码，支持 URL-Safe 字符 (-_)
+// [Fix] 通用 Base64 解码，不依赖查表，自动处理 URL-Safe 和填充问题
 unsigned char* Base64Decode(const char* input, size_t* out_len) {
     if (!input) return NULL;
     size_t len = strlen(input);
     if (len == 0) return NULL;
 
-    size_t out_size = len / 4 * 3 + 4; // 多分配一点防止溢出
-    unsigned char* out = (unsigned char*)malloc(out_size + 1);
+    unsigned char* out = (unsigned char*)malloc(len + 4); 
     if (!out) return NULL;
     
-    size_t i = 0, j = 0;
-    while (i < len) {
-        if (input[i] == '\r' || input[i] == '\n' || input[i] == ' ') { i++; continue; } 
-        if (input[i] == '=') break; 
-        if (i + 1 >= len) break; // 防止越界读取
+    int val = 0, valb = -8;
+    size_t j = 0;
+    
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = input[i];
+        // 映射表逻辑
+        if (c >= 'A' && c <= 'Z') c -= 'A';
+        else if (c >= 'a' && c <= 'z') c = c - 'a' + 26;
+        else if (c >= '0' && c <= '9') c = c - '0' + 52;
+        else if (c == '+' || c == '-') c = 62; // 兼容 + 和 -
+        else if (c == '/' || c == '_') c = 63; // 兼容 / 和 _
+        else if (c == '=') break; // 结束
+        else continue; // 跳过换行、空格等非法字符
         
-        unsigned char a = (unsigned char)input[i];
-        unsigned char b = (unsigned char)input[i+1];
-
-        // 手动处理 URL-Safe 字符兼容
-        int v1 = (a > 127) ? -1 : b64_table[a];
-        int v2 = (b > 127) ? -1 : b64_table[b];
-
-        // 查表法已在表中兼容 - 和 _，此处保留逻辑以防万一使用不同表
-        if (v1 == -1 && a == '-') v1 = 62;
-        if (v1 == -1 && a == '_') v1 = 63;
-        if (v2 == -1 && b == '-') v2 = 62;
-        if (v2 == -1 && b == '_') v2 = 63;
-
-        if (v1 == -1 || v2 == -1) break;
-
-        uint32_t n = (v1 << 18) | (v2 << 12);
-        out[j++] = (n >> 16) & 0xFF;
-
-        if (i + 2 < len && input[i+2] != '=') {
-            unsigned char c = (unsigned char)input[i+2];
-            int v3 = (c > 127) ? -1 : b64_table[c];
-            if (v3 == -1 && c == '-') v3 = 62;
-            if (v3 == -1 && c == '_') v3 = 63;
-
-            if (v3 != -1) {
-                n |= (v3 << 6); 
-                out[j++] = (n >> 8) & 0xFF;
-                
-                if (i + 3 < len && input[i+3] != '=') {
-                    unsigned char d = (unsigned char)input[i+3];
-                    int v4 = (d > 127) ? -1 : b64_table[d];
-                    if (v4 == -1 && d == '-') v4 = 62;
-                    if (v4 == -1 && d == '_') v4 = 63;
-                    
-                    if (v4 != -1) {
-                        n |= v4; 
-                        out[j++] = n & 0xFF;
-                    }
-                }
-            }
+        val = (val << 6) | c;
+        valb += 6;
+        
+        if (valb >= 0) {
+            out[j++] = (unsigned char)((val >> valb) & 0xFF);
+            valb -= 8;
         }
-        i += 4;
     }
-    out[j] = 0; 
+    out[j] = 0;
     if (out_len) *out_len = j;
     return out;
 }
@@ -331,36 +283,38 @@ static BOOL ParseUrl(const char* url, URL_COMPONENTS_SIMPLE* out) {
     return TRUE;
 }
 
+// [Fix] 重构后的 WinInet 网络请求：强制 UA + TLS + 超时设置
 static char* InternalWinInetGet(const char* url) {
     char* result = NULL;
     
-    // [Fix] 使用全局定义的浏览器 User-Agent，避免被订阅源反爬
-    wchar_t wUA[512];
-    if (strlen(g_userAgentStr) > 0) {
-        MultiByteToWideChar(CP_UTF8, 0, g_userAgentStr, -1, wUA, 512);
-    } else {
-        // 默认使用一个现代浏览器的 UA
-        wcscpy(wUA, L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
-    }
+    // 使用常用浏览器 User-Agent，避免被订阅源拦截
+    const wchar_t* ua = L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
-    HINTERNET hInternet = InternetOpenW(wUA, INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
+    HINTERNET hInternet = InternetOpenW(ua, INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
     if (!hInternet) return NULL;
 
-    // [核心修复] 强制 Windows 7 开启 TLS 支持
-    DWORD protocols = 0x00000080 | 0x00000200 | 0x00000800; // TLS 1.0, 1.1, 1.2
+    // 强制开启 TLS 1.1 / 1.2 (兼容 Win7)
+    DWORD protocols = 0x00000080 | 0x00000200 | 0x00000800; 
     InternetSetOptionW(hInternet, INTERNET_OPTION_SECURITY_PROTOCOLS, &protocols, sizeof(protocols));
 
+    // 设置超时 (10秒)
     DWORD timeout = 10000;
     InternetSetOptionW(hInternet, INTERNET_OPTION_CONNECT_TIMEOUT, &timeout, sizeof(DWORD));
+    InternetSetOptionW(hInternet, INTERNET_OPTION_RECEIVE_TIMEOUT, &timeout, sizeof(DWORD));
 
     HINTERNET hFile = InternetOpenUrlA(hInternet, url, NULL, 0, 
         INTERNET_FLAG_RELOAD | INTERNET_FLAG_SECURE | INTERNET_FLAG_IGNORE_CERT_CN_INVALID | INTERNET_FLAG_NO_CACHE_WRITE, 0);
     
     if (hFile) {
-        int capacity = 256 * 1024;
+        // 动态内存增长读取响应
+        int capacity = 256 * 1024; // 初始 256KB
         char* buf = (char*)malloc(capacity);
         DWORD bytesRead = 0, totalRead = 0;
-        while (InternetReadFile(hFile, buf + totalRead, capacity - totalRead - 1, &bytesRead) && bytesRead > 0) {
+        
+        while (buf) {
+            BOOL bRead = InternetReadFile(hFile, buf + totalRead, capacity - totalRead - 1, &bytesRead);
+            if (!bRead || bytesRead == 0) break;
+            
             totalRead += bytesRead;
             if (totalRead >= (DWORD)capacity - 1024) {
                 capacity *= 2;
@@ -369,9 +323,17 @@ static char* InternalWinInetGet(const char* url) {
                 buf = newBuf;
             }
         }
-        if (buf) { buf[totalRead] = 0; result = SafeStrDup(buf, totalRead); free(buf); }
+        
+        if (buf) { 
+            buf[totalRead] = 0; 
+            result = SafeStrDup(buf, totalRead); 
+            free(buf); 
+        }
         InternetCloseHandle(hFile);
+    } else {
+        log_msg("[Utils] InternalWinInetGet failed for %s. Error: %d", url, GetLastError());
     }
+    
     InternetCloseHandle(hInternet);
     return result;
 }
@@ -428,12 +390,13 @@ static char* InternalBoringSSLGet(const char* url) {
 
 char* Utils_HttpGet(const char* url) {
     if (!url) return NULL;
+    // 仅 DoH 查询使用 BoringSSL 引擎，普通订阅下载走更稳定的 WinInet
     if (strstr(url, "/dns-query")) return InternalBoringSSLGet(url);
     return InternalWinInetGet(url);
 }
 
 // --------------------------------------------------------------------------
-// 代理与剪贴板 (严格按照 1.c 逻辑)
+// 代理与剪贴板
 // --------------------------------------------------------------------------
 
 char* GetClipboardText() {
@@ -451,7 +414,6 @@ void SetSystemProxy(BOOL enable) {
     wchar_t proxyServer[256]; swprintf_s(proxyServer, 256, L"127.0.0.1:%d", g_localPort);
     
     if (IsWindows8OrGreater()) {
-        // Windows 8+：直接写注册表
         HKEY hKey; 
         if (RegCreateKeyExW(HKEY_CURRENT_USER, REG_PATH_PROXY, 0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
             DWORD dwEn = enable ? 1 : 0; 
@@ -463,7 +425,6 @@ void SetSystemProxy(BOOL enable) {
             RegCloseKey(hKey);
         }
     } else {
-        // Windows 7 及以下：使用 WinInet 接口
         INTERNET_PER_CONN_OPTION_LISTW list; INTERNET_PER_CONN_OPTIONW opts[3];
         opts[0].dwOption = INTERNET_PER_CONN_FLAGS; 
         opts[0].Value.dwValue = enable ? PROXY_TYPE_PROXY : PROXY_TYPE_DIRECT;
@@ -480,14 +441,12 @@ void SetSystemProxy(BOOL enable) {
         InternetSetOptionW(NULL, INTERNET_OPTION_PER_CONNECTION_OPTION, &list, sizeof(list));
     }
     
-    // 刷新设置
     InternetSetOptionW(NULL, INTERNET_OPTION_SETTINGS_CHANGED, NULL, 0);
     InternetSetOptionW(NULL, INTERNET_OPTION_REFRESH, NULL, 0);
 }
 
 BOOL IsSystemProxyEnabled() {
     BOOL en = FALSE; HKEY hKey; DWORD dwEn = 0, dwSz = 4;
-    // 统一通过注册表读取状态
     if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_PATH_PROXY, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
         if (RegQueryValueExW(hKey, L"ProxyEnable", NULL, NULL, (BYTE*)&dwEn, &dwSz) == ERROR_SUCCESS && dwEn == 1) en = TRUE;
         RegCloseKey(hKey);
