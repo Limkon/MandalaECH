@@ -172,7 +172,7 @@ static char* InternalHttpsGet(const char* url) {
     SOCKET s = INVALID_SOCKET;
     SSL *ssl = NULL;
     char* result = NULL;
-    struct addrinfo hints, *res = NULL;
+    struct addrinfo hints, *res = NULL, *ptr = NULL;
     
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC; 
@@ -184,18 +184,29 @@ static char* InternalHttpsGet(const char* url) {
         return NULL;
     }
     
-    s = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (s == INVALID_SOCKET) { freeaddrinfo(res); return NULL; }
-    
-    DWORD timeout = 8000; 
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
-    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
+    // [Fix] 遍历所有解析出的地址 (IPv4/IPv6)，直到连接成功
+    for (ptr = res; ptr != NULL; ptr = ptr->ai_next) {
+        s = socket(ptr->ai_family, ptr->ai_socktype, ptr->ai_protocol);
+        if (s == INVALID_SOCKET) continue;
 
-    if (connect(s, res->ai_addr, (int)res->ai_addrlen) != 0) {
-        log_msg("[Net] Connect failed: %s", u.host);
-        closesocket(s); freeaddrinfo(res); return NULL;
+        DWORD timeout = 8000; 
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
+
+        if (connect(s, ptr->ai_addr, (int)ptr->ai_addrlen) == 0) {
+            break; // 连接成功
+        }
+        
+        closesocket(s);
+        s = INVALID_SOCKET;
     }
+    
     freeaddrinfo(res);
+
+    if (s == INVALID_SOCKET) {
+        log_msg("[Net] Connect failed (all addresses): %s", u.host);
+        return NULL;
+    }
 
     ssl = SSL_new(g_utils_ctx);
     if (!ssl) { closesocket(s); return NULL; }
