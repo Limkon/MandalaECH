@@ -238,16 +238,18 @@ BOOL CALLBACK InitCryptoCallback(PINIT_ONCE InitOnce, PVOID Parameter, PVOID *Co
     SSL_CTX_set_min_proto_version(g_ssl_ctx, TLS1_2_VERSION);
     SSL_CTX_set_max_proto_version(g_ssl_ctx, TLS1_3_VERSION);
     
+    // TLS 1.2
     const char *chrome_ciphers = "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-RSA-AES128-SHA";
     SSL_CTX_set_cipher_list(g_ssl_ctx, chrome_ciphers);
 
-    // ECH 需要 TLS 1.3
+    // TLS 1.3
     const char *tls13_ciphers = "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256";
     if (SSL_CTX_set_ciphersuites(g_ssl_ctx, tls13_ciphers) != 1) {
          log_msg("[Warn] Failed to set TLS 1.3 ciphersuites");
     }
 
-    SSL_CTX_set_options(g_ssl_ctx, SSL_OP_NO_COMPRESSION | SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION);
+    // [Fix] Add SSL_OP_ENABLE_MIDDLEBOX_COMPAT for better compatibility
+    SSL_CTX_set_options(g_ssl_ctx, SSL_OP_NO_COMPRESSION | SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION | SSL_OP_ENABLE_MIDDLEBOX_COMPAT);
     SSL_CTX_set_session_cache_mode(g_ssl_ctx, SSL_SESS_CACHE_CLIENT);
 
     HRSRC hRes = FindResourceW(NULL, MAKEINTRESOURCEW(2), RT_RCDATA);
@@ -290,10 +292,22 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
     ctx->ssl = SSL_new(g_ssl_ctx);
     if (!ctx->ssl) return -1;
     SSL_set_fd(ctx->ssl, (int)ctx->sock);
-    
-    // [ECH 处理]
+
+    // [Fix 1] 必须首先设置 SNI (Inner SNI)
+    // ECH 机制需要基于已设置的 Inner SNI 来生成 ClientHello
+    const char *sni_name = (target_sni && strlen(target_sni)) ? target_sni : target_host;
+    SSL_set_tlsext_host_name(ctx->ssl, sni_name);
+
+    // [Fix 2] 设置 ALPN (必须包含 h2，以匹配服务器 ECH 配置)
+    unsigned char alpn_protos[] = { 
+        2, 'h', '2', 
+        8, 'h', 't', 't', 'p', '/', '1', '.', '1' 
+    };
+    SSL_set_alpn_protos(ctx->ssl, alpn_protos, sizeof(alpn_protos));
+
+    // [Fix 3] 之后再加载 ECH 配置 (OpenSSL 会自动生成 Outer SNI)
     if (g_enableECH) {
-        const char* query_domain = (g_echPublicName && strlen(g_echPublicName)) ? g_echPublicName : (target_sni ? target_sni : target_host);
+        const char* query_domain = (g_echPublicName && strlen(g_echPublicName)) ? g_echPublicName : sni_name;
         
         size_t ech_len = 0;
         unsigned char* ech_config = FetchECHConfig(query_domain, g_echConfigServer, &ech_len);
@@ -310,7 +324,6 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
         }
     }
 
-    // [ECH Fix] 当 ECH 开启时跳过 Fragmentation BIO，防止干扰 ECH ClientHello 结构
     if (method_frag && !g_enableECH) {
         BIO *frag = BIO_new(method_frag);
         if (frag) {
@@ -324,18 +337,6 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
     } else if (g_enableECH) {
         log_msg("[ECH] Fragmentation/Padding BIO skipped to ensure integrity");
     }
-    
-    const char *sni_name = (target_sni && strlen(target_sni)) ? target_sni : target_host;
-    SSL_set_tlsext_host_name(ctx->ssl, sni_name);
-    
-    // [ALPN Fix] ECH 通常需要 h2/h3 支持。增加 h2 以避免 illegal_parameter
-    // 格式: Length + ProtocolString ...
-    // \x02 h2 \x08 http/1.1
-    unsigned char alpn_protos[] = { 
-        2, 'h', '2', 
-        8, 'h', 't', 't', 'p', '/', '1', '.', '1' 
-    };
-    SSL_set_alpn_protos(ctx->ssl, alpn_protos, sizeof(alpn_protos));
     
     int ret = SSL_connect(ctx->ssl);
     if (ret != 1) {
