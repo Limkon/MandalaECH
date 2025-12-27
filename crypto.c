@@ -1,7 +1,6 @@
 #include "crypto.h"
 #include "utils.h"
 #include "common.h"
-#include "proxy.h" 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,12 +11,14 @@
 #include <openssl/rand.h>
 #include <openssl/bio.h>
 
-// [Fix] 直接定义全局变量，而不是引用 extern
-SSL_CTX *g_ssl_ctx = NULL;
+// 引用 globals.c 中的全局变量
+extern SSL_CTX *g_ssl_ctx;
+extern int g_enableECH;
 
 static BIO_METHOD *method_frag = NULL;
 static INIT_ONCE g_crypto_init_once = INIT_ONCE_STATIC_INIT;
 
+// ---------------------- BIO Implementation ----------------------
 typedef struct {
     int first_packet_sent;
     int frag_min;
@@ -37,7 +38,7 @@ static int frag_free(BIO *b);
 BIO_METHOD *BIO_f_fragment(void) { return method_frag; }
 
 static int frag_new(BIO *b) {
-    FragCtx *ctx = (FragCtx *)Proxy_Malloc(sizeof(FragCtx));
+    FragCtx *ctx = (FragCtx *)malloc(sizeof(FragCtx));
     if(!ctx) return 0;
     memset(ctx, 0, sizeof(FragCtx));
     BIO_set_data(b, ctx);
@@ -48,10 +49,7 @@ static int frag_new(BIO *b) {
 static int frag_free(BIO *b) {
     if (b == NULL) return 0;
     FragCtx *ctx = (FragCtx *)BIO_get_data(b);
-    if (ctx) { 
-        Proxy_Free(ctx, sizeof(FragCtx)); 
-        BIO_set_data(b, NULL); 
-    }
+    if (ctx) { free(ctx); BIO_set_data(b, NULL); }
     return 1;
 }
 
@@ -96,6 +94,7 @@ static char* inject_padding(const char* in, int in_len, int* out_len, int pad_mi
     int ext_total_len = (data[offset] << 8) | data[offset+1];
     offset += 2;
     
+    // [Safety] 严格检查剩余长度，防止越界或处理不完整的 Record
     if (offset + ext_total_len != in_len - TLS_HEADER_LEN) return NULL;
 
     int range = pad_max - pad_min;
@@ -106,13 +105,12 @@ static char* inject_padding(const char* in, int in_len, int* out_len, int pad_mi
 
     int pad_ext_len = 4 + pad_data_len;
     int new_total_len = in_len + pad_ext_len;
-    
-    char* new_buf = (char*)Proxy_Malloc(new_total_len);
+    char* new_buf = (char*)malloc(new_total_len);
     if (!new_buf) return NULL;
 
     memcpy(new_buf, in, in_len);
     unsigned char* p = (unsigned char*)new_buf + in_len;
-    *p++ = 0x00; *p++ = 0x15; 
+    *p++ = 0x00; *p++ = 0x15; // Extension Type: Padding (21)
     *p++ = (pad_data_len >> 8) & 0xFF;
     *p++ = pad_data_len & 0xFF;
     memset(p, 0, pad_data_len);
@@ -171,7 +169,7 @@ static int frag_write(BIO *b, const char *in, int inl) {
             if (frag_count >= MAX_FRAG_COUNT) {
                 int ret = BIO_write(next, send_buf + bytes_processed, remaining);
                 if (ret <= 0) { 
-                    if (alloc_buf) Proxy_Free(alloc_buf, send_len); 
+                    if (alloc_buf) free(alloc_buf);
                     BIO_copy_next_retry(b); 
                     return (bytes_processed > 0 ? (alloc_buf ? inl : bytes_processed) : ret); 
                 }
@@ -186,7 +184,7 @@ static int frag_write(BIO *b, const char *in, int inl) {
             
             int ret = BIO_write(next, send_buf + bytes_processed, chunk_size);
             if (ret <= 0) { 
-                if (alloc_buf) Proxy_Free(alloc_buf, send_len); 
+                if (alloc_buf) free(alloc_buf);
                 BIO_copy_next_retry(b); 
                 return (bytes_processed > 0 ? (alloc_buf ? inl : bytes_processed) : ret); 
             }
@@ -201,7 +199,7 @@ static int frag_write(BIO *b, const char *in, int inl) {
     } else {
         total_sent = BIO_write(next, send_buf, send_len);
     }
-    if (alloc_buf) Proxy_Free(alloc_buf, send_len); 
+    if (alloc_buf) free(alloc_buf);
     
     if (total_sent > 0) {
         BIO_copy_next_retry(b);
@@ -226,6 +224,7 @@ static long frag_ctrl(BIO *b, int cmd, long num, void *ptr) {
     return BIO_ctrl(next, cmd, num, ptr);
 }
 
+// ---------------------- Initialization Logic ----------------------
 BOOL CALLBACK InitCryptoCallback(PINIT_ONCE InitOnce, PVOID Parameter, PVOID *Context) {
     SSL_library_init(); 
     OpenSSL_add_all_algorithms(); 
@@ -249,9 +248,11 @@ BOOL CALLBACK InitCryptoCallback(PINIT_ONCE InitOnce, PVOID Parameter, PVOID *Co
     SSL_CTX_set_min_proto_version(g_ssl_ctx, TLS1_2_VERSION);
     SSL_CTX_set_max_proto_version(g_ssl_ctx, TLS1_3_VERSION);
     
+    // TLS 1.2
     const char *chrome_ciphers = "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-RSA-AES128-SHA";
     SSL_CTX_set_cipher_list(g_ssl_ctx, chrome_ciphers);
 
+    // TLS 1.3
     const char *tls13_ciphers = "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256";
     if (SSL_CTX_set_ciphersuites(g_ssl_ctx, tls13_ciphers) != 1) {
          log_msg("[Warn] Failed to set TLS 1.3 ciphersuites");
@@ -292,18 +293,25 @@ void cleanup_crypto_global() {
     if (method_frag) { BIO_meth_free(method_frag); method_frag = NULL; }
 }
 
+// ---------------------- Connection Logic ----------------------
+
 int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target_host, const CryptoSettings* settings) {
     if (!g_ssl_ctx) return -1;
 
     ctx->ssl = SSL_new(g_ssl_ctx);
     if (!ctx->ssl) return -1;
-    
+    // [Fix] 移除 SSL_set_fd，避免 BIO 所有权混乱
+    // SSL_set_fd(ctx->ssl, (int)ctx->sock); 
+
+    // 1. 设置 SNI (Inner SNI)
     const char *sni_name = (target_sni && strlen(target_sni)) ? target_sni : target_host;
     SSL_set_tlsext_host_name(ctx->ssl, sni_name);
 
+    // 2. 设置 ALPN (HTTP/1.1)
     unsigned char alpn_protos[] = { 8, 'h', 't', 't', 'p', '/', '1', '.', '1' };
     SSL_set_alpn_protos(ctx->ssl, alpn_protos, sizeof(alpn_protos));
 
+    // 3. ECH 配置
     if (g_enableECH) {
         SSL_set_min_proto_version(ctx->ssl, TLS1_3_VERSION);
         SSL_set_max_proto_version(ctx->ssl, TLS1_3_VERSION);
@@ -318,12 +326,14 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
             } else {
                  log_msg("[ECH] Config set for %s (len=%d)", query_domain, ech_len);
             }
-            Proxy_Free(ech_config, ech_len);
+            free(ech_config);
         } else {
             log_msg("[ECH] No config found for %s, fallback to plain TLS", query_domain);
         }
     }
 
+    // [Fix] 手动构建 BIO 链，确保引用计数正确
+    // 创建基础 Socket BIO (引用计数=1)
     BIO *internal_bio = BIO_new_socket((int)ctx->sock, BIO_NOCLOSE);
     if (!internal_bio) { SSL_free(ctx->ssl); ctx->ssl = NULL; return -1; }
 
@@ -331,12 +341,26 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
         BIO *frag_bio = BIO_new(method_frag);
         if (frag_bio) {
             BIO_set_params(frag_bio, settings);
+            // frag -> internal. internal 被链条持有。
             BIO_push(frag_bio, internal_bio); 
+            
+            // SSL 使用 frag_bio 进行读写。
+            // SSL_set_bio 会消耗传入 BIO 的引用。
+            // 此时 internal_bio 被 frag_bio 引用，我们需要确保它不会因为 SSL 释放链头而过早销毁吗？
+            // BIO_push 不增加 internal 的引用计数，它只是接管所有权。
+            // SSL_set_bio 接管 frag_bio 的所有权。
+            // 我们还需要一个引用给 rbio 吗？如果不区分 r/w，SSL_set_bio(ssl, bio, bio)。
+            // 在这种情况下，rbio = internal, wbio = frag (chain to internal).
+            // 为简单起见，我们让 rbio 也走 frag（透传），或者直接设为 socket。
+            // 为了避免复杂的引用计数问题，这里让 rbio 和 wbio 都使用 frag_bio。
+            // 这样 frag_bio 的 read 会透传给 internal_bio。
+            
             SSL_set_bio(ctx->ssl, frag_bio, frag_bio);
         } else {
             SSL_set_bio(ctx->ssl, internal_bio, internal_bio);
         }
     } else {
+        // 无 Fragment，直接使用 Socket BIO
         SSL_set_bio(ctx->ssl, internal_bio, internal_bio);
     }
     
