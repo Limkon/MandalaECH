@@ -235,6 +235,7 @@ BOOL CALLBACK InitCryptoCallback(PINIT_ONCE InitOnce, PVOID Parameter, PVOID *Co
         return FALSE;
     }
 
+    // 默认协议范围
     SSL_CTX_set_min_proto_version(g_ssl_ctx, TLS1_2_VERSION);
     SSL_CTX_set_max_proto_version(g_ssl_ctx, TLS1_3_VERSION);
     
@@ -248,7 +249,6 @@ BOOL CALLBACK InitCryptoCallback(PINIT_ONCE InitOnce, PVOID Parameter, PVOID *Co
          log_msg("[Warn] Failed to set TLS 1.3 ciphersuites");
     }
 
-    // [Fix] Add SSL_OP_ENABLE_MIDDLEBOX_COMPAT for better compatibility
     SSL_CTX_set_options(g_ssl_ctx, SSL_OP_NO_COMPRESSION | SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION | SSL_OP_ENABLE_MIDDLEBOX_COMPAT);
     SSL_CTX_set_session_cache_mode(g_ssl_ctx, SSL_SESS_CACHE_CLIENT);
 
@@ -293,22 +293,24 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
     if (!ctx->ssl) return -1;
     SSL_set_fd(ctx->ssl, (int)ctx->sock);
 
-    // [Fix 1] 必须首先设置 SNI (Inner SNI)
-    // ECH 机制需要基于已设置的 Inner SNI 来生成 ClientHello
+    // [Fix] 1. SNI 必须首先设置 (Inner SNI)
     const char *sni_name = (target_sni && strlen(target_sni)) ? target_sni : target_host;
     SSL_set_tlsext_host_name(ctx->ssl, sni_name);
 
-    // [Fix 2] 设置 ALPN (必须包含 h2，以匹配服务器 ECH 配置)
+    // [Fix] 2. ALPN: 包含 h2 以支持 ECH (优先 h2)
     unsigned char alpn_protos[] = { 
         2, 'h', '2', 
         8, 'h', 't', 't', 'p', '/', '1', '.', '1' 
     };
     SSL_set_alpn_protos(ctx->ssl, alpn_protos, sizeof(alpn_protos));
 
-    // [Fix 3] 之后再加载 ECH 配置 (OpenSSL 会自动生成 Outer SNI)
+    // [Fix] 3. 加载 ECH 配置 & 强制 TLS 1.3
     if (g_enableECH) {
+        // ECH 要求严格的 TLS 1.3。禁止 TLS 1.2 以防止协议降级导致的非法参数错误
+        SSL_set_min_proto_version(ctx->ssl, TLS1_3_VERSION);
+        SSL_set_max_proto_version(ctx->ssl, TLS1_3_VERSION);
+
         const char* query_domain = (g_echPublicName && strlen(g_echPublicName)) ? g_echPublicName : sni_name;
-        
         size_t ech_len = 0;
         unsigned char* ech_config = FetchECHConfig(query_domain, g_echConfigServer, &ech_len);
         
@@ -324,6 +326,7 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
         }
     }
 
+    // [Fix] 4. ECH 开启时跳过 Fragmentation BIO
     if (method_frag && !g_enableECH) {
         BIO *frag = BIO_new(method_frag);
         if (frag) {
