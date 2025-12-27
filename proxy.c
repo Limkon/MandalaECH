@@ -3,28 +3,20 @@
 #include "utils.h"
 #include "common.h"
 #include <openssl/sha.h>
-#include <process.h>
 
 // [Safety] 全局活跃连接计数器与内存水位监控
 static volatile LONG g_active_connections = 0;
 volatile LONG64 g_total_allocated_mem = 0; 
-HANDLE hIOCP = NULL;
 
-// [Safety] 自动初始化锁的标志位，防止崩溃
-static volatile LONG g_locksInitialized = 0;
-
-// [Concurrency] 客户端初始化上下文 (仅用于握手线程启动)
+// [Concurrency] 客户端线程上下文 - 确保配置在线程间隔离
 typedef struct {
     SOCKET clientSock;
     ProxyConfig config;          
     char userAgent[512];         
     CryptoSettings cryptoSettings; 
-} ClientInitContext;
+} ClientContext;
 
-// --------------------------------------------------------------------------
-// 辅助函数
-// --------------------------------------------------------------------------
-
+// --- 辅助函数：解析 UUID ---
 void parse_uuid(const char* uuid_str, unsigned char* out) {
     const char* p = uuid_str;
     int i = 0;
@@ -42,6 +34,7 @@ void parse_uuid(const char* uuid_str, unsigned char* out) {
     }
 }
 
+// --- 辅助函数：Trojan 密码哈希 ---
 void trojan_password_hash(const char* password, char* out_hex) {
     unsigned char digest[SHA224_DIGEST_LENGTH];
     SHA224((unsigned char*)password, (size_t)strlen(password), digest);
@@ -51,17 +44,19 @@ void trojan_password_hash(const char* password, char* out_hex) {
     out_hex[SHA224_DIGEST_LENGTH * 2] = 0;
 }
 
+// 接收超时辅助函数
 int recv_timeout(SOCKET s, char *buf, int len, int timeout_sec) {
     fd_set fds; 
     FD_ZERO(&fds); 
     FD_SET(s, &fds);
     struct timeval tv = { timeout_sec, 0 };
     int n = select(0, &fds, NULL, NULL, &tv);
-    if (n == 0) return -2; 
-    if (n < 0) return -1;  
+    if (n == 0) return -2; // Timeout
+    if (n < 0) return -1;  // Error
     return recv(s, buf, len, 0);
 }
 
+// 健壮的头部读取
 int read_header_robust(SOCKET s, char* buf, int max_len, int timeout_sec) {
     int total_read = 0;
     int remaining_time = timeout_sec;
@@ -71,13 +66,44 @@ int read_header_robust(SOCKET s, char* buf, int max_len, int timeout_sec) {
         if (n <= 0) return -1; 
         total_read += n;
         buf[total_read] = 0; 
-        if (buf[0] == 0x05) { if (total_read >= 2) return total_read; }
-        else { if (strstr(buf, "\r\n\r\n")) return total_read; }
-        if (total_read > 8192) break; 
+        
+        // SOCKS5 探测 (05 01 00)
+        if (buf[0] == 0x05) { 
+            if (total_read >= 2) return total_read; 
+        }
+        // HTTP 探测
+        else { 
+            if (strstr(buf, "\r\n\r\n")) return total_read; 
+        }
+        
+        if (total_read > 8192) break; // 防御超大头部攻击
     }
     return total_read > 0 ? total_read : -1;
 }
 
+// 发送全部数据 (非阻塞兼容)
+int send_all(SOCKET s, const char *buf, int len) {
+    int total = 0; 
+    int bytesleft = len; 
+    int n;
+    while(total < len) {
+        n = send(s, buf+total, bytesleft, 0);
+        if (n == -1) {
+            int err = WSAGetLastError();
+            if (err == WSAEWOULDBLOCK) { 
+                fd_set wfd; FD_ZERO(&wfd); FD_SET(s, &wfd);
+                struct timeval tv = { 1, 0 };
+                if (select(0, NULL, &wfd, NULL, &tv) > 0) continue;
+                return -1;
+            }
+            return -1;
+        }
+        total += n; bytesleft -= n;
+    }
+    return total;
+}
+
+// Base64 编码 (用于 WS Key)
 void base64_encode_key(const unsigned char* src, char* dst) {
     const char* table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     for(int i=0; i<16; i+=3) {
@@ -91,8 +117,12 @@ void base64_encode_key(const unsigned char* src, char* dst) {
     *(dst-1) = '='; *dst = 0;
 }
 
+// [Optimization] 动态内存分配与监控包装器
 void* proxy_malloc(size_t size) {
-    if (g_total_allocated_mem + (LONG64)size > MAX_TOTAL_MEMORY_USAGE) return NULL;
+    if (g_total_allocated_mem + (LONG64)size > MAX_TOTAL_MEMORY_USAGE) {
+        log_msg("[Warn] Memory limit reached, allocation denied.");
+        return NULL;
+    }
     void* p = malloc(size);
     if (p) InterlockedAdd64(&g_total_allocated_mem, (LONG64)size);
     return p;
@@ -105,411 +135,462 @@ void proxy_free(void* p, size_t size) {
     }
 }
 
-// --------------------------------------------------------------------------
-// IOCP 核心逻辑
-// --------------------------------------------------------------------------
-
-IO_CONTEXT* AllocIoContext(IO_OPERATION_TYPE type) {
-    IO_CONTEXT* ctx = (IO_CONTEXT*)proxy_malloc(sizeof(IO_CONTEXT));
-    if (!ctx) return NULL;
-    memset(ctx, 0, sizeof(IO_CONTEXT));
-    ctx->opType = type;
-    ctx->wsaBuf.buf = ctx->buffer;
-    ctx->wsaBuf.len = IO_BUFFER_SIZE;
-    return ctx;
-}
-
-void FreeIoContext(IO_CONTEXT* ctx) {
-    if (ctx) proxy_free(ctx, sizeof(IO_CONTEXT));
-}
-
-void FreeConnectionContext(CONNECTION_CONTEXT* conn) {
-    if (!conn) return;
-    if (conn->clientSock != INVALID_SOCKET) { closesocket(conn->clientSock); conn->clientSock = INVALID_SOCKET; }
-    if (conn->remoteSock != INVALID_SOCKET) { closesocket(conn->remoteSock); conn->remoteSock = INVALID_SOCKET; }
-    if (conn->ssl) { SSL_free(conn->ssl); conn->ssl = NULL; }
-    if (conn->ws_frag_buf) proxy_free(conn->ws_frag_buf, conn->ws_frag_cap);
-    proxy_free(conn, sizeof(CONNECTION_CONTEXT));
-    InterlockedDecrement(&g_active_connections);
-}
-
-BOOL PostRecv(SOCKET s, IO_CONTEXT* ioCtx) {
-    DWORD flags = 0;
-    ioCtx->wsaBuf.len = IO_BUFFER_SIZE; 
-    ioCtx->bytesTransferred = 0;
-    memset(&ioCtx->overlapped, 0, sizeof(OVERLAPPED));
-    int n = WSARecv(s, &ioCtx->wsaBuf, 1, NULL, &flags, &ioCtx->overlapped, NULL);
-    if (n == SOCKET_ERROR && WSAGetLastError() != ERROR_IO_PENDING) return FALSE;
-    return TRUE;
-}
-
-BOOL PostSend(SOCKET s, const char* data, int len) {
-    if (len <= 0) return TRUE;
-    IO_CONTEXT* sendCtx = AllocIoContext(IO_WRITE_CLIENT); 
-    if (!sendCtx) return FALSE;
-    if (len > IO_BUFFER_SIZE) len = IO_BUFFER_SIZE; 
-    memcpy(sendCtx->buffer, data, len);
-    sendCtx->wsaBuf.len = len;
-    sendCtx->opType = IO_WRITE_CLIENT; 
-    int n = WSASend(s, &sendCtx->wsaBuf, 1, NULL, 0, &sendCtx->overlapped, NULL);
-    if (n == SOCKET_ERROR && WSAGetLastError() != ERROR_IO_PENDING) {
-        FreeIoContext(sendCtx);
-        return FALSE;
-    }
-    return TRUE;
-}
-
-void OnClientRead(CONNECTION_CONTEXT* conn, DWORD bytesTransferred) {
-    if (bytesTransferred == 0) return; 
-    char* plain_data = conn->rxClient.buffer;
-    int plain_len = bytesTransferred;
-    char* frame_buf = (char*)proxy_malloc(plain_len + 14); 
-    if (!frame_buf) return;
-    int frame_len = build_ws_frame(plain_data, plain_len, frame_buf);
-    int max_cipher = frame_len + 1024; 
-    char* cipher_buf = (char*)proxy_malloc(max_cipher);
-    if (!cipher_buf) { proxy_free(frame_buf, plain_len + 14); return; }
-    int cipher_len = tls_encrypt_to_mem(conn, frame_buf, frame_len, cipher_buf, max_cipher);
-    proxy_free(frame_buf, plain_len + 14);
-    if (cipher_len > 0) PostSend(conn->remoteSock, cipher_buf, cipher_len);
-    proxy_free(cipher_buf, max_cipher);
-}
-
-void OnRemoteRead(CONNECTION_CONTEXT* conn, DWORD bytesTransferred) {
-    if (bytesTransferred == 0) return;
-    char* cipher_data = conn->rxRemote.buffer;
-    int cipher_len = bytesTransferred;
-    int max_plain = cipher_len + 1024; 
-    char* plain_buf = (char*)proxy_malloc(max_plain);
-    if (!plain_buf) return;
-    
-    int plain_len = tls_decrypt_from_mem(conn, cipher_data, cipher_len, plain_buf, max_plain);
-    
-    if (plain_len > 0) {
-        if (conn->ws_frag_len + plain_len > conn->ws_frag_cap) {
-            int new_cap = conn->ws_frag_cap * 2;
-            if (new_cap < conn->ws_frag_len + plain_len) new_cap = conn->ws_frag_len + plain_len + 1024;
-            if (new_cap > MAX_WS_FRAME_SIZE) { proxy_free(plain_buf, max_plain); return; }
-            char* new_buf = (char*)proxy_malloc(new_cap);
-            if (new_buf) {
-                if (conn->ws_frag_buf) {
-                    memcpy(new_buf, conn->ws_frag_buf, conn->ws_frag_len);
-                    proxy_free(conn->ws_frag_buf, conn->ws_frag_cap);
-                }
-                conn->ws_frag_buf = new_buf;
-                conn->ws_frag_cap = new_cap;
-            } else { proxy_free(plain_buf, max_plain); return; }
-        }
-        memcpy(conn->ws_frag_buf + conn->ws_frag_len, plain_buf, plain_len);
-        conn->ws_frag_len += plain_len;
-        
-        while (conn->ws_frag_len > 0) {
-            int hl, pl;
-            long long frame_total = check_ws_frame((unsigned char*)conn->ws_frag_buf, conn->ws_frag_len, &hl, &pl);
-            if (frame_total < 0) break; 
-            if (frame_total == 0) break;
-            
-            int opcode = conn->ws_frag_buf[0] & 0x0F;
-            if (opcode == 0x8) break;
-            
-            if ((opcode == 0x1 || opcode == 0x2) && pl > 0) {
-                char* payload = conn->ws_frag_buf + hl;
-                int payload_size = pl;
-                
-                // VLESS Response Header Stripping
-                if (conn->is_vless && !conn->header_stripped) {
-                    if (payload_size >= 2) {
-                        int addon_len = (unsigned char)payload[1];
-                        int head_size = 2 + addon_len;
-                        if (payload_size >= head_size) {
-                            payload += head_size;
-                            payload_size -= head_size;
-                            conn->header_stripped = TRUE;
-                        } else {
-                             payload_size = 0; 
-                        }
-                    } else payload_size = 0;
-                }
-
-                if (payload_size > 0) PostSend(conn->clientSock, payload, payload_size);
-            }
-            if (frame_total < conn->ws_frag_len) memmove(conn->ws_frag_buf, conn->ws_frag_buf + frame_total, conn->ws_frag_len - (int)frame_total);
-            conn->ws_frag_len -= (int)frame_total;
-        }
-    }
-    proxy_free(plain_buf, max_plain);
-}
-
-DWORD WINAPI WorkerThread(LPVOID lpParam) {
-    DWORD bytesTransferred = 0;
-    ULONG_PTR completionKey = 0;
-    LPOVERLAPPED pOverlapped = NULL;
-
-    while (g_proxyRunning) {
-        BOOL ret = GetQueuedCompletionStatus(hIOCP, &bytesTransferred, &completionKey, &pOverlapped, 1000);
-        if (!ret && pOverlapped == NULL) { if (GetLastError() == WAIT_TIMEOUT) continue; continue; }
-
-        CONNECTION_CONTEXT* conn = (CONNECTION_CONTEXT*)completionKey;
-        IO_CONTEXT* ioCtx = (IO_CONTEXT*)pOverlapped;
-
-        if (!ret || (bytesTransferred == 0 && (ioCtx->opType == IO_READ_CLIENT || ioCtx->opType == IO_READ_REMOTE))) {
-            if (conn && !conn->closing) { conn->closing = TRUE; FreeConnectionContext(conn); }
-            if (ioCtx && (ioCtx->opType == IO_WRITE_CLIENT || ioCtx->opType == IO_WRITE_REMOTE)) FreeIoContext(ioCtx);
-            continue;
-        }
-
-        if (ioCtx) {
-            switch (ioCtx->opType) {
-                case IO_READ_CLIENT:
-                    OnClientRead(conn, bytesTransferred);
-                    if (!conn->closing) PostRecv(conn->clientSock, &conn->rxClient);
-                    break;
-                case IO_READ_REMOTE:
-                    OnRemoteRead(conn, bytesTransferred);
-                    if (!conn->closing) PostRecv(conn->remoteSock, &conn->rxRemote);
-                    break;
-                case IO_WRITE_CLIENT:
-                case IO_WRITE_REMOTE:
-                    FreeIoContext(ioCtx);
-                    break;
-            }
-        }
-    }
-    return 0;
-}
-
-// [Fix] Add early_data support
-void SwitchToIOCP(SOCKET c, SOCKET r, TLSContext* tls, BOOL is_vless, const char* early_data, int early_len) {
-    CONNECTION_CONTEXT* conn = (CONNECTION_CONTEXT*)proxy_malloc(sizeof(CONNECTION_CONTEXT));
-    if (!conn) return;
-    memset(conn, 0, sizeof(CONNECTION_CONTEXT));
-    
-    conn->clientSock = c;
-    conn->remoteSock = r;
-    conn->refCount = 1;
-    conn->is_vless = is_vless;
-    
-    conn->ws_frag_cap = 4096;
-    conn->ws_frag_buf = (char*)proxy_malloc(conn->ws_frag_cap);
-    
-    conn->rxClient.opType = IO_READ_CLIENT;
-    conn->rxClient.wsaBuf.buf = conn->rxClient.buffer;
-    conn->rxClient.wsaBuf.len = IO_BUFFER_SIZE;
-    conn->rxRemote.opType = IO_READ_REMOTE;
-    conn->rxRemote.wsaBuf.buf = conn->rxRemote.buffer;
-    conn->rxRemote.wsaBuf.len = IO_BUFFER_SIZE;
-
-    if (!CreateIoCompletionPort((HANDLE)c, hIOCP, (ULONG_PTR)conn, 0) || !CreateIoCompletionPort((HANDLE)r, hIOCP, (ULONG_PTR)conn, 0)) {
-        FreeConnectionContext(conn); return;
-    }
-
-    if (!tls_switch_to_mem_bio(conn, tls)) { FreeConnectionContext(conn); return; }
-
-    // [Fix] Process Early Data (WS Handshake residue)
-    if (early_data && early_len > 0) {
-        if (conn->ws_frag_len + early_len > conn->ws_frag_cap) {
-             // Resize logic... simplified
-             int new_cap = conn->ws_frag_cap + early_len + 1024;
-             char* tmp = (char*)proxy_malloc(new_cap);
-             if(tmp) {
-                 memcpy(tmp, conn->ws_frag_buf, conn->ws_frag_len);
-                 proxy_free(conn->ws_frag_buf, conn->ws_frag_cap);
-                 conn->ws_frag_buf = tmp;
-                 conn->ws_frag_cap = new_cap;
-             }
-        }
-        memcpy(conn->ws_frag_buf, early_data, early_len);
-        conn->ws_frag_len = early_len;
-        
-        while (conn->ws_frag_len > 0) {
-            int hl, pl;
-            long long frame_total = check_ws_frame((unsigned char*)conn->ws_frag_buf, conn->ws_frag_len, &hl, &pl);
-            if (frame_total <= 0) break;
-            
-            int opcode = conn->ws_frag_buf[0] & 0x0F;
-            if ((opcode == 0x1 || opcode == 0x2) && pl > 0) {
-                char* payload = conn->ws_frag_buf + hl;
-                int payload_size = pl;
-                if (conn->is_vless && !conn->header_stripped) {
-                     if (payload_size >= 2) {
-                        int addon_len = (unsigned char)payload[1];
-                        int head_size = 2 + addon_len;
-                        if (payload_size >= head_size) {
-                            payload += head_size; payload_size -= head_size;
-                            conn->header_stripped = TRUE;
-                        } else payload_size = 0;
-                     } else payload_size = 0;
-                }
-                if (payload_size > 0) PostSend(conn->clientSock, payload, payload_size);
-            }
-            if (frame_total < conn->ws_frag_len) memmove(conn->ws_frag_buf, conn->ws_frag_buf + frame_total, conn->ws_frag_len - (int)frame_total);
-            conn->ws_frag_len -= (int)frame_total;
-        }
-    }
-
-    PostRecv(c, &conn->rxClient);
-    PostRecv(r, &conn->rxRemote);
-}
-
-DWORD WINAPI handshake_thread(LPVOID p) {
+// --- 客户端处理线程 (核心逻辑) ---
+DWORD WINAPI client_handler(LPVOID p) {
     InterlockedIncrement(&g_active_connections);
-    ClientInitContext* ctx = (ClientInitContext*)p;
+    ClientContext* ctx = (ClientContext*)p;
     if (!ctx) { InterlockedDecrement(&g_active_connections); return 0; }
+
     SOCKET c = ctx->clientSock;
     ProxyConfig localConfig = ctx->config; 
     CryptoSettings localCrypto = ctx->cryptoSettings;
-    char localUserAgent[512]; strncpy(localUserAgent, ctx->userAgent, 511); localUserAgent[511] = 0;
+    char localUserAgent[512];
+    strncpy(localUserAgent, ctx->userAgent, sizeof(localUserAgent)-1);
+    localUserAgent[sizeof(localUserAgent)-1] = 0;
     free(ctx); 
 
     TLSContext tls; memset(&tls, 0, sizeof(tls));
     SOCKET r = INVALID_SOCKET;      
-    char *c_buf = NULL, *ws_send_buf = NULL, *ws_read_buf_tmp = NULL; 
-    int browser_len, port = 80, is_connect_method = 0, is_socks5 = 0;
-    char method[16], host[256], port_str[16], *header_end;
-    int header_len = 0;
+    char *c_buf = NULL, *ws_read_buf = NULL, *ws_send_buf = NULL; 
+    int ws_read_buf_cap = IO_BUFFER_SIZE; 
+    int ws_buf_len = 0; 
+    int browser_len;
+    char method[16], host[256], port_str[16];
+    int port = 80, is_connect_method = 0, is_socks5 = 0;
+    char *header_end = NULL; int header_len = 0;
     struct addrinfo hints, *res = NULL, *ptr = NULL;
 
+    // 分配初始缓冲区并记录内存占用
     c_buf = (char*)proxy_malloc(IO_BUFFER_SIZE); 
+    ws_read_buf = (char*)proxy_malloc(ws_read_buf_cap); 
     ws_send_buf = (char*)proxy_malloc(IO_BUFFER_SIZE + 4096); 
-    ws_read_buf_tmp = (char*)proxy_malloc(IO_BUFFER_SIZE);
-    if (!c_buf || !ws_send_buf || !ws_read_buf_tmp) goto cl_err; 
+    if (!c_buf || !ws_read_buf || !ws_send_buf) goto cl_end; 
 
-    int flag = 1; setsockopt(c, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
+    int flag = 1;
+    setsockopt(c, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
+    
+    // 1. 读取浏览器首包
     browser_len = read_header_robust(c, c_buf, IO_BUFFER_SIZE, 10);
-    if (browser_len <= 0) goto cl_err; 
+    if (browser_len <= 0) goto cl_end; 
     c_buf[browser_len] = 0;
     
+    // 协议探测
     if (c_buf[0] == 0x05) { 
-        send(c, "\x05\x00", 2, 0); is_socks5 = 1;
+        // Socks5 处理
+        send(c, "\x05\x00", 2, 0); // 无需认证
+        is_socks5 = 1;
+        
         int n = recv_timeout(c, c_buf, IO_BUFFER_SIZE, 10);
-        if (n <= 0) goto cl_err;
+        if (n <= 0) goto cl_end;
         browser_len = n;
-        if (c_buf[1] == 0x01) { 
-             if (c_buf[3] == 0x01) { inet_ntop(AF_INET, &c_buf[4], host, sizeof(host)); port = ntohs(*(unsigned short*)&c_buf[8]); }
-             else if (c_buf[3] == 0x03) { int dlen = (unsigned char)c_buf[4]; memcpy(host, &c_buf[5], dlen); host[dlen] = 0; port = ntohs(*(unsigned short*)&c_buf[5+dlen]); }
-             else goto cl_err;
+        
+        if (c_buf[1] == 0x01) { // CONNECT
+             if (c_buf[3] == 0x01) { // IPv4
+                 inet_ntop(AF_INET, &c_buf[4], host, sizeof(host));
+                 port = ntohs(*(unsigned short*)&c_buf[8]);
+             } else if (c_buf[3] == 0x03) { // Domain
+                 int dlen = (unsigned char)c_buf[4];
+                 memcpy(host, &c_buf[5], dlen); host[dlen] = 0;
+                 port = ntohs(*(unsigned short*)&c_buf[5+dlen]);
+             } else goto cl_end;
              strcpy(method, "SOCKS5");
-        } else goto cl_err;
-    } else {
+        } else goto cl_end;
+    } 
+    else {
+        // HTTP/HTTPS 处理
         if (sscanf(c_buf, "%15s %255s", method, host) == 2) {
             char *p_col = strchr(host, ':');
             if (p_col) { *p_col = 0; port = atoi(p_col+1); }
             else if(stricmp(method, "CONNECT")==0) port = 443;
+            
             if (stricmp(method, "CONNECT") == 0) is_connect_method = 1;
             header_end = strstr(c_buf, "\r\n\r\n");
             header_len = header_end ? (int)(header_end - c_buf) + 4 : browser_len;
-        } else goto cl_err;
+        } else goto cl_end;
     }
     
+    // [Desensitization] 日志脱敏处理 (隐藏部分 Host 信息)
+    char display_host[256]; strcpy(display_host, host);
+#if LOG_DESENSITIZE
+    if (strlen(display_host) > 4) {
+        // 简单脱敏：保留首尾，中间打码
+        size_t dlen = strlen(display_host);
+        if (dlen > 8) {
+            for(size_t i=3; i<dlen-3; i++) if(display_host[i]!='.') display_host[i] = '*';
+        }
+    }
+#endif
+    log_msg("[Proxy] %s -> %s:%d", method, display_host, port);
+    
+    // 2. 连接代理服务器
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM; hints.ai_protocol = IPPROTO_TCP;
+    hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
     snprintf(port_str, sizeof(port_str), "%d", localConfig.port);
-    if (getaddrinfo(localConfig.host, port_str, &hints, &res) != 0) goto cl_err;
-    for (int retry = 0; retry < 2; retry++) {
+
+    if (getaddrinfo(localConfig.host, port_str, &hints, &res) != 0) {
+        log_msg("[Err] DNS Fail: %s", localConfig.host); goto cl_end;
+    }
+
+    for (int retry = 0; retry < 3; retry++) {
         for (ptr = res; ptr != NULL; ptr = ptr->ai_next) {
             r = socket(ptr->ai_family, ptr->ai_socktype, ptr->ai_protocol);
             if (r == INVALID_SOCKET) continue;
+
             setsockopt(r, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
+            int timeout_ms = 5000;
+            setsockopt(r, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout_ms, sizeof(int));
+            setsockopt(r, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout_ms, sizeof(int));
+
             if (connect(r, ptr->ai_addr, (int)ptr->ai_addrlen) == 0) {
                 tls.sock = r;
-                if (tls_init_connect(&tls, localConfig.sni, localConfig.host, &localCrypto) == 0) break;
-                else { tls_close(&tls); closesocket(r); r = INVALID_SOCKET; }
-            } else { closesocket(r); r = INVALID_SOCKET; }
+                // 使用 CryptoSettings 进行 TLS 握手 (支持分片/填充/ECH)
+                if (tls_init_connect(&tls, localConfig.sni, localConfig.host, &localCrypto) == 0) {
+                    break;
+                } else {
+                    tls_close(&tls); closesocket(r); r = INVALID_SOCKET;
+                }
+            } else {
+                closesocket(r); r = INVALID_SOCKET;
+            }
         }
         if (r != INVALID_SOCKET && tls.ssl != NULL) break;
-        Sleep(100);
+        Sleep(200);
     }
-    if (r == INVALID_SOCKET || tls.ssl == NULL) goto cl_err;
+    if (r == INVALID_SOCKET || tls.ssl == NULL) goto cl_end;
     
+    // 3. WebSocket 握手
     const char* sni_val = (strlen(localConfig.sni) > 0) ? localConfig.sni : localConfig.host;
     const char* req_path = (strlen(localConfig.path) > 0) ? localConfig.path : "/";
     unsigned char rnd_key[16]; char ws_key_str[32];
     for(int i=0; i<16; i++) rnd_key[i] = rand() % 256;
     base64_encode_key(rnd_key, ws_key_str);
+
     int offset = snprintf(ws_send_buf, IO_BUFFER_SIZE, 
         "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-        "Sec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n", req_path, sni_val, localUserAgent, ws_key_str);
-    tls_write(&tls, ws_send_buf, offset);
-    
-    int hlen = tls_read(&tls, ws_read_buf_tmp, IO_BUFFER_SIZE - 1);
-    if (hlen <= 0 || !strstr(ws_read_buf_tmp, "101")) goto cl_err;
-    
-    char* early_data = NULL;
-    int early_len = 0;
-    char* body_start = strstr(ws_read_buf_tmp, "\r\n\r\n");
-    if (body_start) {
-        body_start += 4;
-        early_len = hlen - (int)(body_start - ws_read_buf_tmp);
-        if (early_len > 0) early_data = body_start;
-    }
+        "Sec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n", 
+        req_path, sni_val, localUserAgent, ws_key_str);
 
-    unsigned char proto_buf[2048]; int proto_len = 0, flen = 0;
-    struct in_addr ip4; 
-    BOOL is_vless = (_stricmp(localConfig.type, "vless") == 0);
+    tls_write(&tls, ws_send_buf, offset);
+    int hlen = tls_read(&tls, ws_read_buf, ws_read_buf_cap - 1);
+    if (hlen <= 0) goto cl_end;
+    ws_read_buf[hlen] = 0;
     
+    if (!strstr(ws_read_buf, "101")) { 
+        log_msg("[Err] WS Handshake Fail: %.50s", ws_read_buf); goto cl_end; 
+    }
+    
+    // 处理 Early Data (粘包)
+    char* body_start = strstr(ws_read_buf, "\r\n\r\n");
+    if (body_start) {
+        body_start += 4; 
+        int header_bytes = (int)(body_start - ws_read_buf);
+        int remaining = hlen - header_bytes;
+        if (remaining > 0) {
+            memmove(ws_read_buf, body_start, remaining);
+            ws_buf_len = remaining;
+        }
+    }
+    
+    // 4. 代理协议封包 (VLESS / Trojan / SS / Mandala / Socks)
+    unsigned char proto_buf[2048]; 
+    int proto_len = 0, flen = 0;
+    struct in_addr ip4; struct in6_addr ip6;
+    
+    BOOL is_vless = (_stricmp(localConfig.type, "vless") == 0);
+    BOOL is_trojan = (_stricmp(localConfig.type, "trojan") == 0);
+    BOOL is_shadowsocks = (_stricmp(localConfig.type, "shadowsocks") == 0);
+    BOOL is_mandala = (_stricmp(localConfig.type, "mandala") == 0);
+
     if (is_vless) {
-        proto_buf[proto_len++] = 0x00; parse_uuid(localConfig.user, proto_buf + proto_len); proto_len += 16; 
-        proto_buf[proto_len++] = 0x00; proto_buf[proto_len++] = 0x01; 
+        proto_buf[proto_len++] = 0x00; // Version
+        parse_uuid(localConfig.user, proto_buf + proto_len); proto_len += 16; 
+        proto_buf[proto_len++] = 0x00; // Addons
+        proto_buf[proto_len++] = 0x01; // TCP
         proto_buf[proto_len++] = (port >> 8) & 0xFF; proto_buf[proto_len++] = port & 0xFF;        
-        if (inet_pton(AF_INET, host, &ip4) == 1) { proto_buf[proto_len++] = 0x01; memcpy(proto_buf + proto_len, &ip4, 4); proto_len += 4; } 
-        else { proto_buf[proto_len++] = 0x02; proto_buf[proto_len++] = (unsigned char)strlen(host); memcpy(proto_buf + proto_len, host, strlen(host)); proto_len += (int)strlen(host); }
+        if (inet_pton(AF_INET, host, &ip4) == 1) {
+            proto_buf[proto_len++] = 0x01; memcpy(proto_buf + proto_len, &ip4, 4); proto_len += 4;
+        } else if (inet_pton(AF_INET6, host, &ip6) == 1) {
+            proto_buf[proto_len++] = 0x03; memcpy(proto_buf + proto_len, &ip6, 16); proto_len += 16;
+        } else {
+            proto_buf[proto_len++] = 0x02; proto_buf[proto_len++] = (unsigned char)strlen(host);
+            memcpy(proto_buf + proto_len, host, strlen(host)); proto_len += (int)strlen(host);
+        }
         flen = build_ws_frame((char*)proto_buf, proto_len, ws_send_buf);
         tls_write(&tls, ws_send_buf, flen);
     } 
+    else if (is_trojan || is_mandala) {
+        char hex_pass[SHA224_DIGEST_LENGTH * 2 + 1]; 
+        trojan_password_hash(localConfig.pass, hex_pass);
+        
+        if (is_mandala) { // Mandala 自定义协议
+            unsigned char salt[4], plaintext[2048]; 
+            int p_len = 0;
+            for(int i=0; i<4; i++) salt[i] = rand() % 256;
+            
+            memcpy(plaintext, hex_pass, 56); p_len = 56;
+            int pad = rand() % 16; plaintext[p_len++] = (unsigned char)pad;
+            for(int i=0; i<pad; i++) plaintext[p_len++] = rand() % 256;
+            
+            plaintext[p_len++] = 0x01; // TCP
+            if (inet_pton(AF_INET, host, &ip4) == 1) {
+                 plaintext[p_len++] = 0x01; memcpy(plaintext + p_len, &ip4, 4); p_len += 4;
+            } else if (inet_pton(AF_INET6, host, &ip6) == 1) {
+                 plaintext[p_len++] = 0x04; memcpy(plaintext + p_len, &ip6, 16); p_len += 16;
+            } else {
+                 plaintext[p_len++] = 0x03; plaintext[p_len++] = (unsigned char)strlen(host);
+                 memcpy(plaintext + p_len, host, strlen(host)); p_len += strlen(host);
+            }
+            plaintext[p_len++] = (port >> 8) & 0xFF; plaintext[p_len++] = port & 0xFF;
+            plaintext[p_len++] = 0x0D; plaintext[p_len++] = 0x0A;
 
-    if (is_socks5) send(c, "\x05\x00\x00\x01\0\0\0\0\0\0", 10, 0);
-    else if (is_connect_method) send(c, "HTTP/1.1 200 Connection Established\r\n\r\n", 39, 0);
-    
-    if (!is_socks5 && is_connect_method && browser_len > header_len) {
-        flen = build_ws_frame(c_buf + header_len, browser_len - header_len, ws_send_buf);
+            memcpy(proto_buf, salt, 4);
+            for(int i=0; i<p_len; i++) proto_buf[4 + i] = plaintext[i] ^ salt[i % 4];
+            proto_len = 4 + p_len;
+        } else { // Trojan 标准协议
+            memcpy(proto_buf, hex_pass, 56); proto_len = 56;
+            proto_buf[proto_len++] = 0x0D; proto_buf[proto_len++] = 0x0A;
+            proto_buf[proto_len++] = 0x01; 
+            if (inet_pton(AF_INET, host, &ip4) == 1) {
+                 proto_buf[proto_len++] = 0x01; memcpy(proto_buf + proto_len, &ip4, 4); proto_len += 4;
+            } else if (inet_pton(AF_INET6, host, &ip6) == 1) {
+                 proto_buf[proto_len++] = 0x04; memcpy(proto_buf + proto_len, &ip6, 16); proto_len += 16;
+            } else {
+                 proto_buf[proto_len++] = 0x03; proto_buf[proto_len++] = (unsigned char)strlen(host);
+                 memcpy(proto_buf + proto_len, host, strlen(host)); proto_len += strlen(host);
+            }
+            proto_buf[proto_len++] = (port >> 8) & 0xFF; proto_buf[proto_len++] = port & 0xFF;
+            proto_buf[proto_len++] = 0x0D; proto_buf[proto_len++] = 0x0A;
+        }
+        flen = build_ws_frame((char*)proto_buf, proto_len, ws_send_buf);
         tls_write(&tls, ws_send_buf, flen);
-    } else if (!is_connect_method && !is_socks5) {
+    } 
+    else if (is_shadowsocks) {
+        if (inet_pton(AF_INET, host, &ip4) == 1) {
+             proto_buf[proto_len++] = 0x01; memcpy(proto_buf + proto_len, &ip4, 4); proto_len += 4;
+        } else if (inet_pton(AF_INET6, host, &ip6) == 1) {
+             proto_buf[proto_len++] = 0x04; memcpy(proto_buf + proto_len, &ip6, 16); proto_len += 16;
+        } else {
+             proto_buf[proto_len++] = 0x03; proto_buf[proto_len++] = (unsigned char)strlen(host);
+             memcpy(proto_buf + proto_len, host, strlen(host)); proto_len += strlen(host);
+        }
+        proto_buf[proto_len++] = (port >> 8) & 0xFF; proto_buf[proto_len++] = port & 0xFF;
+        flen = build_ws_frame((char*)proto_buf, proto_len, ws_send_buf);
+        tls_write(&tls, ws_send_buf, flen);
+    }
+    else { // SOCKS5 Outbound
+        char auth[] = {0x05, 0x01, 0x00}; 
+        if (strlen(localConfig.user) > 0) auth[2] = 0x02; 
+        flen = build_ws_frame(auth, 3, ws_send_buf);
+        tls_write(&tls, ws_send_buf, flen);
+        
+        char resp_buf[512]; 
+        if (ws_read_payload_exact(&tls, resp_buf, 2) < 2) goto cl_end;
+        if (resp_buf[1] == 0x02) {
+            int ulen = strlen(localConfig.user);
+            int plen = strlen(localConfig.pass);
+            unsigned char auth_pkg[512]; int ap_len = 0;
+            auth_pkg[ap_len++] = 0x01; 
+            auth_pkg[ap_len++] = ulen; memcpy(auth_pkg+ap_len, localConfig.user, ulen); ap_len += ulen;
+            auth_pkg[ap_len++] = plen; memcpy(auth_pkg+ap_len, localConfig.pass, plen); ap_len += plen;
+            flen = build_ws_frame((char*)auth_pkg, ap_len, ws_send_buf);
+            tls_write(&tls, ws_send_buf, flen);
+            if (ws_read_payload_exact(&tls, resp_buf, 2) < 2) goto cl_end;
+            if (resp_buf[1] != 0x00) goto cl_end;
+        } 
+        int slen = 0;
+        unsigned char socks_req[512];
+        socks_req[slen++] = 0x05; socks_req[slen++] = 0x01; socks_req[slen++] = 0x00; 
+        if (inet_pton(AF_INET, host, &ip4) == 1) {
+            socks_req[slen++] = 0x01; memcpy(socks_req + slen, &ip4, 4); slen += 4;
+        } else {
+            socks_req[slen++] = 0x03; socks_req[slen++] = (unsigned char)strlen(host);
+            memcpy(socks_req + slen, host, strlen(host)); slen += (int)strlen(host);
+        }
+        socks_req[slen++] = (port >> 8) & 0xFF; socks_req[slen++] = port & 0xFF;
+        flen = build_ws_frame((char*)socks_req, slen, ws_send_buf);
+        tls_write(&tls, ws_send_buf, flen);
+        if (ws_read_payload_exact(&tls, resp_buf, 4) == 0) goto cl_end;
+        if (resp_buf[1] != 0x00) goto cl_end;
+    }
+    
+    // 5. 响应浏览器
+    if (is_socks5) {
+        unsigned char s5_ok[] = {0x05, 0x00, 0x00, 0x01, 0,0,0,0, 0,0};
+        send(c, (char*)s5_ok, 10, 0);
+    } else if (is_connect_method) {
+        const char *ok = "HTTP/1.1 200 Connection Established\r\n\r\n";
+        send(c, ok, strlen(ok), 0);
+        if (browser_len > header_len) {
+            int extra_len = browser_len - header_len;
+            flen = build_ws_frame(c_buf + header_len, extra_len, ws_send_buf);
+            tls_write(&tls, ws_send_buf, flen);
+        }
+    } else {
         flen = build_ws_frame(c_buf, browser_len, ws_send_buf);
         tls_write(&tls, ws_send_buf, flen);
     }
+    
+    // 6. 转发循环 (非阻塞 IO)
+    u_long mode = 1; 
+    ioctlsocket(c, FIONBIO, &mode); 
+    ioctlsocket(r, FIONBIO, &mode);
+    fd_set fds; struct timeval tv; 
+    int vless_response_header_stripped = 0;
+    
+    while(1) {
+        FD_ZERO(&fds); FD_SET(c, &fds); FD_SET(r, &fds);
+        int pending = SSL_pending(tls.ssl);
+        tv.tv_sec = 1; tv.tv_usec = 0;
+        
+        // 如果有缓存数据，不再等待
+        if (pending > 0 || ws_buf_len > 0) { tv.tv_sec = 0; tv.tv_usec = 0; }
+        
+        int n = select(0, &fds, NULL, NULL, &tv);
+        if (n < 0) break;
+        
+        // 浏览器 -> 代理
+        if (FD_ISSET(c, &fds)) {
+            int len = recv(c, c_buf, IO_BUFFER_SIZE, 0);
+            if (len > 0) {
+                flen = build_ws_frame(c_buf, len, ws_send_buf);
+                if (tls_write(&tls, ws_send_buf, flen) < 0) break;
+            } else if (len == 0) {
+                break;
+            } else if (WSAGetLastError() != WSAEWOULDBLOCK) {
+                break;
+            }
+        }
+        
+        // 代理 -> 浏览器
+        if (FD_ISSET(r, &fds) || pending > 0) {
+            // [Optimization] 动态扩容与水位控制
+            if (ws_buf_len >= ws_read_buf_cap - 1024) { 
+                if (ws_read_buf_cap < MAX_WS_FRAME_SIZE) {
+                    int new_cap = ws_read_buf_cap * 2;
+                    if (new_cap > MAX_WS_FRAME_SIZE) new_cap = MAX_WS_FRAME_SIZE;
+                    
+                    // 尝试重分配
+                    char* new_buf = (char*)realloc(ws_read_buf, new_cap);
+                    if (new_buf) {
+                        // 更新全局内存计数
+                        InterlockedAdd64(&g_total_allocated_mem, (LONG64)(new_cap - ws_read_buf_cap));
+                        ws_read_buf = new_buf;
+                        ws_read_buf_cap = new_cap;
+                    }
+                }
+            }
+            
+            // [Bug Fix] 防止死循环: 如果缓冲区已满且无法继续扩容，则由于 ws_buf_len == ws_read_buf_cap，
+            // 导致 tls_read 读取 0 字节。此时若数据帧仍不完整，check_ws_frame 返回 0，循环将无限空转。
+            if (ws_buf_len < ws_read_buf_cap) {
+                int len = tls_read(&tls, ws_read_buf + ws_buf_len, ws_read_buf_cap - ws_buf_len);
+                if (len > 0) ws_buf_len += len;
+                else if (len < 0) break; 
+            } else {
+                // 缓冲区已满且无法解析，认为遭遇超大帧或攻击，断开连接
+                log_msg("[Err] WS buffer overflow or packet too large. Dropping.");
+                break;
+            }
+        }
+        
+        // 解析 WebSocket 帧
+        while (ws_buf_len > 0) {
+            int hl, pl;
+            long long frame_total = check_ws_frame((unsigned char*)ws_read_buf, ws_buf_len, &hl, &pl);
+            if (frame_total < 0) goto cl_end; // 帧过大或错误
+            if (frame_total > 0) {
+                int opcode = ws_read_buf[0] & 0x0F;
+                if (opcode == 0x8) goto cl_end; // Close
+                
+                if ((opcode == 0x1 || opcode == 0x2) && pl > 0) {
+                    char* payload_ptr = ws_read_buf + hl;
+                    int payload_size = pl;
+                    
+                    // VLESS 响应头剥离 (Response Header: 2 bytes version + 1 byte len + N bytes info)
+                    if (is_vless && !vless_response_header_stripped) {
+                        if (payload_size >= 2) {
+                            int addon_len = (unsigned char)payload_ptr[1];
+                            int head_size = 2 + addon_len;
+                            if (payload_size >= head_size) {
+                                payload_ptr += head_size;
+                                payload_size -= head_size;
+                                vless_response_header_stripped = 1;
+                            } else { 
+                                payload_size = 0; // 数据不足，等下一包
+                            }
+                        } else payload_size = 0;
+                    }
+                    
+                    if (payload_size > 0) {
+                        if (send_all(c, payload_ptr, payload_size) < 0) goto cl_end;
+                    }
+                }
+                
+                // 移除已处理帧
+                if (frame_total < ws_buf_len) {
+                    memmove(ws_read_buf, ws_read_buf + frame_total, ws_buf_len - (int)frame_total);
+                }
+                ws_buf_len -= (int)frame_total;
+            } else break; // 数据不完整
+        }
+    }
 
-    SwitchToIOCP(c, r, &tls, is_vless, early_data, early_len);
-
+cl_end:
     if (res) freeaddrinfo(res);
+    // 释放内存并更新全局水位
     proxy_free(c_buf, IO_BUFFER_SIZE);
+    proxy_free(ws_read_buf, ws_read_buf_cap);
     proxy_free(ws_send_buf, IO_BUFFER_SIZE + 4096);
-    proxy_free(ws_read_buf_tmp, IO_BUFFER_SIZE);
-    return 0;
-
-cl_err:
-    if (res) freeaddrinfo(res);
-    proxy_free(c_buf, IO_BUFFER_SIZE);
-    proxy_free(ws_send_buf, IO_BUFFER_SIZE + 4096);
-    proxy_free(ws_read_buf_tmp, IO_BUFFER_SIZE);
+    
     tls_close(&tls);
     if (r != INVALID_SOCKET) closesocket(r); 
     if (c != INVALID_SOCKET) closesocket(c);
+    
     InterlockedDecrement(&g_active_connections);
     return 0;
 }
 
+// 监听线程与管理函数
 DWORD WINAPI server_thread(LPVOID p) {
-    // [Safety] 确保锁被初始化
-    if (InterlockedCompareExchange(&g_locksInitialized, 1, 0) == 0) {
-        InitGlobalLocks(); 
-    }
-
     g_listen_sock = socket(AF_INET, SOCK_STREAM, 0);
-    struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET; addr.sin_port = htons(g_localPort); addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    int opt = 1; setsockopt(g_listen_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
-    if (bind(g_listen_sock, (struct sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) { g_proxyRunning = FALSE; return 0; }
+    struct sockaddr_in addr; 
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET; 
+    addr.sin_port = htons(g_localPort);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    
+    int opt = 1; 
+    setsockopt(g_listen_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
+    
+    if (bind(g_listen_sock, (struct sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
+        log_msg("[Fatal] Port %d bind fail", g_localPort); 
+        g_proxyRunning = FALSE; 
+        return 0;
+    }
+    
     listen(g_listen_sock, SOMAXCONN);
+    log_msg("[System] Server listening on 127.0.0.1:%d", g_localPort);
     
     while(g_proxyRunning) {
         SOCKET c = accept(g_listen_sock, NULL, NULL);
         if (c != INVALID_SOCKET) {
-            ClientInitContext* ctx = (ClientInitContext*)malloc(sizeof(ClientInitContext));
+            // [Safety] 最大连接数限制
+            if (g_active_connections >= MAX_CONNECTIONS) {
+                closesocket(c);
+                Sleep(10); 
+                continue;
+            }
+
+            // [Concurrency] 配置快照
+            ClientContext* ctx = (ClientContext*)malloc(sizeof(ClientContext));
             if (ctx) {
                 ctx->clientSock = c;
-                EnterCriticalSection(&g_configLock); // Now safe
+                EnterCriticalSection(&g_configLock);
                 ctx->config = g_proxyConfig; 
-                strncpy(ctx->userAgent, g_userAgentStr, 511);
+                strncpy(ctx->userAgent, g_userAgentStr, sizeof(ctx->userAgent)-1);
+                ctx->userAgent[sizeof(ctx->userAgent)-1] = 0;
+                
                 ctx->cryptoSettings.enableFragment = g_enableFragment;
                 ctx->cryptoSettings.fragMin = g_fragSizeMin;
                 ctx->cryptoSettings.fragMax = g_fragSizeMax;
@@ -519,9 +600,16 @@ DWORD WINAPI server_thread(LPVOID p) {
                 ctx->cryptoSettings.padMax = g_padSizeMax;
                 ctx->cryptoSettings.enableChromeCiphers = g_enableChromeCiphers;
                 LeaveCriticalSection(&g_configLock);
-                HANDLE hClient = (HANDLE)_beginthreadex(NULL, 0, (unsigned int (__stdcall *)(void *))handshake_thread, (void*)ctx, 0, NULL);
-                if (hClient) CloseHandle(hClient); else { free(ctx); closesocket(c); }
-            } else closesocket(c);
+
+                HANDLE hClient = CreateThread(NULL, 0, client_handler, (LPVOID)ctx, 0, NULL);
+                if (hClient) CloseHandle(hClient); 
+                else { 
+                    free(ctx); 
+                    closesocket(c); 
+                }
+            } else {
+                closesocket(c);
+            }
         } else break;
     }
     return 0;
@@ -529,27 +617,21 @@ DWORD WINAPI server_thread(LPVOID p) {
 
 void StartProxyCore() {
     if (g_proxyRunning) return;
-    
-    // [Safety] 确保锁被初始化 (双重保障)
-    if (InterlockedCompareExchange(&g_locksInitialized, 1, 0) == 0) {
-        InitGlobalLocks(); 
-    }
-
     g_proxyRunning = TRUE;
-    hIOCP = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
-    SYSTEM_INFO si; GetSystemInfo(&si);
-    for (int i = 0; i < (int)si.dwNumberOfProcessors * 2; i++) {
-        CloseHandle((HANDLE)_beginthreadex(NULL, 0, (unsigned int (__stdcall *)(void *))WorkerThread, NULL, 0, NULL));
-    }
     hProxyThread = CreateThread(NULL, 0, server_thread, NULL, 0, NULL);
+    if (!hProxyThread) g_proxyRunning = FALSE;
 }
 
 void StopProxyCore() {
     g_proxyRunning = FALSE;
-    if (g_listen_sock != INVALID_SOCKET) { closesocket(g_listen_sock); g_listen_sock = INVALID_SOCKET; }
-    if (hIOCP) {
-        SYSTEM_INFO si; GetSystemInfo(&si);
-        for (int i=0; i < (int)si.dwNumberOfProcessors * 2; i++) PostQueuedCompletionStatus(hIOCP, 0, 0, NULL);
+    if (g_listen_sock != INVALID_SOCKET) { 
+        closesocket(g_listen_sock); 
+        g_listen_sock = INVALID_SOCKET; 
     }
-    if (hProxyThread) { WaitForSingleObject(hProxyThread, 2000); CloseHandle(hProxyThread); hProxyThread = NULL; }
+    if (hProxyThread) { 
+        WaitForSingleObject(hProxyThread, 2000); 
+        CloseHandle(hProxyThread); 
+        hProxyThread = NULL; 
+    }
+    log_msg("[System] Proxy Stopped");
 }

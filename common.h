@@ -8,42 +8,75 @@
 #define _UNICODE
 #endif
 
-// 防止旧版 SDK 警告
+// 防止旧版 SDK 警告，锁定最低支持 Windows 7 (0x0601)
 #ifndef _WIN32_IE
 #define _WIN32_IE 0x0601
 #endif
+
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0601
 #endif
 
 #define WIN32_LEAN_AND_MEAN
+
+// 尝试阻止 windows.h 包含 wincrypt.h 以避免与 OpenSSL 冲突
 #define NOCRYPT 
 
 // --- 生产环境限制参数 ---
-#define MAX_CONNECTIONS 10000
+#define MAX_CONNECTIONS 512
 #define IO_BUFFER_SIZE 16384 
+// 允许的最大单帧大小 (8MB)，但在处理时将增加更严苛的内存水位检查
 #define MAX_WS_FRAME_SIZE 8388608 
-#define MAX_TOTAL_MEMORY_USAGE (1024LL * 1024 * 1024) // 1GB
+// 生产环境建议：单个进程用于网络缓冲的最大内存总量 (如 512MB)，防止 OOM
+#define MAX_TOTAL_MEMORY_USAGE (512 * 1024 * 1024)
 
-#define LOG_DESENSITIZE TRUE
+// --- 调试与安全配置 ---
+#define LOG_DESENSITIZE TRUE  // 开启日志脱敏，隐藏密码和敏感 Host
 
-// --- Windows 头文件 ---
+// --- 1. Windows 系统头文件 ---
 #include <windows.h>
 #include <shellapi.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
-#include <mswsock.h> 
 #include <commctrl.h>
 #include <shlobj.h>
 #include <wininet.h>
-#include <stdio.h> 
 
+// --- 2. 引入资源头文件 ---
 #include "resource.h"
 
-// --- OpenSSL ---
+// --- 3. 清理 Windows 宏污染 (解决与 OpenSSL 的命名冲突) ---
 #ifdef X509_NAME
 #undef X509_NAME
 #endif
+#ifdef X509_EXTENSIONS
+#undef X509_EXTENSIONS
+#endif
+#ifdef X509_CERT_PAIR
+#undef X509_CERT_PAIR
+#endif
+#ifdef PKCS7_ISSUER_AND_SERIAL
+#undef PKCS7_ISSUER_AND_SERIAL
+#endif
+#ifdef PKCS7_SIGNER_INFO
+#undef PKCS7_SIGNER_INFO
+#endif
+#ifdef OCSP_REQUEST
+#undef OCSP_REQUEST
+#endif
+#ifdef OCSP_RESPONSE
+#undef OCSP_RESPONSE
+#endif
+
+// --- 4. 标准 C 头文件 ---
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <wchar.h>
+#include <time.h>
+#include <ctype.h>
+
+// --- 5. OpenSSL/BoringSSL 头文件 ---
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/bio.h>
@@ -72,62 +105,13 @@
 #define ID_TRAY_SETTINGS 1010
 #define ID_GLOBAL_HOTKEY 9001
 #define ID_TRAY_NODE_BASE 2000
+
+// ECH 设置控件 ID
 #define ID_CHK_ECH         7022
 #define ID_EDIT_ECH_SERVER 7023
 #define ID_EDIT_ECH_DOMAIN 7024
 
-// --- [原版功能恢复] 订阅与更新 ---
-#define MAX_SUBS 64
-#define UPDATE_MODE_MANUAL 0
-#define UPDATE_MODE_STARTUP 1
-#define UPDATE_MODE_DAILY 2
-#define UPDATE_MODE_WEEKLY 3
-#define UPDATE_MODE_CUSTOM 4
-
-typedef struct {
-    char url[512];
-    BOOL enabled;
-} Subscription;
-
-// --- [IOCP] 结构体定义 ---
-
-typedef enum {
-    IO_READ_CLIENT,
-    IO_WRITE_CLIENT,
-    IO_READ_REMOTE,
-    IO_WRITE_REMOTE
-} IO_OPERATION_TYPE;
-
-typedef struct {
-    OVERLAPPED overlapped;
-    IO_OPERATION_TYPE opType;
-    WSABUF wsaBuf;
-    char buffer[IO_BUFFER_SIZE]; 
-    DWORD bytesTransferred;
-} IO_CONTEXT;
-
-typedef struct {
-    SOCKET clientSock;
-    SOCKET remoteSock;
-    SSL *ssl;
-    
-    BIO *io_in;  
-    BIO *io_out; 
-    
-    char *ws_frag_buf;
-    int ws_frag_len;
-    int ws_frag_cap;
-
-    IO_CONTEXT rxClient; 
-    IO_CONTEXT rxRemote; 
-    
-    volatile LONG refCount; 
-    BOOL closing;
-
-    BOOL is_vless;
-    BOOL header_stripped;
-} CONNECTION_CONTEXT;
-
+// --- 结构体定义 ---
 typedef struct { 
     SOCKET sock; 
     SSL *ssl; 
@@ -144,20 +128,9 @@ typedef struct {
 } ProxyConfig;
 
 // --- 全局变量声明 ---
-
-// 1. 订阅相关 (修复 undeclared identifier)
-extern Subscription g_subs[MAX_SUBS];
-extern int g_subCount;
-extern int g_subUpdateMode;
-extern int g_subUpdateInterval;
-extern long long g_lastUpdateTime;
-
-// 2. 核心变量
 extern ProxyConfig g_proxyConfig;
 extern volatile BOOL g_proxyRunning;
 extern SOCKET g_listen_sock;
-extern HANDLE hIOCP; 
-
 extern SSL_CTX *g_ssl_ctx;
 extern HANDLE hProxyThread;
 extern NOTIFYICONDATAW nid;
@@ -180,7 +153,7 @@ extern WNDPROC g_oldListBoxProc;
 extern int g_nEditScrollPos;
 extern int g_nEditContentHeight;
 
-// 3. 抗封锁相关
+// 抗封锁配置
 extern BOOL g_enableChromeCiphers;
 extern BOOL g_enableALPN;
 extern BOOL g_enableFragment;
@@ -193,6 +166,7 @@ extern int g_padSizeMax;
 extern int g_uaPlatformIndex; 
 extern char g_userAgentStr[512];
 
+// ECH 全局配置变量
 extern BOOL g_enableECH;
 extern char g_echConfigServer[256]; 
 extern char g_echPublicName[256];   
@@ -201,23 +175,12 @@ extern const wchar_t* UA_PLATFORMS[];
 extern const char* UA_TEMPLATES[];
 
 extern BOOL g_enableLog;
-extern volatile LONG64 g_total_allocated_mem;
-extern CRITICAL_SECTION g_configLock; 
 
-// --- 函数声明 (修复 implicit declaration) ---
+// 内存水位管理变量 (由 proxy.c 维护)
+extern volatile LONG64 g_total_allocated_mem;
+
+extern CRITICAL_SECTION g_configLock; 
 void InitGlobalLocks();
 void DeleteGlobalLocks();
-
-// 配置与订阅功能
-void LoadSettings();
-void SaveSettings();
-int UpdateAllSubscriptions(BOOL force);
-int ImportFromClipboard();
-BOOL IsAutorun();
-void ParseTags();
-void DeleteNode(wchar_t* tag);
-void SwitchNode(wchar_t* tag);
-void UpdateTrayIcon();
-void ReloadNodeList();
 
 #endif // COMMON_H

@@ -11,14 +11,14 @@
 #include <openssl/rand.h>
 #include <openssl/bio.h>
 
-// 引用 globals.c (或 common.h 定义的全局变量)
+// 引用 globals.c 中的全局变量
 extern SSL_CTX *g_ssl_ctx;
 extern int g_enableECH;
 
 static BIO_METHOD *method_frag = NULL;
 static INIT_ONCE g_crypto_init_once = INIT_ONCE_STATIC_INIT;
 
-// ---------------------- BIO Implementation (保留用于 Fragment/Padding) ----------------------
+// ---------------------- BIO Implementation ----------------------
 typedef struct {
     int first_packet_sent;
     int frag_min;
@@ -293,18 +293,17 @@ void cleanup_crypto_global() {
     if (method_frag) { BIO_meth_free(method_frag); method_frag = NULL; }
 }
 
-// ---------------------- Connection Logic (Sync/Async Hybrid) ----------------------
+// ---------------------- Connection Logic ----------------------
 
-// 握手阶段使用的同步连接初始化
 int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target_host, const CryptoSettings* settings) {
     if (!g_ssl_ctx) return -1;
 
     ctx->ssl = SSL_new(g_ssl_ctx);
     if (!ctx->ssl) return -1;
-    // [Fix] 移除 SSL_set_fd，避免 BIO 所有权混乱。我们手动管理 BIO。
+    // [Fix] 移除 SSL_set_fd，避免 BIO 所有权混乱
     // SSL_set_fd(ctx->ssl, (int)ctx->sock); 
 
-    // 1. 设置 SNI
+    // 1. 设置 SNI (Inner SNI)
     const char *sni_name = (target_sni && strlen(target_sni)) ? target_sni : target_host;
     SSL_set_tlsext_host_name(ctx->ssl, sni_name);
 
@@ -334,7 +333,7 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
     }
 
     // [Fix] 手动构建 BIO 链，确保引用计数正确
-    // 创建基础 Socket BIO (引用计数=1, NOCLOSE 因为 socket 可能还要给 IOCP 用)
+    // 创建基础 Socket BIO (引用计数=1)
     BIO *internal_bio = BIO_new_socket((int)ctx->sock, BIO_NOCLOSE);
     if (!internal_bio) { SSL_free(ctx->ssl); ctx->ssl = NULL; return -1; }
 
@@ -342,18 +341,29 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
         BIO *frag_bio = BIO_new(method_frag);
         if (frag_bio) {
             BIO_set_params(frag_bio, settings);
-            // frag -> internal. 
+            // frag -> internal. internal 被链条持有。
             BIO_push(frag_bio, internal_bio); 
-            // 握手阶段使用 Filter BIO
+            
+            // SSL 使用 frag_bio 进行读写。
+            // SSL_set_bio 会消耗传入 BIO 的引用。
+            // 此时 internal_bio 被 frag_bio 引用，我们需要确保它不会因为 SSL 释放链头而过早销毁吗？
+            // BIO_push 不增加 internal 的引用计数，它只是接管所有权。
+            // SSL_set_bio 接管 frag_bio 的所有权。
+            // 我们还需要一个引用给 rbio 吗？如果不区分 r/w，SSL_set_bio(ssl, bio, bio)。
+            // 在这种情况下，rbio = internal, wbio = frag (chain to internal).
+            // 为简单起见，我们让 rbio 也走 frag（透传），或者直接设为 socket。
+            // 为了避免复杂的引用计数问题，这里让 rbio 和 wbio 都使用 frag_bio。
+            // 这样 frag_bio 的 read 会透传给 internal_bio。
+            
             SSL_set_bio(ctx->ssl, frag_bio, frag_bio);
         } else {
             SSL_set_bio(ctx->ssl, internal_bio, internal_bio);
         }
     } else {
+        // 无 Fragment，直接使用 Socket BIO
         SSL_set_bio(ctx->ssl, internal_bio, internal_bio);
     }
     
-    // 阻塞式握手 (在 worker thread 中进行)
     int ret = SSL_connect(ctx->ssl);
     if (ret != 1) {
         int err_code = SSL_get_error(ctx->ssl, ret);
@@ -369,7 +379,6 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
     return 0;
 }
 
-// 同步写 (仅握手阶段使用)
 int tls_write(TLSContext *ctx, const char *data, int len) {
     if (!ctx || !ctx->ssl) return -1;
     int written = 0;
@@ -392,7 +401,6 @@ int tls_write(TLSContext *ctx, const char *data, int len) {
     return written;
 }
 
-// 同步读 (仅握手阶段使用)
 int tls_read(TLSContext *ctx, char *out, int max) {
     if (!ctx || !ctx->ssl) return -1;
     int ret = SSL_read(ctx->ssl, out, max);
@@ -427,102 +435,6 @@ int tls_read_exact(TLSContext *ctx, char *buf, int len) {
 void tls_close(TLSContext *ctx) {
     if (ctx->ssl) { SSL_shutdown(ctx->ssl); SSL_free(ctx->ssl); ctx->ssl = NULL; }
 }
-
-// ---------------------- IOCP Support Functions ----------------------
-
-// [IOCP] 握手完成后，切换到内存 BIO 模式
-// 此时 Socket 将由 IOCP 线程池管理，OpenSSL 仅作为纯内存过滤器
-BOOL tls_switch_to_mem_bio(CONNECTION_CONTEXT* connCtx, TLSContext* tls) {
-    if (!connCtx || !tls || !tls->ssl) return FALSE;
-
-    // 1. 创建两个内存 BIO
-    BIO *rbio = BIO_new(BIO_s_mem());
-    BIO *wbio = BIO_new(BIO_s_mem());
-    
-    if (!rbio || !wbio) {
-        if (rbio) BIO_free(rbio);
-        if (wbio) BIO_free(wbio);
-        return FALSE;
-    }
-
-    // 设置 BIO 为非阻塞模式，EOF 返回 -1
-    BIO_set_mem_eof_return(rbio, -1);
-    BIO_set_mem_eof_return(wbio, -1);
-
-    // 2. 替换 SSL 的 BIO
-    // 原有的 Socket/Fragment BIO 会被自动释放 (SSL_set_bio 接管所有权)
-    // 但我们的 socket 是 BIO_NOCLOSE 创建的，所以底层 socket 句柄安全
-    SSL_set_bio(tls->ssl, rbio, wbio);
-
-    connCtx->ssl = tls->ssl;
-    connCtx->io_in = rbio;   // Write encrypted data here -> SSL_read gets it
-    connCtx->io_out = wbio;  // SSL_write puts data here -> Read encrypted data
-    
-    // 清空 TLSContext 防止 double free，因为 SSL 对象已经转移给 connCtx
-    tls->ssl = NULL; 
-    
-    return TRUE;
-}
-
-// [IOCP] 解密流程: Network(Encrypted) -> BIO_write(io_in) -> SSL_read -> Application(Plain)
-int tls_decrypt_from_mem(CONNECTION_CONTEXT* ctx, const char* encrypted_in, int in_len, char* decrypted_out, int max_out) {
-    if (!ctx || !ctx->ssl || !ctx->io_in) return -1;
-    
-    // 1. 将收到的网络数据(密文)写入 Input BIO
-    int written = BIO_write(ctx->io_in, encrypted_in, in_len);
-    if (written <= 0) return -1; // BIO error or OOM
-    
-    // 2. 从 SSL 引擎读取解密后的数据(明文)
-    // 注意：可能因为数据包不完整导致 SSL_read 返回 WANT_READ，此时返回 0
-    int total_read = 0;
-    while (total_read < max_out) {
-        int n = SSL_read(ctx->ssl, decrypted_out + total_read, max_out - total_read);
-        if (n > 0) {
-            total_read += n;
-        } else {
-            int err = SSL_get_error(ctx->ssl, n);
-            if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
-                // 当前内存中的数据不足以解出一个完整的 TLS Record
-                break; 
-            }
-            // 其他错误 (如 SSL_ERROR_SSL, SSL_ERROR_SYSCALL)
-            return -1; 
-        }
-    }
-    return total_read;
-}
-
-// [IOCP] 加密流程: Application(Plain) -> SSL_write -> BIO_read(io_out) -> Network(Encrypted)
-int tls_encrypt_to_mem(CONNECTION_CONTEXT* ctx, const char* plain_in, int in_len, char* encrypted_out, int max_out) {
-    if (!ctx || !ctx->ssl || !ctx->io_out) return -1;
-
-    // 1. 将明文写入 SSL 引擎
-    int written = 0;
-    while (written < in_len) {
-        int n = SSL_write(ctx->ssl, plain_in + written, in_len - written);
-        if (n > 0) {
-            written += n;
-        } else {
-            // 这里很少会失败，除非内存 BIO 满了或者 SSL 状态错误
-            return -1; 
-        }
-    }
-    
-    // 2. 从 Output BIO 读取加密后的数据(密文)
-    int total_cipher = 0;
-    while (total_cipher < max_out) {
-        int n = BIO_read(ctx->io_out, encrypted_out + total_cipher, max_out - total_cipher);
-        if (n > 0) {
-            total_cipher += n;
-        } else {
-            // BIO_read 返回 -1 表示读空了，这是正常的结束条件
-            break; 
-        }
-    }
-    return total_cipher;
-}
-
-// ---------------------- WebSocket Helper ----------------------
 
 int build_ws_frame(const char *in, int len, char *out) {
     int idx = 0;
