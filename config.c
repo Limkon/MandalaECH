@@ -2,6 +2,7 @@
 #include "common.h"
 #include "utils.h"
 #include "cJSON.h"
+#include "proxy.h" // [Fix] 包含 proxy.h 以修复 StopProxyCore/StartProxyCore 隐式声明
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,12 +11,10 @@
 // 辅助函数
 // --------------------------------------------------------------------------
 
-// 提取 URL 中的 Fragment (#之后) 或 Query (?ps=) 作为节点备注
 static void parse_node_tag(const char* url, char* tag_out, int tag_max) {
     if (!url || !tag_out) return;
     tag_out[0] = 0;
     
-    // 1. 尝试取 Fragment (#)
     const char* p = strchr(url, '#');
     if (p) {
         p++;
@@ -25,7 +24,6 @@ static void parse_node_tag(const char* url, char* tag_out, int tag_max) {
         return;
     }
     
-    // 2. 尝试取 ps 参数 (常见于旧版链接)
     p = strstr(url, "ps=");
     if (p) {
         p += 3;
@@ -47,10 +45,8 @@ void SwitchNode(const wchar_t* tag) {
     if (!tag) return;
     
     EnterCriticalSection(&g_configLock);
-    
     wcsncpy(currentNode, tag, 63); currentNode[63] = 0;
     
-    // 1. 读取配置文件
     char* buffer = NULL; long size = 0;
     if (!ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) {
         LeaveCriticalSection(&g_configLock);
@@ -66,7 +62,6 @@ void SwitchNode(const wchar_t* tag) {
         return;
     }
     
-    // 2. 查找目标节点
     char tagUtf8[256];
     WideCharToMultiByte(CP_UTF8, 0, tag, -1, tagUtf8, 256, NULL, NULL);
     
@@ -82,13 +77,10 @@ void SwitchNode(const wchar_t* tag) {
         }
     }
     
-    // 3. 激活节点：移至 outbounds[0] 并更新内存缓存
     if (targetNode) {
-        // 调整顺序
         cJSON_DetachItemViaPointer(outbounds, targetNode);
         cJSON_InsertItemInArray(outbounds, 0, targetNode);
         
-        // 提取配置到 g_proxyConfig (供 proxy.c 使用)
         memset(&g_proxyConfig, 0, sizeof(g_proxyConfig));
         
         cJSON* srv = cJSON_GetObjectItem(targetNode, "server");
@@ -100,23 +92,19 @@ void SwitchNode(const wchar_t* tag) {
         cJSON* type = cJSON_GetObjectItem(targetNode, "type");
         if (type && type->valuestring) strncpy(g_proxyConfig.type, type->valuestring, 31);
         
-        // 用户名/UUID
-        cJSON* user = cJSON_GetObjectItem(targetNode, "username"); // Socks/HTTP
-        if(!user) user = cJSON_GetObjectItem(targetNode, "uuid");  // VMess/VLESS
+        cJSON* user = cJSON_GetObjectItem(targetNode, "username"); 
+        if(!user) user = cJSON_GetObjectItem(targetNode, "uuid");  
         if (user && user->valuestring) strncpy(g_proxyConfig.user, user->valuestring, 127);
         
-        // 密码
         cJSON* pass = cJSON_GetObjectItem(targetNode, "password");
         if (pass && pass->valuestring) strncpy(g_proxyConfig.pass, pass->valuestring, 127);
         
-        // TLS SNI
         cJSON* tls = cJSON_GetObjectItem(targetNode, "tls");
         if (tls) {
             cJSON* sni = cJSON_GetObjectItem(tls, "server_name");
             if (sni && sni->valuestring) strncpy(g_proxyConfig.sni, sni->valuestring, 255);
         }
         
-        // Transport Path (WS)
         cJSON* trans = cJSON_GetObjectItem(targetNode, "transport");
         if (trans) {
             cJSON* ws = cJSON_GetObjectItem(trans, "wsSettings");
@@ -124,7 +112,6 @@ void SwitchNode(const wchar_t* tag) {
                 cJSON* path = cJSON_GetObjectItem(ws, "path");
                 if (path && path->valuestring) strncpy(g_proxyConfig.path, path->valuestring, 255);
                 
-                // 兼容：如果 TLS SNI 为空，尝试从 Host header 获取
                 if (strlen(g_proxyConfig.sni) == 0) {
                     cJSON* headers = cJSON_GetObjectItem(ws, "headers");
                     if (headers) {
@@ -135,7 +122,6 @@ void SwitchNode(const wchar_t* tag) {
             }
         }
 
-        // 4. 原子保存配置
         char* out = cJSON_Print(root);
         if (out) {
             WriteBufferToFile(CONFIG_FILE, out);
@@ -149,7 +135,6 @@ void SwitchNode(const wchar_t* tag) {
     cJSON_Delete(root);
     LeaveCriticalSection(&g_configLock);
     
-    // 重启代理核心
     if (g_proxyRunning) {
         StopProxyCore();
         StartProxyCore();
@@ -207,11 +192,7 @@ void DeleteNode(const wchar_t* tag) {
 // 核心：协议解析 (全协议支持)
 // --------------------------------------------------------------------------
 
-// 解析 SS 协议 (SIP002 & Legacy)
 static void ParseSS(const char* body, const char* fragment, cJSON* node) {
-    // 格式1 (SIP002): user:pass@host:port
-    // 格式2 (Legacy): BASE64(method:pass@host:port) - 已由外层解码
-    
     char method[64] = {0};
     char password[128] = {0};
     char host[256] = {0};
@@ -219,7 +200,6 @@ static void ParseSS(const char* body, const char* fragment, cJSON* node) {
     
     const char* at = strrchr(body, '@');
     if (at) {
-        // body = "method:pass@host:port"
         int user_len = (int)(at - body);
         char user_part[256];
         if (user_len > 255) user_len = 255;
@@ -241,13 +221,9 @@ static void ParseSS(const char* body, const char* fragment, cJSON* node) {
             port = atoi(p_colon + 1);
         }
     } else {
-        // 可能是旧版直接 Base64 包含所有信息，或者格式错误
-        // 这里尝试处理 "method:pass:host:port" 这种非标准格式
-        // 实际上标准 SS 必须有 @
         return;
     }
     
-    // 构建 JSON
     cJSON_AddStringToObject(node, "type", "shadowsocks");
     cJSON_AddStringToObject(node, "server", host);
     cJSON_AddNumberToObject(node, "server_port", port);
@@ -259,7 +235,7 @@ static void ParseSS(const char* body, const char* fragment, cJSON* node) {
     else snprintf(tag, 256, "ss-%s:%d", host, port);
     cJSON_AddStringToObject(node, "tag", tag);
     
-    cJSON_AddStringToObject(node, "network", "tcp"); // 默认 TCP
+    cJSON_AddStringToObject(node, "network", "tcp"); 
 }
 
 static void ParseLinkAndAdd(const char* link, cJSON* outbounds) {
@@ -275,7 +251,6 @@ static void ParseLinkAndAdd(const char* link, cJSON* outbounds) {
     
     cJSON* node = cJSON_CreateObject();
     
-    // ---------------- VMESS ----------------
     if (_stricmp(scheme, "vmess") == 0) {
         const char* b64 = p_colon + 3;
         size_t decoded_len = 0;
@@ -284,20 +259,18 @@ static void ParseLinkAndAdd(const char* link, cJSON* outbounds) {
             cJSON* v = cJSON_Parse((char*)decoded);
             free(decoded);
             if (v) {
-                // 必选字段
                 cJSON* ps = cJSON_GetObjectItem(v, "ps");
                 cJSON* add = cJSON_GetObjectItem(v, "add");
                 cJSON* port = cJSON_GetObjectItem(v, "port");
                 cJSON* id = cJSON_GetObjectItem(v, "id");
                 
-                // 可选/协议字段
                 cJSON* aid = cJSON_GetObjectItem(v, "aid");
                 cJSON* net = cJSON_GetObjectItem(v, "net");
-                cJSON* type = cJSON_GetObjectItem(v, "type"); // header type
+                cJSON* type = cJSON_GetObjectItem(v, "type"); 
                 cJSON* host = cJSON_GetObjectItem(v, "host");
                 cJSON* path = cJSON_GetObjectItem(v, "path");
                 cJSON* tls = cJSON_GetObjectItem(v, "tls");
-                cJSON* scy = cJSON_GetObjectItem(v, "scy"); // security
+                cJSON* scy = cJSON_GetObjectItem(v, "scy"); 
                 cJSON* sni = cJSON_GetObjectItem(v, "sni");
                 cJSON* alpn = cJSON_GetObjectItem(v, "alpn");
                 
@@ -319,7 +292,6 @@ static void ParseLinkAndAdd(const char* link, cJSON* outbounds) {
                     else 
                         cJSON_AddStringToObject(node, "security", "auto");
 
-                    // Transport
                     char netStr[32] = "tcp";
                     if (net && net->valuestring) strncpy(netStr, net->valuestring, 31);
                     
@@ -331,7 +303,6 @@ static void ParseLinkAndAdd(const char* link, cJSON* outbounds) {
                         if (path && path->valuestring && strlen(path->valuestring)>0) 
                             cJSON_AddStringToObject(wsSettings, "path", path->valuestring);
                             
-                        // Headers / Host
                         if (host && host->valuestring && strlen(host->valuestring)>0) {
                             cJSON* headers = cJSON_CreateObject();
                             cJSON_AddStringToObject(headers, "Host", host->valuestring);
@@ -340,7 +311,6 @@ static void ParseLinkAndAdd(const char* link, cJSON* outbounds) {
                         cJSON_AddItemToObject(trans, "wsSettings", wsSettings);
                         cJSON_AddItemToObject(node, "transport", trans);
                     } else if (strcmp(netStr, "grpc") == 0) {
-                        // 补充对 gRPC 的基本支持
                         cJSON* trans = cJSON_CreateObject();
                         cJSON_AddStringToObject(trans, "type", "grpc");
                         cJSON* grpc = cJSON_CreateObject();
@@ -349,7 +319,6 @@ static void ParseLinkAndAdd(const char* link, cJSON* outbounds) {
                         cJSON_AddItemToObject(node, "transport", trans);
                     } else {
                         cJSON_AddStringToObject(node, "network", "tcp");
-                        // TCP HTTP Header (type=http)
                         if (type && strcmp(type->valuestring, "http") == 0) {
                              cJSON* trans = cJSON_CreateObject();
                              cJSON_AddStringToObject(trans, "type", "tcp");
@@ -362,7 +331,6 @@ static void ParseLinkAndAdd(const char* link, cJSON* outbounds) {
                         }
                     }
                     
-                    // TLS
                     if ((tls && strcmp(tls->valuestring, "tls") == 0) || (port && port->valueint == 443)) {
                         cJSON* tObj = cJSON_CreateObject();
                         cJSON_AddBoolToObject(tObj, "enabled", cJSON_True);
@@ -377,7 +345,6 @@ static void ParseLinkAndAdd(const char* link, cJSON* outbounds) {
                              cJSON_AddItemToObject(tObj, "alpn", alpnArr);
                         }
                         cJSON_AddItemToObject(node, "tls", tObj);
-                        // V2Ray Core 约定: 如果开启 TLS，外层 security 字段应设为 tls，或保留为 auto
                     }
                     
                     cJSON_AddItemToArray(outbounds, node);
@@ -386,7 +353,6 @@ static void ParseLinkAndAdd(const char* link, cJSON* outbounds) {
             } else cJSON_Delete(node);
         } else cJSON_Delete(node);
     }
-    // ---------------- VLESS / TROJAN ----------------
     else if (_stricmp(scheme, "vless") == 0 || _stricmp(scheme, "trojan") == 0) {
         const char* body = p_colon + 3;
         const char* at = strchr(body, '@');
@@ -398,21 +364,17 @@ static void ParseLinkAndAdd(const char* link, cJSON* outbounds) {
             char user[128], host[256], tag[256] = {0};
             int port = 443;
             
-            // User
             int uLen = (int)(at - body);
             if (uLen > 127) uLen = 127;
             strncpy(user, body, uLen); user[uLen] = 0;
             
-            // Host
             const char* host_start = at + 1;
             int hLen = (int)(last_colon - host_start);
             if (hLen > 255) hLen = 255;
             strncpy(host, host_start, hLen); host[hLen] = 0;
             
-            // Port
             port = atoi(last_colon + 1);
             
-            // Tag
             parse_node_tag(link, tag, 256);
             if (strlen(tag) == 0) snprintf(tag, 256, "%s-%s:%d", scheme, host, port);
             
@@ -424,17 +386,16 @@ static void ParseLinkAndAdd(const char* link, cJSON* outbounds) {
             if (_stricmp(scheme, "trojan") == 0) cJSON_AddStringToObject(node, "password", user);
             else cJSON_AddStringToObject(node, "uuid", user);
             
-            // Query Params
             if (q) {
                 char* type = GetQueryParam(q, "type");
-                char* security = GetQueryParam(q, "security"); // tls, reality...
+                char* security = GetQueryParam(q, "security"); 
                 char* sni = GetQueryParam(q, "sni");
                 char* path = GetQueryParam(q, "path");
                 char* hostParam = GetQueryParam(q, "host");
-                char* flow = GetQueryParam(q, "flow"); // xtls-rprx-vision
+                char* flow = GetQueryParam(q, "flow"); 
                 char* fp = GetQueryParam(q, "fp");
                 char* alpn = GetQueryParam(q, "alpn");
-                char* serviceName = GetQueryParam(q, "serviceName"); // grpc
+                char* serviceName = GetQueryParam(q, "serviceName");
                 
                 if (flow && strlen(flow) > 0) cJSON_AddStringToObject(node, "flow", flow);
 
@@ -474,7 +435,6 @@ static void ParseLinkAndAdd(const char* link, cJSON* outbounds) {
                     if (fp) cJSON_AddStringToObject(tObj, "fingerprint", fp);
                     if (alpn) {
                          cJSON* alpnArr = cJSON_CreateArray();
-                         // 简单处理逗号分隔
                          cJSON_AddItemToArray(alpnArr, cJSON_CreateString(alpn));
                          cJSON_AddItemToObject(tObj, "alpn", alpnArr);
                     }
@@ -485,15 +445,12 @@ static void ParseLinkAndAdd(const char* link, cJSON* outbounds) {
                 if(path) free(path); if(hostParam) free(hostParam); if(flow) free(flow);
                 if(fp) free(fp); if(alpn) free(alpn); if(serviceName) free(serviceName);
             } else {
-                // 无参数默认逻辑
                 cJSON_AddStringToObject(node, "network", "tcp");
             }
             cJSON_AddItemToArray(outbounds, node);
         } else cJSON_Delete(node);
     } 
-    // ---------------- SHADOWSOCKS ----------------
     else if (_stricmp(scheme, "ss") == 0) {
-        // ss://BASE64(...)#tag 或 ss://method:pass@host:port#tag
         const char* body = p_colon + 3;
         const char* hash = strchr(body, '#');
         char fragment[256] = {0};
@@ -501,7 +458,6 @@ static void ParseLinkAndAdd(const char* link, cJSON* outbounds) {
             strncpy(fragment, hash + 1, 255);
         }
 
-        // 检查是否包含 @，如果有，则非 Base64 封装的全部信息 (SIP002 明文)
         if (strchr(body, '@')) {
             char temp_body[1024];
             int len = hash ? (int)(hash - body) : (int)strlen(body);
@@ -510,8 +466,6 @@ static void ParseLinkAndAdd(const char* link, cJSON* outbounds) {
             ParseSS(temp_body, fragment, node);
             cJSON_AddItemToArray(outbounds, node);
         } else {
-            // 可能是 Base64 编码的 user:pass@host:port
-            // 或者是旧版 method:pass@host:port
             int b64_len = hash ? (int)(hash - body) : (int)strlen(body);
             char b64_str[1024];
             if (b64_len > 1023) b64_len = 1023;
@@ -531,9 +485,7 @@ static void ParseLinkAndAdd(const char* link, cJSON* outbounds) {
             }
         }
     }
-    // ---------------- SOCKS / HTTP ----------------
     else if (_stricmp(scheme, "socks") == 0 || _stricmp(scheme, "http") == 0) {
-         // socks://user:pass@host:port#tag
          const char* body = p_colon + 3;
          const char* at = strchr(body, '@');
          const char* last_colon = strrchr(body, ':');
@@ -576,10 +528,6 @@ static void ParseLinkAndAdd(const char* link, cJSON* outbounds) {
     }
 }
 
-// --------------------------------------------------------------------------
-// 核心：订阅更新
-// --------------------------------------------------------------------------
-
 int UpdateAllSubscriptions(BOOL forceLog) {
     EnterCriticalSection(&g_configLock);
     int subCount = g_subCount;
@@ -591,7 +539,6 @@ int UpdateAllSubscriptions(BOOL forceLog) {
 
     int new_nodes_count = 0;
     
-    // 1. 读取配置文件
     char* buffer = NULL; long size = 0;
     if (!ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) {
         if(forceLog) log_msg("[Sub] Failed to read config file");
@@ -603,7 +550,6 @@ int UpdateAllSubscriptions(BOOL forceLog) {
     cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
     if (!outbounds) { cJSON_Delete(root); return 0; }
     
-    // 2. 逐个更新订阅
     for (int i = 0; i < subCount; i++) {
         if (!subsCopy[i].enabled) continue;
         
@@ -615,7 +561,6 @@ int UpdateAllSubscriptions(BOOL forceLog) {
             continue;
         }
         
-        // 尝试 Base64 解码 (订阅通常是 B64 编码的节点列表)
         size_t b64_len = 0;
         unsigned char* decoded = Base64Decode(resp, &b64_len);
         
@@ -623,14 +568,12 @@ int UpdateAllSubscriptions(BOOL forceLog) {
         if (decoded && b64_len > 0) {
             raw_list = (char*)decoded;
         } else {
-            // 如果解码失败，可能服务器返回的就是明文列表
             raw_list = SafeStrDup(resp, strlen(resp));
         }
         free(resp);
         
         if (!raw_list) continue;
         
-        // 逐行解析
         char* ctx = NULL;
         char* line = strtok_s(raw_list, "\r\n", &ctx);
         int count_in_sub = 0;
@@ -649,7 +592,6 @@ int UpdateAllSubscriptions(BOOL forceLog) {
         if (forceLog) log_msg("[Sub] Added %d nodes from sub %d", count_in_sub, i+1);
     }
     
-    // 3. 保存更改
     if (new_nodes_count > 0) {
         char* out = cJSON_Print(root);
         if (out) {
@@ -675,7 +617,6 @@ int UpdateAllSubscriptions(BOOL forceLog) {
 void ParseTags() {
     EnterCriticalSection(&g_configLock);
     
-    // 释放旧缓存
     if (nodeTags) {
         for(int i=0; i<nodeCount; i++) free(nodeTags[i]);
         free(nodeTags); nodeTags = NULL;
@@ -707,10 +648,6 @@ void ParseTags() {
     }
     LeaveCriticalSection(&g_configLock);
 }
-
-// --------------------------------------------------------------------------
-// 剪贴板导入
-// --------------------------------------------------------------------------
 
 int ImportFromClipboard() {
     char* text = GetClipboardText();
@@ -786,17 +723,29 @@ void LoadSettings() {
     g_subCount = GetPrivateProfileIntW(L"Subs", L"Count", 0, g_iniFilePath);
     if (g_subCount > MAX_SUBS) g_subCount = MAX_SUBS;
     for(int i=0; i<g_subCount; i++) {
-        wchar_t key[32]; swprintf(key, 32, L"Url_%d", i);
-        GetPrivateProfileStringA("Subs", key, "", g_subs[i].url, 512, "set.ini");
+        // [Fix] 使用 Wide API 读取 URL 并转换为 ANSI
+        wchar_t wKey[32]; swprintf(wKey, 32, L"Url_%d", i);
+        wchar_t wUrl[512] = {0};
         
-        swprintf(key, 32, L"En_%d", i);
-        g_subs[i].enabled = GetPrivateProfileIntW(L"Subs", key, 1, g_iniFilePath);
+        GetPrivateProfileStringW(L"Subs", wKey, L"", wUrl, 512, g_iniFilePath);
+        if (wcslen(wUrl) > 0) {
+            WideCharToMultiByte(CP_UTF8, 0, wUrl, -1, g_subs[i].url, 512, NULL, NULL);
+        } else {
+             // 兼容旧版 ANSI 读取
+             GetPrivateProfileStringA("Subs", "Url", "", g_subs[i].url, 512, "set.ini");
+        }
+        
+        swprintf(wKey, 32, L"En_%d", i);
+        g_subs[i].enabled = GetPrivateProfileIntW(L"Subs", wKey, 1, g_iniFilePath);
     }
     
     g_subUpdateMode = GetPrivateProfileIntW(L"Subs", L"UpdateMode", UPDATE_MODE_DAILY, g_iniFilePath);
     g_subUpdateInterval = GetPrivateProfileIntW(L"Subs", L"UpdateInterval", 24, g_iniFilePath);
-    char buf[64]; GetPrivateProfileStringA("Subs", "LastTime", "0", buf, 64, "set.ini");
-    g_lastUpdateTime = _atoi64(buf);
+    
+    // [Fix] 读取 LastTime (LongLong as String)
+    wchar_t wTimeBuf[64];
+    GetPrivateProfileStringW(L"Subs", L"LastTime", L"0", wTimeBuf, 64, g_iniFilePath);
+    g_lastUpdateTime = _wtoi64(wTimeBuf);
 }
 
 void SaveSettings() {
@@ -827,13 +776,21 @@ void SaveSettings() {
 
     swprintf(buf, 64, L"%d", g_subCount); WritePrivateProfileStringW(L"Subs", L"Count", buf, g_iniFilePath);
     for(int i=0; i<g_subCount; i++) {
-        wchar_t key[32]; swprintf(key, 32, L"Url_%d", i);
-        WritePrivateProfileStringA("Subs", key, g_subs[i].url, "set.ini");
-        swprintf(key, 32, L"En_%d", i);
-        swprintf(buf, 64, L"%d", g_subs[i].enabled); WritePrivateProfileStringW(L"Subs", key, buf, g_iniFilePath);
+        // [Fix] 写入 URL 使用 Wide API
+        wchar_t wKey[32]; swprintf(wKey, 32, L"Url_%d", i);
+        wchar_t wUrl[512];
+        MultiByteToWideChar(CP_UTF8, 0, g_subs[i].url, -1, wUrl, 512);
+        WritePrivateProfileStringW(L"Subs", wKey, wUrl, g_iniFilePath);
+        
+        swprintf(wKey, 32, L"En_%d", i);
+        swprintf(buf, 64, L"%d", g_subs[i].enabled); 
+        WritePrivateProfileStringW(L"Subs", wKey, buf, g_iniFilePath);
     }
     
     swprintf(buf, 64, L"%d", g_subUpdateMode); WritePrivateProfileStringW(L"Subs", L"UpdateMode", buf, g_iniFilePath);
     swprintf(buf, 64, L"%d", g_subUpdateInterval); WritePrivateProfileStringW(L"Subs", L"UpdateInterval", buf, g_iniFilePath);
-    sprintf(buf, "%lld", g_lastUpdateTime); WritePrivateProfileStringA("Subs", "LastTime", buf, "set.ini");
+    
+    // [Fix] 写入 LastTime 使用 Wide API
+    swprintf(buf, 64, L"%lld", g_lastUpdateTime);
+    WritePrivateProfileStringW(L"Subs", L"LastTime", buf, g_iniFilePath);
 }
