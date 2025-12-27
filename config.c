@@ -91,12 +91,13 @@ static void ParseSSPlugin(cJSON* outbound, const char* pluginParam) {
 // --- 配置加载与保存 ---
 
 void LoadSettings() {
+    // 读取系统与热键设置
     UINT modifiers = GetPrivateProfileIntW(L"Settings", L"Modifiers", MOD_CONTROL | MOD_ALT, g_iniFilePath);
     UINT vk = GetPrivateProfileIntW(L"Settings", L"VK", 'H', g_iniFilePath);
     int port = GetPrivateProfileIntW(L"Settings", L"LocalPort", 10809, g_iniFilePath);
     int hideTray = GetPrivateProfileIntW(L"Settings", L"HideTray", 0, g_iniFilePath);
     
-    // 抗封锁配置
+    // 读取抗封锁配置
     int enableChrome = GetPrivateProfileIntW(L"Settings", L"ChromeCiphers", 1, g_iniFilePath);
     int enableALPN = GetPrivateProfileIntW(L"Settings", L"EnableALPN", 1, g_iniFilePath);
     int enableFrag = GetPrivateProfileIntW(L"Settings", L"EnableFragment", 0, g_iniFilePath);
@@ -108,13 +109,13 @@ void LoadSettings() {
     int padMax = GetPrivateProfileIntW(L"Settings", L"PadMax", 500, g_iniFilePath);
     int uaIdx = GetPrivateProfileIntW(L"Settings", L"UAPlatform", 0, g_iniFilePath);
 
-    // ECH 配置
+    // 读取 ECH 配置
     int enableECH = GetPrivateProfileIntW(L"Settings", L"EnableECH", 0, g_iniFilePath);
     wchar_t wEchServer[256] = {0}, wEchPub[256] = {0};
     GetPrivateProfileStringW(L"Settings", L"ECHServer", L"https://cloudflare-dns.com/dns-query", wEchServer, 256, g_iniFilePath);
     GetPrivateProfileStringW(L"Settings", L"ECHPublicName", L"", wEchPub, 256, g_iniFilePath);
 
-    // 订阅配置
+    // 读取订阅配置
     int upMode = GetPrivateProfileIntW(L"Subscriptions", L"UpdateMode", 0, g_iniFilePath);
     int upInterval = GetPrivateProfileIntW(L"Subscriptions", L"UpdateInterval", 24, g_iniFilePath);
     
@@ -165,24 +166,24 @@ void LoadSettings() {
 void SaveSettings() {
     EnterCriticalSection(&g_configLock);
 
-    wchar_t buffer[16];
-    swprintf_s(buffer, 16, L"%u", g_hotkeyModifiers); WritePrivateProfileStringW(L"Settings", L"Modifiers", buffer, g_iniFilePath);
-    swprintf_s(buffer, 16, L"%u", g_hotkeyVk); WritePrivateProfileStringW(L"Settings", L"VK", buffer, g_iniFilePath);
-    swprintf_s(buffer, 16, L"%d", g_localPort); WritePrivateProfileStringW(L"Settings", L"LocalPort", buffer, g_iniFilePath);
-    swprintf_s(buffer, 16, L"%d", g_hideTrayStart); WritePrivateProfileStringW(L"Settings", L"HideTray", buffer, g_iniFilePath);
+    wchar_t buffer[32];
+    swprintf_s(buffer, 32, L"%u", g_hotkeyModifiers); WritePrivateProfileStringW(L"Settings", L"Modifiers", buffer, g_iniFilePath);
+    swprintf_s(buffer, 32, L"%u", g_hotkeyVk); WritePrivateProfileStringW(L"Settings", L"VK", buffer, g_iniFilePath);
+    swprintf_s(buffer, 32, L"%d", g_localPort); WritePrivateProfileStringW(L"Settings", L"LocalPort", buffer, g_iniFilePath);
+    swprintf_s(buffer, 32, L"%d", g_hideTrayStart); WritePrivateProfileStringW(L"Settings", L"HideTray", buffer, g_iniFilePath);
     
-    swprintf_s(buffer, 16, L"%d", g_enableChromeCiphers); WritePrivateProfileStringW(L"Settings", L"ChromeCiphers", buffer, g_iniFilePath);
-    swprintf_s(buffer, 16, L"%d", g_enableALPN); WritePrivateProfileStringW(L"Settings", L"EnableALPN", buffer, g_iniFilePath);
-    swprintf_s(buffer, 16, L"%d", g_enableFragment); WritePrivateProfileStringW(L"Settings", L"EnableFragment", buffer, g_iniFilePath);
-    swprintf_s(buffer, 16, L"%d", g_fragSizeMin); WritePrivateProfileStringW(L"Settings", L"FragMin", buffer, g_iniFilePath);
-    swprintf_s(buffer, 16, L"%d", g_fragSizeMax); WritePrivateProfileStringW(L"Settings", L"FragMax", buffer, g_iniFilePath);
-    swprintf_s(buffer, 16, L"%d", g_fragDelayMs); WritePrivateProfileStringW(L"Settings", L"FragDelay", buffer, g_iniFilePath);
-    swprintf_s(buffer, 16, L"%d", g_enablePadding); WritePrivateProfileStringW(L"Settings", L"EnablePadding", buffer, g_iniFilePath);
-    swprintf_s(buffer, 16, L"%d", g_padSizeMin); WritePrivateProfileStringW(L"Settings", L"PadMin", buffer, g_iniFilePath);
-    swprintf_s(buffer, 16, L"%d", g_padSizeMax); WritePrivateProfileStringW(L"Settings", L"PadMax", buffer, g_iniFilePath);
-    swprintf_s(buffer, 16, L"%d", g_uaPlatformIndex); WritePrivateProfileStringW(L"Settings", L"UAPlatform", buffer, g_iniFilePath);
+    swprintf_s(buffer, 32, L"%d", g_enableChromeCiphers); WritePrivateProfileStringW(L"Settings", L"ChromeCiphers", buffer, g_iniFilePath);
+    swprintf_s(buffer, 32, L"%d", g_enableALPN); WritePrivateProfileStringW(L"Settings", L"EnableALPN", buffer, g_iniFilePath);
+    swprintf_s(buffer, 32, L"%d", g_enableFragment); WritePrivateProfileStringW(L"Settings", L"EnableFragment", buffer, g_iniFilePath);
+    swprintf_s(buffer, 32, L"%d", g_fragSizeMin); WritePrivateProfileStringW(L"Settings", L"FragMin", buffer, g_iniFilePath);
+    swprintf_s(buffer, 32, L"%d", g_fragSizeMax); WritePrivateProfileStringW(L"Settings", L"FragMax", buffer, g_iniFilePath);
+    swprintf_s(buffer, 32, L"%d", g_fragDelayMs); WritePrivateProfileStringW(L"Settings", L"FragDelay", buffer, g_iniFilePath);
+    swprintf_s(buffer, 32, L"%d", g_enablePadding); WritePrivateProfileStringW(L"Settings", L"EnablePadding", buffer, g_iniFilePath);
+    swprintf_s(buffer, 32, L"%d", g_padSizeMin); WritePrivateProfileStringW(L"Settings", L"PadMin", buffer, g_iniFilePath);
+    swprintf_s(buffer, 32, L"%d", g_padSizeMax); WritePrivateProfileStringW(L"Settings", L"PadMax", buffer, g_iniFilePath);
+    swprintf_s(buffer, 32, L"%d", g_uaPlatformIndex); WritePrivateProfileStringW(L"Settings", L"UAPlatform", buffer, g_iniFilePath);
     
-    swprintf_s(buffer, 16, L"%d", g_enableECH); WritePrivateProfileStringW(L"Settings", L"EnableECH", buffer, g_iniFilePath);
+    swprintf_s(buffer, 32, L"%d", g_enableECH); WritePrivateProfileStringW(L"Settings", L"EnableECH", buffer, g_iniFilePath);
     
     wchar_t wEchServerOut[256] = {0}, wEchPubOut[256] = {0};
     MultiByteToWideChar(CP_UTF8, 0, g_echConfigServer, -1, wEchServerOut, 256);
@@ -195,14 +196,16 @@ void SaveSettings() {
     WritePrivateProfileStringW(L"Settings", L"UserAgent", wUABuf, g_iniFilePath);
 
     WritePrivateProfileStringW(L"Settings", L"LastNode", currentNode, g_iniFilePath);
-    WritePrivateProfileStringW(L"Subscriptions", NULL, NULL, g_iniFilePath); // Clear section
+    
+    // 清空 Subscriptions 节以重新写入
+    WritePrivateProfileStringW(L"Subscriptions", NULL, NULL, g_iniFilePath); 
     
     wchar_t wTimeBuf[64]; swprintf_s(wTimeBuf, 64, L"%lld", g_lastUpdateTime);
     WritePrivateProfileStringW(L"Subscriptions", L"LastUpdateTime", wTimeBuf, g_iniFilePath);
 
-    swprintf_s(buffer, 16, L"%d", g_subUpdateMode); WritePrivateProfileStringW(L"Subscriptions", L"UpdateMode", buffer, g_iniFilePath);
-    swprintf_s(buffer, 16, L"%d", g_subUpdateInterval); WritePrivateProfileStringW(L"Subscriptions", L"UpdateInterval", buffer, g_iniFilePath);
-    swprintf_s(buffer, 16, L"%d", g_subCount); WritePrivateProfileStringW(L"Subscriptions", L"Count", buffer, g_iniFilePath);
+    swprintf_s(buffer, 32, L"%d", g_subUpdateMode); WritePrivateProfileStringW(L"Subscriptions", L"UpdateMode", buffer, g_iniFilePath);
+    swprintf_s(buffer, 32, L"%d", g_subUpdateInterval); WritePrivateProfileStringW(L"Subscriptions", L"UpdateInterval", buffer, g_iniFilePath);
+    swprintf_s(buffer, 32, L"%d", g_subCount); WritePrivateProfileStringW(L"Subscriptions", L"Count", buffer, g_iniFilePath);
 
     for (int i = 0; i < g_subCount; i++) {
         wchar_t wKeyEn[32], wKeyUrl[32], wUrl[512], wVal[2];
@@ -398,6 +401,7 @@ BOOL AddNodeToConfig(cJSON* newNode) {
     return ret;
 }
 
+// [Core Fix] 批量添加节点逻辑增强
 int Internal_BatchAddNodesFromText(const char* text, cJSON* outbounds) {
     if (!text || !outbounds) return 0;
     int count = 0; 
@@ -405,15 +409,25 @@ int Internal_BatchAddNodesFromText(const char* text, cJSON* outbounds) {
     unsigned char* decoded = NULL;
     size_t decLen = 0;
 
-    if (strstr(text, "://")) sourceText = _strdup(text);
-    else {
+    // 1. 尝试判定格式
+    // 如果包含 "://" 很可能是明文 URI 列表
+    if (strstr(text, "://")) {
+        sourceText = _strdup(text);
+    } else {
+        // 尝试 Base64 解码 (utils.c 中已增强兼容性)
         decoded = Base64Decode(text, &decLen);
-        if (decoded && decLen > 0) sourceText = (char*)decoded;
-        else { sourceText = _strdup(text); if (decoded) free(decoded); }
+        if (decoded && decLen > 0) {
+             sourceText = (char*)decoded;
+        } else {
+             // 解码失败或为空，尝试作为明文处理 (Fallback)
+             if (decoded) free(decoded);
+             sourceText = _strdup(text);
+        }
     }
     
     if (!sourceText) return 0;
     
+    // 2. 逐行解析
     char* p = sourceText;
     while (*p) {
         size_t span = strspn(p, "\r\n ,"); p += span; if (!*p) break;
@@ -424,6 +438,7 @@ int Internal_BatchAddNodesFromText(const char* text, cJSON* outbounds) {
             
             if (strlen(line) > 0) {
                 cJSON* node = NULL;
+                // 按协议前缀匹配
                 if (_strnicmp(line, "vmess://", 8) == 0) node = ParseVmess(line);
                 else if (_strnicmp(line, "ss://", 5) == 0) node = ParseShadowsocks(line);
                 else if (_strnicmp(line, "vless://", 8) == 0) node = ParseVlessOrTrojan(line);
@@ -440,13 +455,18 @@ int Internal_BatchAddNodesFromText(const char* text, cJSON* outbounds) {
                     if (cJSON_HasObjectItem(node, "tag")) cJSON_ReplaceItemInObject(node, "tag", cJSON_CreateString(uniqueTag));
                     else cJSON_AddStringToObject(node, "tag", uniqueTag);
                     cJSON_AddItemToArray(outbounds, node); count++;
+                } else {
+                    // 记录未识别的行，方便调试
+                    // log_msg("[Parser] Skipped unknown or invalid line: %.50s...", line);
                 }
             }
             free(line);
             p += len;
         }
     }
-    free(sourceText); return count;
+    
+    free(sourceText); 
+    return count;
 }
 
 int ImportFromClipboard() {
@@ -483,7 +503,13 @@ int UpdateAllSubscriptions(BOOL forceMsg) {
     for (int i = 0; i < count; i++) {
         log_msg("[Sub] DL (%d/%d): %s", i+1, count, subUrls[i]);
         char* data = Utils_HttpGet(subUrls[i]);
-        if (data) { rawData[i] = data; downloadSuccess++; } else log_msg("[Sub] Failed: %s", subUrls[i]);
+        if (data) { 
+            rawData[i] = data; 
+            downloadSuccess++; 
+            log_msg("[Sub] Downloaded %d bytes from %s", strlen(data), subUrls[i]);
+        } else {
+            log_msg("[Sub] Failed to download: %s", subUrls[i]);
+        }
     }
 
     if (downloadSuccess == 0) { log_msg("[Err] All downloads failed."); return 0; }
@@ -496,13 +522,19 @@ int UpdateAllSubscriptions(BOOL forceMsg) {
     
     int totalNewNodes = 0;
     for (int i = 0; i < count; i++) {
-        if (rawData[i]) { totalNewNodes += Internal_BatchAddNodesFromText(rawData[i], outbounds); free(rawData[i]); }
+        if (rawData[i]) { 
+            int c = Internal_BatchAddNodesFromText(rawData[i], outbounds); 
+            totalNewNodes += c; 
+            log_msg("[Sub] Parsed %d nodes from sub %d", c, i+1);
+            free(rawData[i]); 
+        }
     }
     
     char* out = cJSON_Print(root); WriteBufferToFile(CONFIG_FILE, out); free(out); cJSON_Delete(root);
     ParseTags(); 
+    // 即使解析出 0 个节点，只要下载成功也算更新了一次，避免死循环重试
     if (downloadSuccess > 0) { g_lastUpdateTime = (long long)time(NULL); SaveSettings(); }
-    log_msg("[Sub] Update done. Nodes: %d", totalNewNodes);
+    log_msg("[Sub] Update done. Total nodes: %d", totalNewNodes);
     return totalNewNodes;
 }
 
@@ -515,6 +547,7 @@ void ToggleTrayIcon() {
 }
 
 // --- 协议解析实现 (Vmess/Vless/Trojan/Shadowsocks/Socks/Mandala) ---
+// 下面的解析函数已在之前的版本中进行了完善，本次保持一致
 
 // SOCKS 解析
 cJSON* ParseSocks(const char* link) {
@@ -535,7 +568,6 @@ cJSON* ParseSocks(const char* link) {
     const char* query = qMark ? qMark + 1 : NULL;
     char* sni = GetQueryParam(query, "sni"); if (!sni) sni = GetQueryParam(query, "peer");
     
-    // 修复 path 截断逻辑
     char* path = GetQueryParam(query, "path"); 
     if (path) { 
         char* hash_in_path = strchr(path, '#');
@@ -641,7 +673,6 @@ cJSON* ParseVmess(const char* link) {
     if (cJSON_IsString(net) && strcmp(net->valuestring, "ws") == 0) {
         cJSON* t = cJSON_CreateObject(); cJSON_AddStringToObject(t, "type", "ws");
         if(cJSON_IsString(path)) {
-            // VMess 内部 JSON 的 path 可能也带 #，虽然少见，一并处理
             char* p_val = _strdup(path->valuestring);
             char* hash_pos = strchr(p_val, '#');
             if (hash_pos) *hash_pos = '\0';
@@ -663,7 +694,7 @@ cJSON* ParseVmess(const char* link) {
     cJSON_Delete(vmessJson); return outbound;
 }
 
-// VLESS / Trojan 解析 (核心修复点)
+// VLESS / Trojan 解析
 cJSON* ParseVlessOrTrojan(const char* link) {
     char protocol[16] = {0};
     if (strncmp(link, "vless://", 8) == 0) strcpy(protocol, "vless");
@@ -679,7 +710,6 @@ cJSON* ParseVlessOrTrojan(const char* link) {
     int portNum = (colon && colon < hostEnd) ? atoi(colon+1) : 443;
     int hostLen = (int)(hostEnd - p); char* host = (char*)malloc(hostLen + 1); strncpy(host, p, hostLen); host[hostLen] = 0;
     
-    // Tag 解析：UTF-8 解码
     char* tag = NULL;
     if (hash) {
         tag = (char*)malloc(strlen(hash + 1) + 1);
@@ -700,12 +730,9 @@ cJSON* ParseVlessOrTrojan(const char* link) {
         cJSON* t = cJSON_CreateObject(); cJSON_AddStringToObject(t, "type", "ws");
         char* path = GetQueryParam(query, "path"); 
         if (path) { 
-            // 修复：截断在 # 之前
             char* hash_in_path = strchr(path, '#');
             if (hash_in_path) *hash_in_path = '\0';
-            
-            char* d = (char*)malloc(strlen(path) + 1); 
-            UrlDecode(d, path); // 支持中文路径
+            char* d = (char*)malloc(strlen(path) + 1); UrlDecode(d, path); 
             cJSON_AddStringToObject(t, "path", d); 
             free(d); free(path); 
         }
