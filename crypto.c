@@ -18,6 +18,18 @@ extern int g_enableECH;
 static BIO_METHOD *method_frag = NULL;
 static INIT_ONCE g_crypto_init_once = INIT_ONCE_STATIC_INIT;
 
+// TLS 协议常量定义 (消除魔术数字)
+#define TLS_HEADER_LEN 5
+#define HANDSHAKE_HEADER_LEN 4
+#define TLS_RECORD_TYPE_HANDSHAKE 0x16
+#define TLS_HANDSHAKE_TYPE_CLIENT_HELLO 0x01
+
+// Client Hello 最小固定头部长度:
+// Version(2) + Random(32) + SessionID Len(1) = 35
+// 加上 RecordHeader(5) + HandshakeHeader(4) = 9 + 35 = 44
+// 注意：原代码 offset=43 是指向 SessionID Len 的位置，这是正确的
+#define CLIENT_HELLO_FIXED_OFFSET 43
+
 // ---------------------- BIO Implementation ----------------------
 typedef struct {
     int first_packet_sent;
@@ -66,67 +78,85 @@ void BIO_set_params(BIO *b, const CryptoSettings *s) {
 }
 
 #define MAX_FRAG_COUNT 32 
-#define TLS_HEADER_LEN 5
-#define HANDSHAKE_HEADER_LEN 4
 
+// 注入随机 Padding Extension 到 Client Hello
 static char* inject_padding(const char* in, int in_len, int* out_len, int pad_min, int pad_max) {
-    if (in_len < TLS_HEADER_LEN + HANDSHAKE_HEADER_LEN) return NULL;
-    unsigned char* data = (unsigned char*)in;
-    if (data[0] != 0x16) return NULL; 
-    if (data[5] != 0x01) return NULL;
-
-    int offset = 43; 
-    if (in_len < offset + 1) return NULL;
+    // 基础长度检查
+    if (in_len < TLS_HEADER_LEN + HANDSHAKE_HEADER_LEN + CLIENT_HELLO_FIXED_OFFSET) return NULL;
     
+    unsigned char* data = (unsigned char*)in;
+    // 验证是否为 Client Hello
+    if (data[0] != TLS_RECORD_TYPE_HANDSHAKE) return NULL; 
+    if (data[5] != TLS_HANDSHAKE_TYPE_CLIENT_HELLO) return NULL;
+
+    int offset = CLIENT_HELLO_FIXED_OFFSET; 
+    
+    // 1. 跳过 Session ID
+    if (in_len < offset + 1) return NULL;
     int sess_id_len = data[offset];
     offset += 1 + sess_id_len;
-    if (in_len < offset + 2) return NULL;
     
+    // 2. 跳过 Cipher Suites
+    if (in_len < offset + 2) return NULL;
     int cipher_len = (data[offset] << 8) | data[offset+1];
     offset += 2 + cipher_len;
-    if (in_len < offset + 1) return NULL;
     
+    // 3. 跳过 Compression Methods
+    if (in_len < offset + 1) return NULL;
     int comp_len = data[offset];
     offset += 1 + comp_len;
-    if (in_len < offset + 2) return NULL;
     
+    // 4. 获取 Extensions 长度
+    if (in_len < offset + 2) return NULL;
     int ext_len_offset = offset;
     int ext_total_len = (data[offset] << 8) | data[offset+1];
     offset += 2;
     
-    // [Safety] 严格检查剩余长度，防止越界或处理不完整的 Record
+    // [Safety] 严格检查剩余长度，确保这是一个完整且唯一的 Record
+    // 防止处理粘包数据或不完整包，导致内存破坏
     if (offset + ext_total_len != in_len - TLS_HEADER_LEN) return NULL;
 
+    // 计算随机 Padding 大小
     int range = pad_max - pad_min;
     if (range < 0) range = 0;
     unsigned char rnd; RAND_bytes(&rnd, 1);
     int pad_data_len = pad_min + (range > 0 ? (rnd % (range + 1)) : 0);
     if (pad_data_len <= 0) return NULL;
 
-    int pad_ext_len = 4 + pad_data_len;
+    // 分配新缓冲区
+    int pad_ext_len = 4 + pad_data_len; // Type(2) + Len(2) + Data
     int new_total_len = in_len + pad_ext_len;
     char* new_buf = (char*)malloc(new_total_len);
     if (!new_buf) return NULL;
 
+    // 复制原数据
     memcpy(new_buf, in, in_len);
+    
+    // 追加 Padding Extension (Type 21)
+    // 注意：这里假设原数据末尾即为 Extensions 结束位置，由上面的长度检查保证
     unsigned char* p = (unsigned char*)new_buf + in_len;
     *p++ = 0x00; *p++ = 0x15; // Extension Type: Padding (21)
     *p++ = (pad_data_len >> 8) & 0xFF;
     *p++ = pad_data_len & 0xFF;
     memset(p, 0, pad_data_len);
 
+    // 更新长度字段
     unsigned char* ptr = (unsigned char*)new_buf;
+    
+    // 更新 TLS Record Length
     int old_rec_len = (ptr[3] << 8) | ptr[4];
     int new_rec_len = old_rec_len + pad_ext_len;
     ptr[3] = (new_rec_len >> 8) & 0xFF;
     ptr[4] = new_rec_len & 0xFF;
     
+    // 更新 Handshake Header Length
     int old_hs_len = (ptr[6] << 16) | (ptr[7] << 8) | ptr[8];
     int new_hs_len = old_hs_len + pad_ext_len;
     ptr[6] = (new_hs_len >> 16) & 0xFF;
     ptr[7] = (new_hs_len >> 8) & 0xFF;
     ptr[8] = new_hs_len & 0xFF;
     
+    // 更新 Extensions Total Length
     int new_ext_total_len = ext_total_len + pad_ext_len;
     ptr[ext_len_offset] = (new_ext_total_len >> 8) & 0xFF;
     ptr[ext_len_offset+1] = new_ext_total_len & 0xFF;
@@ -145,6 +175,7 @@ static int frag_write(BIO *b, const char *in, int inl) {
     int send_len = inl;
     char* alloc_buf = NULL; 
 
+    // 仅对首包进行 Padding 注入 (Client Hello)
     if (inl > 0 && ctx->first_packet_sent == 0) {
         if (ctx->enable_padding && !g_enableECH) {
             int new_len = 0;
@@ -166,6 +197,7 @@ static int frag_write(BIO *b, const char *in, int inl) {
         int frag_count = 0;
         
         while (remaining > 0) {
+            // 防止分片过多导致性能下降，超过限制后直接发送剩余数据
             if (frag_count >= MAX_FRAG_COUNT) {
                 int ret = BIO_write(next, send_buf + bytes_processed, remaining);
                 if (ret <= 0) { 
@@ -175,6 +207,8 @@ static int frag_write(BIO *b, const char *in, int inl) {
                 }
                 bytes_processed += ret; remaining -= ret; break;
             }
+
+            // 计算随机分片大小
             int range = ctx->frag_max - ctx->frag_min; 
             if (range < 0) range = 0;
             unsigned char rnd_byte; RAND_bytes(&rnd_byte, 1);
@@ -190,9 +224,12 @@ static int frag_write(BIO *b, const char *in, int inl) {
             }
             bytes_processed += ret; remaining -= ret; frag_count++;
             
+            // [Perf] 延迟注入，增加阈值检查防止阻塞过久
             if (remaining > 0 && ctx->frag_delay > 0) {
                 unsigned char dly_rnd; RAND_bytes(&dly_rnd, 1);
-                Sleep(dly_rnd % (ctx->frag_delay + 1));
+                int actual_delay = dly_rnd % (ctx->frag_delay + 1);
+                if (actual_delay > 100) actual_delay = 100; // 强制限制最大延迟 100ms
+                if (actual_delay > 0) Sleep(actual_delay);
             }
         }
         total_sent = bytes_processed;
@@ -203,7 +240,7 @@ static int frag_write(BIO *b, const char *in, int inl) {
     
     if (total_sent > 0) {
         BIO_copy_next_retry(b);
-        return inl; 
+        return inl; // 欺骗上层已全部写入（实际上可能因为分片有延迟）
     }
     BIO_copy_next_retry(b);
     return total_sent;
@@ -300,8 +337,7 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
 
     ctx->ssl = SSL_new(g_ssl_ctx);
     if (!ctx->ssl) return -1;
-    // [Fix] 移除 SSL_set_fd，避免 BIO 所有权混乱
-    // SSL_set_fd(ctx->ssl, (int)ctx->sock); 
+    // [Note] SSL_set_fd 会尝试接管 BIO，此处我们手动构建 BIO 链，故不调用它。
 
     // 1. 设置 SNI (Inner SNI)
     const char *sni_name = (target_sni && strlen(target_sni)) ? target_sni : target_host;
@@ -332,29 +368,23 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
         }
     }
 
-    // [Fix] 手动构建 BIO 链，确保引用计数正确
-    // 创建基础 Socket BIO (引用计数=1)
+    // 4. 构建 BIO 链
+    // 基础 Socket BIO (引用计数=1)
     BIO *internal_bio = BIO_new_socket((int)ctx->sock, BIO_NOCLOSE);
     if (!internal_bio) { SSL_free(ctx->ssl); ctx->ssl = NULL; return -1; }
 
     if (method_frag && !g_enableECH) {
+        // 创建分片过滤 BIO
         BIO *frag_bio = BIO_new(method_frag);
         if (frag_bio) {
             BIO_set_params(frag_bio, settings);
-            // frag -> internal. internal 被链条持有。
+            // 链接: frag_bio -> internal_bio
+            // BIO_push 返回链头(frag_bio)，internal_bio 的所有权被链条管理
             BIO_push(frag_bio, internal_bio); 
             
-            // SSL 使用 frag_bio 进行读写。
-            // SSL_set_bio 会消耗传入 BIO 的引用。
-            // 此时 internal_bio 被 frag_bio 引用，我们需要确保它不会因为 SSL 释放链头而过早销毁吗？
-            // BIO_push 不增加 internal 的引用计数，它只是接管所有权。
-            // SSL_set_bio 接管 frag_bio 的所有权。
-            // 我们还需要一个引用给 rbio 吗？如果不区分 r/w，SSL_set_bio(ssl, bio, bio)。
-            // 在这种情况下，rbio = internal, wbio = frag (chain to internal).
-            // 为简单起见，我们让 rbio 也走 frag（透传），或者直接设为 socket。
-            // 为了避免复杂的引用计数问题，这里让 rbio 和 wbio 都使用 frag_bio。
-            // 这样 frag_bio 的 read 会透传给 internal_bio。
-            
+            // 设置 SSL BIO: 读写都使用 frag_bio
+            // SSL_set_bio 会消耗传入 BIO 的引用计数。
+            // 当 SSL 释放时，会释放 frag_bio，进而释放 internal_bio (链式释放)
             SSL_set_bio(ctx->ssl, frag_bio, frag_bio);
         } else {
             SSL_set_bio(ctx->ssl, internal_bio, internal_bio);
