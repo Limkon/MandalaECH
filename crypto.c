@@ -15,6 +15,7 @@ extern SSL_CTX *g_ssl_ctx;
 static BIO_METHOD *method_frag = NULL;
 static INIT_ONCE g_crypto_init_once = INIT_ONCE_STATIC_INIT;
 
+// ---------------------- BIO Implementation ----------------------
 typedef struct {
     int first_packet_sent;
     int frag_min;
@@ -49,6 +50,7 @@ static int frag_free(BIO *b) {
     return 1;
 }
 
+// [Fix] 现在 CryptoSettings 已在头文件中定义，这里可以正确访问成员
 void BIO_set_params(BIO *b, const CryptoSettings *s) {
     FragCtx *ctx = (FragCtx *)BIO_get_data(b);
     if (ctx && s) { 
@@ -69,6 +71,7 @@ static char* inject_padding(const char* in, int in_len, int* out_len, int pad_mi
     if (in_len < TLS_HEADER_LEN + HANDSHAKE_HEADER_LEN) return NULL;
     unsigned char* data = (unsigned char*)in;
     
+    // Check Handshake (0x16) and ClientHello (0x01)
     if (data[0] != 0x16 || data[5] != 0x01) return NULL; 
 
     int offset = 43; 
@@ -107,6 +110,7 @@ static char* inject_padding(const char* in, int in_len, int* out_len, int pad_mi
     memcpy(new_buf, in, in_len);
     unsigned char* p = (unsigned char*)new_buf + in_len; 
 
+    // Padding Extension (0x0015)
     *p++ = 0x00; *p++ = 0x15;
     *p++ = (pad_data_len >> 8) & 0xFF;
     *p++ = pad_data_len & 0xFF;
@@ -291,8 +295,6 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
     if (!ctx->ssl) return -1;
     SSL_set_fd(ctx->ssl, (int)ctx->sock);
     
-    // ECH 处理略 (保持原样)
-    
     if (method_frag) {
         BIO *frag = BIO_new(method_frag);
         if (frag) {
@@ -413,7 +415,7 @@ long long check_ws_frame(unsigned char *in, int len, int *head_len, int *payload
     return (long long)(hl + pl); 
 }
 
-// [Critical Fix] 修复栈溢出：增加 max_len 参数并检查
+// [Safety] 栈溢出修复：使用 max_len 限制
 int ws_read_payload_exact(TLSContext *tls, char *out_buf, int expected_len, int max_len) {
     char raw_head[16];
     if (!tls_read_exact(tls, raw_head, 2)) return 0;
@@ -422,13 +424,14 @@ int ws_read_payload_exact(TLSContext *tls, char *out_buf, int expected_len, int 
         if (!tls_read_exact(tls, raw_head + 2, 2)) return 0;
         payload_len = (unsigned char)raw_head[2] << 8 | (unsigned char)raw_head[3];
     } else if (payload_len == 127) {
-        return 0; // Handshake 不应出现超大帧
+        return 0; // Handshake 阶段不应有超大包
     }
     
     if (payload_len < expected_len) return 0;
     
-    // [Safety] 防止栈溢出，如果 Payload 大于缓冲区直接失败
+    // [Critical] 检查 payload 大小是否超过缓冲区
     if (payload_len > max_len) {
+        // 数据包过大，丢弃或返回错误，防止溢出
         return 0; 
     }
     
