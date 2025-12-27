@@ -8,6 +8,7 @@
 #include <windows.h>
 #include <wininet.h>
 #include <ctype.h>
+#include <stddef.h> // for offsetof
 
 // 引入 BoringSSL/OpenSSL 头文件
 #include <openssl/ssl.h>
@@ -529,4 +530,77 @@ BOOL IsSystemProxyEnabled() {
         RegCloseKey(hKey);
     }
     return en;
+}
+
+// --------------------------------------------------------------------------
+// 生产级内存池实现 (基于 Windows SLIST 无锁列表)
+// --------------------------------------------------------------------------
+
+// 内存块头部结构，用于 SLIST
+typedef struct DECLSPEC_ALIGN(16) _MEMORY_BLOCK {
+    SLIST_ENTRY ItemEntry;
+    char Data[IO_BUFFER_SIZE]; // 16KB 数据区
+} MEMORY_BLOCK;
+
+static SLIST_HEADER g_PoolHeader;
+static volatile long g_PoolSize = 0;
+static const int MAX_POOL_SIZE = 1024; // 池中最大缓存 1024 个块 (约 16MB)，超过则释放给 OS
+
+void InitMemoryPool() {
+    InitializeSListHead(&g_PoolHeader);
+    log_msg("[System] Memory Pool Initialized (SLIST)");
+}
+
+void CleanupMemoryPool() {
+    PSLIST_ENTRY pEntry;
+    int count = 0;
+    while ((pEntry = InterlockedPopEntrySList(&g_PoolHeader)) != NULL) {
+        MEMORY_BLOCK* pBlock = (MEMORY_BLOCK*)pEntry;
+        _aligned_free(pBlock);
+        count++;
+    }
+    log_msg("[System] Memory Pool Cleaned. Freed %d blocks.", count);
+}
+
+void* Pool_Alloc_16K() {
+    // 1. 尝试从池中获取
+    PSLIST_ENTRY pEntry = InterlockedPopEntrySList(&g_PoolHeader);
+    if (pEntry) {
+        InterlockedDecrement(&g_PoolSize);
+        MEMORY_BLOCK* pBlock = (MEMORY_BLOCK*)pEntry;
+        return pBlock->Data;
+    }
+
+    // 2. 池为空，向 OS 申请 (对齐内存)
+    // 注意：使用 _aligned_malloc 以满足 SLIST 的对齐要求
+    MEMORY_BLOCK* pNewBlock = (MEMORY_BLOCK*)_aligned_malloc(sizeof(MEMORY_BLOCK), 16);
+    if (!pNewBlock) {
+        log_msg("[Fatal] OOM in Pool_Alloc_16K");
+        return NULL;
+    }
+    
+    // 计入全局内存水位 (复用 proxy.c 中的计数器逻辑，如果需要)
+    // InterlockedAdd64(&g_total_allocated_mem, sizeof(MEMORY_BLOCK));
+    
+    return pNewBlock->Data;
+}
+
+void Pool_Free_16K(void* ptr) {
+    if (!ptr) return;
+
+    // 计算回结构体头部指针
+    // Data 是结构体的第二个成员，偏移量即为 ItemEntry 的大小
+    // 但由于 DECLSPEC_ALIGN(16)，ItemEntry (8 bytes on x64) 后面可能有 padding
+    // 标准做法是使用 offsetof，或者直接转换：
+    MEMORY_BLOCK* pBlock = (MEMORY_BLOCK*)((char*)ptr - offsetof(MEMORY_BLOCK, Data));
+
+    // 1. 检查池是否已满
+    if (g_PoolSize < MAX_POOL_SIZE) {
+        InterlockedPushEntrySList(&g_PoolHeader, &(pBlock->ItemEntry));
+        InterlockedIncrement(&g_PoolSize);
+    } else {
+        // 2. 池已满，直接释放给 OS
+        _aligned_free(pBlock);
+        // InterlockedAdd64(&g_total_allocated_mem, -sizeof(MEMORY_BLOCK));
+    }
 }
