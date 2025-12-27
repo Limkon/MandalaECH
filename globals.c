@@ -13,10 +13,7 @@ NOTIFYICONDATAW nid = {0};
 HWND hwnd = NULL;
 HMENU hMenu = NULL;
 HMENU hNodeSubMenu = NULL;
-
-// [Fix] 此处定义日志窗口句柄，gui.c 中仅作 extern 声明，解决 multiple definition 错误
 HWND hLogViewerWnd = NULL; 
-
 HFONT hLogFont = NULL;
 HFONT hAppFont = NULL;
 
@@ -54,13 +51,13 @@ char g_userAgentStr[512] = "";
 
 // --- ECH 配置 ---
 BOOL g_enableECH = FALSE;
-char g_echConfigServer[256] = "https://cloudflare-dns.com/dns-query"; // 默认 DoH
+char g_echConfigServer[256] = "https://cloudflare-dns.com/dns-query"; 
 char g_echPublicName[256] = "";
 
 // --- 日志 ---
 BOOL g_enableLog = FALSE;
 
-// --- SSL 上下文 (解决 crypto.c 中的 undefined reference 错误) ---
+// --- SSL 上下文 ---
 SSL_CTX *g_ssl_ctx = NULL;
 
 // --- 线程同步 ---
