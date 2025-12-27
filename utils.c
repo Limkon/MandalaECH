@@ -272,8 +272,8 @@ char* Utils_HttpGet(const char* url) {
     return InternalHttpsGet(url);
 }
 
-// ECH 配置获取 (修复版 v2)
-// 修复 RFC 3597 格式解析 bug：严格分离长度字段和 Hex 数据
+// ECH 配置获取 (修复版 v3)
+// 增加对 ech="Base64" 参数格式的解析 (RFC 9460 Presentation Format)
 unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t* out_len) {
     if (!domain || !doh_server) return NULL;
     char url[2048]; snprintf(url, sizeof(url), "%s?name=%s&type=65", doh_server, domain);
@@ -297,74 +297,88 @@ unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t
                 cJSON* data = cJSON_GetObjectItem(record, "data");
                 if (data && data->valuestring) {
                     const char* data_str = data->valuestring;
-                    log_msg("[ECH] Raw RR: %s", data_str); // Debug: 打印原始记录
+                    log_msg("[ECH] Raw RR: %s", data_str); 
 
-                    const char* p_hex = data_str;
-                    
-                    // 1. 严格处理 RFC 3597 格式前缀 (e.g., "\# 123 <hex>")
-                    if (strncmp(p_hex, "\\#", 2) == 0) {
-                        p_hex += 2;
-                        // Skip spaces
-                        while (*p_hex && isspace((unsigned char)*p_hex)) p_hex++;
-                        // Skip length digits
-                        while (*p_hex && isdigit((unsigned char)*p_hex)) p_hex++;
-                        // Skip separator spaces
-                        while (*p_hex && isspace((unsigned char)*p_hex)) p_hex++;
-                    }
-
-                    // 2. 将数据转换为二进制
-                    unsigned char rdata[4096];
-                    int rdata_len = HexToBin(p_hex, rdata, sizeof(rdata));
-                    
-                    if (rdata_len > 2) { 
-                        // 3. 解析 HTTPS RR RDATA (RFC 9460)
-                        // Structure: [Priority(2)] [TargetName(Var)] [Params(Var)]
-                        unsigned char* ptr = rdata;
-                        unsigned char* end = rdata + rdata_len;
-                        
-                        // Priority
-                        if (ptr + 2 > end) continue;
-                        int priority = (ptr[0] << 8) | ptr[1];
-                        ptr += 2;
-                        
-                        // 如果优先级为 0 (AliasMode)，则没有参数，直接跳过
-                        if (priority == 0) {
-                            log_msg("[ECH] Skipped AliasMode RR");
-                            continue;
-                        }
-
-                        // Skip Target Name (Wire-format DNS name)
-                        while (ptr < end && *ptr != 0) {
-                            int label_len = *ptr;
-                            ptr++;
-                            if (ptr + label_len > end) { ptr = end; break; }
-                            ptr += label_len;
-                        }
-                        if (ptr >= end) continue; 
-                        ptr++; // Skip terminating 0x00
-
-                        // Iterate Params
-                        // Param Structure: [Key(2)] [Len(2)] [Value(Len)]
-                        while (ptr + 4 <= end) {
-                            int key = (ptr[0] << 8) | ptr[1];
-                            int val_len = (ptr[2] << 8) | ptr[3];
-                            ptr += 4;
-                            
-                            if (ptr + val_len > end) break;
-                            
-                            // Key 5 = ECH Config
-                            if (key == 0x0005) {
-                                ech_config = (unsigned char*)malloc(val_len);
-                                if (ech_config) {
-                                    memcpy(ech_config, ptr, val_len);
-                                    *out_len = val_len;
-                                    log_msg("[ECH] Found config, len=%d", val_len);
+                    // 策略 A: 检查是否存在 ech="Base64" 格式
+                    const char* tag = "ech=\"";
+                    char* p_start = strstr(data_str, tag);
+                    if (p_start) {
+                        p_start += strlen(tag);
+                        char* p_end = strchr(p_start, '"');
+                        if (p_end) {
+                            int b64_len = (int)(p_end - p_start);
+                            char* b64_str = (char*)malloc(b64_len + 1);
+                            if (b64_str) {
+                                memcpy(b64_str, p_start, b64_len);
+                                b64_str[b64_len] = 0;
+                                
+                                size_t decoded_len = 0;
+                                unsigned char* decoded = Base64Decode(b64_str, &decoded_len);
+                                free(b64_str);
+                                
+                                if (decoded && decoded_len > 0) {
+                                    ech_config = decoded;
+                                    *out_len = decoded_len;
+                                    log_msg("[ECH] Found ech param (Base64), len=%d", decoded_len);
+                                    // 成功提取，直接返回，因为 ech 参数的值就是 payload
+                                    break; 
                                 }
-                                break;
+                                if (decoded) free(decoded);
                             }
-                            ptr += val_len;
                         }
                     }
+
+                    // 策略 B: 检查 RFC 3597 Hex 格式 (\# <len> <hex>)
+                    if (!ech_config) {
+                        const char* p_hex = data_str;
+                        if (strncmp(p_hex, "\\#", 2) == 0) {
+                            p_hex += 2;
+                            while (*p_hex && isspace((unsigned char)*p_hex)) p_hex++;
+                            while (*p_hex && isdigit((unsigned char)*p_hex)) p_hex++; // Skip length
+                            while (*p_hex && isspace((unsigned char)*p_hex)) p_hex++;
+                            
+                            unsigned char rdata[4096];
+                            int rdata_len = HexToBin(p_hex, rdata, sizeof(rdata));
+                            
+                            if (rdata_len > 2) {
+                                unsigned char* ptr = rdata;
+                                unsigned char* end = rdata + rdata_len;
+                                if (ptr + 2 <= end) {
+                                    int priority = (ptr[0] << 8) | ptr[1];
+                                    ptr += 2;
+                                    if (priority != 0) {
+                                        // Skip Target Name
+                                        while (ptr < end && *ptr != 0) {
+                                            int label_len = *ptr; ptr++;
+                                            if (ptr + label_len > end) { ptr = end; break; }
+                                            ptr += label_len;
+                                        }
+                                        if (ptr < end) ptr++; // Skip null terminator
+                                        
+                                        // Scan Params
+                                        while (ptr + 4 <= end) {
+                                            int key = (ptr[0] << 8) | ptr[1];
+                                            int val_len = (ptr[2] << 8) | ptr[3];
+                                            ptr += 4;
+                                            if (ptr + val_len > end) break;
+                                            
+                                            if (key == 0x0005) { // ECH Config
+                                                ech_config = (unsigned char*)malloc(val_len);
+                                                if (ech_config) {
+                                                    memcpy(ech_config, ptr, val_len);
+                                                    *out_len = val_len;
+                                                    log_msg("[ECH] Found ech param (Hex Wire), len=%d", val_len);
+                                                }
+                                                break;
+                                            }
+                                            ptr += val_len;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                 }
             }
             if (ech_config) break; 
@@ -497,4 +511,3 @@ BOOL IsSystemProxyEnabled() {
     }
     return en;
 }
-
