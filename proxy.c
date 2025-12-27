@@ -160,10 +160,11 @@ DWORD WINAPI client_handler(LPVOID p) {
     char *header_end = NULL; int header_len = 0;
     struct addrinfo hints, *res = NULL, *ptr = NULL;
 
-    // 分配初始缓冲区并记录内存占用
-    c_buf = (char*)proxy_malloc(IO_BUFFER_SIZE); 
-    ws_read_buf = (char*)proxy_malloc(ws_read_buf_cap); 
-    ws_send_buf = (char*)proxy_malloc(IO_BUFFER_SIZE + 4096); 
+    // --- [Production Fix] 使用内存池分配 ---
+    c_buf = (char*)Pool_Alloc_16K();
+    ws_read_buf = (char*)Pool_Alloc_16K();
+    ws_send_buf = (char*)Pool_Alloc_16K();
+    
     if (!c_buf || !ws_read_buf || !ws_send_buf) goto cl_end; 
 
     int flag = 1;
@@ -451,7 +452,8 @@ DWORD WINAPI client_handler(LPVOID p) {
         
         // 浏览器 -> 代理
         if (FD_ISSET(c, &fds)) {
-            int len = recv(c, c_buf, IO_BUFFER_SIZE, 0);
+            // [Fix] 限制读取大小，预留出 WS 封装头空间 (约14字节)，防止 ws_send_buf (16K) 溢出
+            int len = recv(c, c_buf, IO_BUFFER_SIZE - 256, 0);
             if (len > 0) {
                 flen = build_ws_frame(c_buf, len, ws_send_buf);
                 if (tls_write(&tls, ws_send_buf, flen) < 0) break;
@@ -470,19 +472,24 @@ DWORD WINAPI client_handler(LPVOID p) {
                     int new_cap = ws_read_buf_cap * 2;
                     if (new_cap > MAX_WS_FRAME_SIZE) new_cap = MAX_WS_FRAME_SIZE;
                     
-                    // 尝试重分配
-                    char* new_buf = (char*)realloc(ws_read_buf, new_cap);
+                    // [Production Fix] 混合内存模型：堆扩展
+                    char* new_buf = (char*)proxy_malloc(new_cap);
                     if (new_buf) {
-                        // 更新全局内存计数
-                        InterlockedAdd64(&g_total_allocated_mem, (LONG64)(new_cap - ws_read_buf_cap));
+                        memcpy(new_buf, ws_read_buf, ws_buf_len);
+                        
+                        // [Production Fix] 正确归还旧内存
+                        if (ws_read_buf_cap == IO_BUFFER_SIZE) {
+                            Pool_Free_16K(ws_read_buf); // 归还给池
+                        } else {
+                            proxy_free(ws_read_buf, ws_read_buf_cap); // 归还给堆
+                        }
+                        
                         ws_read_buf = new_buf;
                         ws_read_buf_cap = new_cap;
                     }
                 }
             }
             
-            // [Bug Fix] 防止死循环: 如果缓冲区已满且无法继续扩容，则由于 ws_buf_len == ws_read_buf_cap，
-            // 导致 tls_read 读取 0 字节。此时若数据帧仍不完整，check_ws_frame 返回 0，循环将无限空转。
             if (ws_buf_len < ws_read_buf_cap) {
                 int len = tls_read(&tls, ws_read_buf + ws_buf_len, ws_read_buf_cap - ws_buf_len);
                 if (len > 0) ws_buf_len += len;
@@ -538,10 +545,19 @@ DWORD WINAPI client_handler(LPVOID p) {
 
 cl_end:
     if (res) freeaddrinfo(res);
-    // 释放内存并更新全局水位
-    proxy_free(c_buf, IO_BUFFER_SIZE);
-    proxy_free(ws_read_buf, ws_read_buf_cap);
-    proxy_free(ws_send_buf, IO_BUFFER_SIZE + 4096);
+    
+    // [Production Fix] 智能内存归还
+    if (c_buf) Pool_Free_16K(c_buf);
+    
+    if (ws_send_buf) Pool_Free_16K(ws_send_buf);
+    
+    if (ws_read_buf) {
+        if (ws_read_buf_cap == IO_BUFFER_SIZE) {
+            Pool_Free_16K(ws_read_buf);
+        } else {
+            proxy_free(ws_read_buf, ws_read_buf_cap);
+        }
+    }
     
     tls_close(&tls);
     if (r != INVALID_SOCKET) closesocket(r); 
