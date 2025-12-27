@@ -38,6 +38,25 @@ BOOL CALLBACK EnumSetFont(HWND hWnd, LPARAM lParam) {
     return TRUE;
 }
 
+// --- [Fix] 辅助：UTF-8 文本设置函数 (解决乱码) ---
+void SetDlgItemTextUtf8(HWND hDlg, int nIDDlgItem, const char* lpString) {
+    if (!lpString) {
+        SetDlgItemTextW(hDlg, nIDDlgItem, L"");
+        return;
+    }
+    int wLen = MultiByteToWideChar(CP_UTF8, 0, lpString, -1, NULL, 0);
+    if (wLen > 0) {
+        wchar_t* wBuf = (wchar_t*)malloc(wLen * sizeof(wchar_t));
+        if (wBuf) {
+            MultiByteToWideChar(CP_UTF8, 0, lpString, -1, wBuf, wLen);
+            SetDlgItemTextW(hDlg, nIDDlgItem, wBuf);
+            free(wBuf);
+        }
+    } else {
+        SetDlgItemTextW(hDlg, nIDDlgItem, L"");
+    }
+}
+
 // --- 自动更新线程 ---
 DWORD WINAPI AutoUpdateThread(LPVOID lpParam) {
     Sleep(3000); // 等待初始化
@@ -116,17 +135,20 @@ void LoadNodeToEdit(HWND hWnd, const wchar_t* tag) {
     
     if (target) {
         SetDlgItemTextW(hWnd, ID_EDIT_TAG, tag);
+        
+        // [Fix] 使用 SetDlgItemTextUtf8 解决中文乱码
         cJSON* server = cJSON_GetObjectItem(target, "server");
-        if(server) SetDlgItemTextA(hWnd, ID_EDIT_ADDR, server->valuestring);
+        if(server) SetDlgItemTextUtf8(hWnd, ID_EDIT_ADDR, server->valuestring);
+        
         cJSON* port = cJSON_GetObjectItem(target, "server_port");
         if(port) SetDlgItemInt(hWnd, ID_EDIT_PORT, port->valueint, FALSE);
         
         cJSON* user = cJSON_GetObjectItem(target, "username");
         if(!user) user = cJSON_GetObjectItem(target, "uuid");
-        if(user) SetDlgItemTextA(hWnd, ID_EDIT_USER, user->valuestring);
+        if(user) SetDlgItemTextUtf8(hWnd, ID_EDIT_USER, user->valuestring);
         
         cJSON* pass = cJSON_GetObjectItem(target, "password");
-        if(pass) SetDlgItemTextA(hWnd, ID_EDIT_PASS, pass->valuestring);
+        if(pass) SetDlgItemTextUtf8(hWnd, ID_EDIT_PASS, pass->valuestring);
         
         cJSON* trans = cJSON_GetObjectItem(target, "transport"); 
         if (!trans) trans = cJSON_GetObjectItem(target, "streamSettings"); // 兼容旧版
@@ -143,11 +165,11 @@ void LoadNodeToEdit(HWND hWnd, const wchar_t* tag) {
         
         if (wsSettings) {
              cJSON* path = cJSON_GetObjectItem(wsSettings, "path");
-             if (path) SetDlgItemTextA(hWnd, ID_EDIT_PATH, path->valuestring);
+             if (path) SetDlgItemTextUtf8(hWnd, ID_EDIT_PATH, path->valuestring);
              cJSON* headers = cJSON_GetObjectItem(wsSettings, "headers");
              if (headers) {
                  cJSON* host = cJSON_GetObjectItem(headers, "Host");
-                 if (host) SetDlgItemTextA(hWnd, ID_EDIT_HOST, host->valuestring);
+                 if (host) SetDlgItemTextUtf8(hWnd, ID_EDIT_HOST, host->valuestring);
              }
         }
         
@@ -158,7 +180,7 @@ void LoadNodeToEdit(HWND hWnd, const wchar_t* tag) {
         if (tls || (security && strcmp(security->valuestring, "tls") == 0)) {
              SendMessage(hTls, CB_SETCURSEL, 1, 0);
              cJSON* sni = tls ? cJSON_GetObjectItem(tls, "server_name") : NULL;
-             if (sni) SetDlgItemTextA(hWnd, ID_EDIT_HOST, sni->valuestring);
+             if (sni) SetDlgItemTextUtf8(hWnd, ID_EDIT_HOST, sni->valuestring);
         }
     }
     cJSON_Delete(root);
@@ -519,13 +541,13 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             SetDlgItemInt(hWnd, ID_EDIT_PAD_MIN, pMin, FALSE);
             SetDlgItemInt(hWnd, ID_EDIT_PAD_MAX, pMax, FALSE);
 
-            wchar_t wBuf[256];
-            MultiByteToWideChar(CP_UTF8, 0, echServer, -1, wBuf, 256); SetWindowTextW(hEchSrv, wBuf);
-            MultiByteToWideChar(CP_UTF8, 0, echPub, -1, wBuf, 256); SetWindowTextW(hEchPub, wBuf);
+            // [Fix] 设置 UTF-8 文本
+            SetDlgItemTextUtf8(hWnd, ID_EDIT_ECH_SERVER, echServer);
+            SetDlgItemTextUtf8(hWnd, ID_EDIT_ECH_DOMAIN, echPub);
 
             for(int i=0; i<5; i++) SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)UA_PLATFORMS[i]);
             SendMessage(hCombo, CB_SETCURSEL, uaIdx, 0);
-            SetDlgItemTextA(hWnd, ID_EDIT_UA_STR, uaStr);
+            SetDlgItemTextUtf8(hWnd, ID_EDIT_UA_STR, uaStr);
             
             EnumChildWindows(hWnd, EnumSetFont, (LPARAM)hAppFont);
             SendMessage(hWnd, WM_SETFONT, (WPARAM)hAppFont, TRUE);
@@ -534,7 +556,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
         case WM_COMMAND:
             if (LOWORD(wParam) == ID_COMBO_PLATFORM && HIWORD(wParam) == CBN_SELCHANGE) {
                 int idx = SendMessage((HWND)lParam, CB_GETCURSEL, 0, 0);
-                if (idx >= 0 && idx < 5) SetDlgItemTextA(hWnd, ID_EDIT_UA_STR, UA_TEMPLATES[idx]);
+                if (idx >= 0 && idx < 5) SetDlgItemTextUtf8(hWnd, ID_EDIT_UA_STR, UA_TEMPLATES[idx]);
             }
             if (LOWORD(wParam) == IDOK) {
                 // 读取并保存
@@ -567,14 +589,18 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
                 g_enablePadding = (IsDlgButtonChecked(hWnd, ID_CHK_PADDING) == BST_CHECKED);
                 g_enableECH = (IsDlgButtonChecked(hWnd, ID_CHK_ECH) == BST_CHECKED);
 
-                wchar_t wBuf[256];
+                // [Fix] 使用 GetDlgItemTextW 确保读取到的 UTF-8 转换正确
+                wchar_t wBuf[512];
                 GetDlgItemTextW(hWnd, ID_EDIT_ECH_SERVER, wBuf, 256);
                 WideCharToMultiByte(CP_UTF8, 0, wBuf, -1, g_echConfigServer, 256, NULL, NULL);
+                
                 GetDlgItemTextW(hWnd, ID_EDIT_ECH_DOMAIN, wBuf, 256);
                 WideCharToMultiByte(CP_UTF8, 0, wBuf, -1, g_echPublicName, 256, NULL, NULL);
 
                 g_uaPlatformIndex = SendMessage(GetDlgItem(hWnd, ID_COMBO_PLATFORM), CB_GETCURSEL, 0, 0);
-                GetDlgItemTextA(hWnd, ID_EDIT_UA_STR, g_userAgentStr, 511);
+                
+                GetDlgItemTextW(hWnd, ID_EDIT_UA_STR, wBuf, 511);
+                WideCharToMultiByte(CP_UTF8, 0, wBuf, -1, g_userAgentStr, 512, NULL, NULL);
 
                 if (vk != 0 && newMod != 0) {
                     UnregisterHotKey(hwnd, ID_GLOBAL_HOTKEY);
