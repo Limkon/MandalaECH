@@ -8,7 +8,7 @@
 #include <windows.h>
 #include <wininet.h>
 #include <ctype.h>
-#include <stddef.h> // for offsetof
+#include <stddef.h> 
 
 // 引入 BoringSSL/OpenSSL 头文件
 #include <openssl/ssl.h>
@@ -27,7 +27,7 @@
 static SSL_CTX* g_utils_ctx = NULL;
 
 // --------------------------------------------------------------------------
-// 日志与辅助
+// 系统兼容性与日志辅助
 // --------------------------------------------------------------------------
 
 BOOL IsWindows8OrGreater() {
@@ -71,21 +71,20 @@ void log_msg(const char *format, ...) {
 }
 
 // --------------------------------------------------------------------------
-// Base64 / Hex (Robust Implementation)
+// Base64 / Hex (健壮实现)
 // --------------------------------------------------------------------------
 
 static const int b64_table[] = {
     -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
     -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,62,-1,63, // + and -
-    52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1, // 0-9
-    -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14, // A-O
-    15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,63, // P-Z and _
-    -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40, // a-o
-    41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1  // p-z
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,62,-1,63,
+    52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1,
+    -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
+    15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,63,
+    -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
+    41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1 
 };
 
-// 健壮的 Base64 解码：忽略所有非 Base64 字符（空格、换行等），只处理有效字符
 unsigned char* Base64Decode(const char* input, size_t* out_len) {
     if(!input) return NULL;
     size_t len = strlen(input);
@@ -95,18 +94,15 @@ unsigned char* Base64Decode(const char* input, size_t* out_len) {
     unsigned char* out = (unsigned char*)malloc(out_capacity);
     if (!out) return NULL;
 
-    size_t i = 0;
-    size_t j = 0;
-    int value_buf = 0;
-    int bits_collected = 0;
+    size_t i = 0, j = 0;
+    int value_buf = 0, bits_collected = 0;
 
     while (i < len) {
         unsigned char c = (unsigned char)input[i++];
-        if (c == '=') break; // Padding end
-        if (c > 127) continue; // Skip non-ascii
-
+        if (c == '=') break; 
+        if (c > 127) continue; 
         int val = b64_table[c];
-        if (val == -1) continue; // Skip invalid chars (whitespace etc)
+        if (val == -1) continue; 
 
         value_buf = (value_buf << 6) | val;
         bits_collected += 6;
@@ -135,7 +131,7 @@ static int HexToBin(const char* hex, unsigned char* out, int max_len) {
 }
 
 // --------------------------------------------------------------------------
-// 网络请求实现
+// 网络请求与 ECH 配置获取
 // --------------------------------------------------------------------------
 
 typedef struct { char host[256]; int port; char path[1024]; } URL_COMPONENTS_SIMPLE;
@@ -185,7 +181,6 @@ static char* InternalHttpsGet(const char* url) {
         return NULL;
     }
     
-    // [Fix] 遍历所有解析出的地址 (IPv4/IPv6)，直到连接成功
     for (ptr = res; ptr != NULL; ptr = ptr->ai_next) {
         s = socket(ptr->ai_family, ptr->ai_socktype, ptr->ai_protocol);
         if (s == INVALID_SOCKET) continue;
@@ -195,9 +190,8 @@ static char* InternalHttpsGet(const char* url) {
         setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
 
         if (connect(s, ptr->ai_addr, (int)ptr->ai_addrlen) == 0) {
-            break; // 连接成功
+            break; 
         }
-        
         closesocket(s);
         s = INVALID_SOCKET;
     }
@@ -205,14 +199,13 @@ static char* InternalHttpsGet(const char* url) {
     freeaddrinfo(res);
 
     if (s == INVALID_SOCKET) {
-        log_msg("[Net] Connect failed (all addresses): %s", u.host);
+        log_msg("[Net] Connect failed: %s", u.host);
         return NULL;
     }
 
     ssl = SSL_new(g_utils_ctx);
     if (!ssl) { closesocket(s); return NULL; }
     SSL_set_fd(ssl, (int)s);
-    
     SSL_set_tlsext_host_name(ssl, u.host);
 
     if (SSL_connect(ssl) != 1) {
@@ -259,7 +252,6 @@ static char* InternalHttpsGet(const char* url) {
 
     if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); }
     if (s != INVALID_SOCKET) closesocket(s);
-    
     return result;
 }
 
@@ -268,22 +260,15 @@ char* Utils_HttpGet(const char* url) {
     return InternalHttpsGet(url);
 }
 
-// ECH 配置获取 (Debug Enhanced)
 unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t* out_len) {
     if (!domain || !doh_server) return NULL;
     char url[2048]; snprintf(url, sizeof(url), "%s?name=%s&type=65", doh_server, domain);
     
     char* json_str = Utils_HttpGet(url);
-    if (!json_str) {
-        log_msg("[ECH] JSON fetch failed");
-        return NULL;
-    }
+    if (!json_str) { log_msg("[ECH] JSON fetch failed"); return NULL; }
     
     cJSON* root = cJSON_Parse(json_str); free(json_str);
-    if (!root) {
-        log_msg("[ECH] JSON parse failed");
-        return NULL;
-    }
+    if (!root) { log_msg("[ECH] JSON parse failed"); return NULL; }
     
     unsigned char* ech_config = NULL; *out_len = 0;
     cJSON* answer = cJSON_GetObjectItem(root, "Answer");
@@ -295,26 +280,18 @@ unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t
             if (!record) continue;
             cJSON* type = cJSON_GetObjectItem(record, "type");
             
-            // Type 65 = HTTPS
             if (type && type->valueint == 65) { 
                 cJSON* data = cJSON_GetObjectItem(record, "data");
                 if (data && data->valuestring) {
                     const char* data_str = data->valuestring;
-                    log_msg("[ECH] Raw RR: %s", data_str); 
 
-                    // ----------------------------------------------------
                     // Strategy A: Check for ech="Base64"
-                    // ----------------------------------------------------
                     const char* tag = "ech=\"";
                     char* p_start = strstr(data_str, tag);
                     if (p_start) {
                         p_start += strlen(tag);
                         char* p_end = strchr(p_start, '"');
-                        
-                        // 防御性：处理转义引号，虽然在 Raw RR 中通常不需要
-                        while (p_end && *(p_end - 1) == '\\') {
-                            p_end = strchr(p_end + 1, '"');
-                        }
+                        while (p_end && *(p_end - 1) == '\\') p_end = strchr(p_end + 1, '"');
 
                         if (p_end) {
                             int b64_len = (int)(p_end - p_start);
@@ -323,32 +300,21 @@ unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t
                                 if (b64_str) {
                                     memcpy(b64_str, p_start, b64_len);
                                     b64_str[b64_len] = 0;
-                                    
-                                    log_msg("[ECH] Found tag, extracting %d chars: %.20s...", b64_len, b64_str);
-
                                     size_t decoded_len = 0;
                                     unsigned char* decoded = Base64Decode(b64_str, &decoded_len);
                                     free(b64_str);
-                                    
                                     if (decoded && decoded_len > 0) {
-                                        ech_config = decoded;
-                                        *out_len = decoded_len;
-                                        log_msg("[ECH] Base64 success, len=%d", decoded_len);
-                                        break; // Success!
+                                        ech_config = decoded; *out_len = decoded_len;
+                                        break; 
                                     } else {
-                                        log_msg("[ECH] Base64 decode failed or empty");
                                         if(decoded) free(decoded);
                                     }
                                 }
                             }
-                        } else {
-                            log_msg("[ECH] Malformed ech param (missing end quote)");
                         }
                     }
 
-                    // ----------------------------------------------------
                     // Strategy B: RFC 3597 Hex Format (\# <len> <hex>)
-                    // ----------------------------------------------------
                     if (!ech_config) {
                         const char* p_hex = data_str;
                         if (strncmp(p_hex, "\\#", 2) == 0) {
@@ -364,30 +330,24 @@ unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t
                                 unsigned char* ptr = rdata;
                                 unsigned char* end = rdata + rdata_len;
                                 if (ptr + 2 <= end) {
-                                    int priority = (ptr[0] << 8) | ptr[1];
-                                    ptr += 2;
+                                    int priority = (ptr[0] << 8) | ptr[1]; ptr += 2;
                                     if (priority != 0) {
-                                        // Skip Target Name
                                         while (ptr < end && *ptr != 0) {
                                             int label_len = *ptr; ptr++;
                                             if (ptr + label_len > end) { ptr = end; break; }
                                             ptr += label_len;
                                         }
-                                        if (ptr < end) ptr++; // Skip null terminator
-                                        
-                                        // Scan Params
+                                        if (ptr < end) ptr++;
                                         while (ptr + 4 <= end) {
                                             int key = (ptr[0] << 8) | ptr[1];
                                             int val_len = (ptr[2] << 8) | ptr[3];
                                             ptr += 4;
                                             if (ptr + val_len > end) break;
-                                            
-                                            if (key == 0x0005) { // ECH Config
+                                            if (key == 0x0005) {
                                                 ech_config = (unsigned char*)malloc(val_len);
                                                 if (ech_config) {
                                                     memcpy(ech_config, ptr, val_len);
                                                     *out_len = val_len;
-                                                    log_msg("[ECH] Hex wire format success, len=%d", val_len);
                                                 }
                                                 break;
                                             }
@@ -398,7 +358,6 @@ unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t
                             }
                         }
                     }
-
                 }
             }
             if (ech_config) break; 
@@ -409,7 +368,7 @@ unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t
 }
 
 // --------------------------------------------------------------------------
-// 其他工具函数
+// 文件操作 (原子写入实现)
 // --------------------------------------------------------------------------
 
 BOOL ReadFileToBuffer(const wchar_t* filename, char** buffer, long* size) {
@@ -427,14 +386,56 @@ BOOL ReadFileToBuffer(const wchar_t* filename, char** buffer, long* size) {
     return TRUE;
 }
 
+// [Production Fix] 原子写入文件
+// 逻辑：将内存中的 buffer 写入 .tmp 文件，校验无误后，原子覆盖原文件
 BOOL WriteBufferToFile(const wchar_t* filename, const char* buffer) {
-    FILE* f = _wfopen(filename, L"wb");
-    if (!f) return FALSE;
+    wchar_t tempPath[MAX_PATH];
+    wchar_t bakPath[MAX_PATH]; // 用于可选的安全备份
+
+    if (!filename || !buffer) return FALSE;
+
+    // 1. 构造文件名
+    swprintf(tempPath, MAX_PATH, L"%s.tmp", filename);
+    swprintf(bakPath, MAX_PATH, L"%s.bak", filename);
+
+    // 2. 写入临时文件 (写入过程完全与原文件隔离)
+    FILE* f = _wfopen(tempPath, L"wb");
+    if (!f) {
+        log_msg("[Config] Failed to create temp file: %ls", tempPath);
+        return FALSE;
+    }
+
     size_t len = strlen(buffer);
-    fwrite(buffer, 1, len, f);
+    if (fwrite(buffer, 1, len, f) != len) {
+        log_msg("[Config] Failed to write temp file");
+        fclose(f);
+        DeleteFileW(tempPath);
+        return FALSE;
+    }
+    fflush(f); // 确保数据落盘
     fclose(f);
+
+    // 3. (可选) 创建 .bak 备份，防止逻辑错误导致配置归零
+    // 这不会影响 .tmp -> .json 的原子性
+    if (GetFileAttributesW(filename) != INVALID_FILE_ATTRIBUTES) {
+        CopyFileW(filename, bakPath, FALSE);
+    }
+
+    // 4. 原子替换 (Atomic Replace)
+    // MOVEFILE_REPLACE_EXISTING: 如果目标文件存在，直接替换
+    // 操作系统保证此操作在文件系统层面是原子的：要么替换成功，要么失败，不会出现半个文件
+    if (!MoveFileExW(tempPath, filename, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+         log_msg("[Config] Atomic swap failed, err=%d", GetLastError());
+         DeleteFileW(tempPath);
+         return FALSE;
+    }
+
     return TRUE;
 }
+
+// --------------------------------------------------------------------------
+// 字符串与工具
+// --------------------------------------------------------------------------
 
 void TrimString(char* str) {
     if (!str) return;
@@ -486,7 +487,7 @@ char* GetClipboardText() {
 }
 
 // --------------------------------------------------------------------------
-// 代理设置
+// 系统代理设置 (兼容新旧系统)
 // --------------------------------------------------------------------------
 
 void SetSystemProxy(BOOL enable) {
@@ -533,10 +534,9 @@ BOOL IsSystemProxyEnabled() {
 }
 
 // --------------------------------------------------------------------------
-// 生产级内存池实现 (基于 Windows SLIST 无锁列表)
+// 生产级内存池实现 (Phase 1, 基于 Windows SLIST)
 // --------------------------------------------------------------------------
 
-// 内存块头部结构，用于 SLIST
 typedef struct DECLSPEC_ALIGN(16) _MEMORY_BLOCK {
     SLIST_ENTRY ItemEntry;
     char Data[IO_BUFFER_SIZE]; // 16KB 数据区
@@ -544,7 +544,7 @@ typedef struct DECLSPEC_ALIGN(16) _MEMORY_BLOCK {
 
 static SLIST_HEADER g_PoolHeader;
 static volatile long g_PoolSize = 0;
-static const int MAX_POOL_SIZE = 1024; // 池中最大缓存 1024 个块 (约 16MB)，超过则释放给 OS
+static const int MAX_POOL_SIZE = 1024; // 约 16MB
 
 void InitMemoryPool() {
     InitializeSListHead(&g_PoolHeader);
@@ -572,35 +572,23 @@ void* Pool_Alloc_16K() {
     }
 
     // 2. 池为空，向 OS 申请 (对齐内存)
-    // 注意：使用 _aligned_malloc 以满足 SLIST 的对齐要求
     MEMORY_BLOCK* pNewBlock = (MEMORY_BLOCK*)_aligned_malloc(sizeof(MEMORY_BLOCK), 16);
     if (!pNewBlock) {
         log_msg("[Fatal] OOM in Pool_Alloc_16K");
         return NULL;
     }
-    
-    // 计入全局内存水位 (复用 proxy.c 中的计数器逻辑，如果需要)
-    // InterlockedAdd64(&g_total_allocated_mem, sizeof(MEMORY_BLOCK));
-    
     return pNewBlock->Data;
 }
 
 void Pool_Free_16K(void* ptr) {
     if (!ptr) return;
 
-    // 计算回结构体头部指针
-    // Data 是结构体的第二个成员，偏移量即为 ItemEntry 的大小
-    // 但由于 DECLSPEC_ALIGN(16)，ItemEntry (8 bytes on x64) 后面可能有 padding
-    // 标准做法是使用 offsetof，或者直接转换：
     MEMORY_BLOCK* pBlock = (MEMORY_BLOCK*)((char*)ptr - offsetof(MEMORY_BLOCK, Data));
 
-    // 1. 检查池是否已满
     if (g_PoolSize < MAX_POOL_SIZE) {
         InterlockedPushEntrySList(&g_PoolHeader, &(pBlock->ItemEntry));
         InterlockedIncrement(&g_PoolSize);
     } else {
-        // 2. 池已满，直接释放给 OS
         _aligned_free(pBlock);
-        // InterlockedAdd64(&g_total_allocated_mem, -sizeof(MEMORY_BLOCK));
     }
 }
