@@ -94,7 +94,7 @@ static char* inject_padding(const char* in, int in_len, int* out_len, int pad_mi
     int ext_total_len = (data[offset] << 8) | data[offset+1];
     offset += 2;
     
-    // [Safety] 严格检查剩余长度，防止越界或处理不完整的 Record
+    // [Safety] 严格检查剩余长度
     if (offset + ext_total_len != in_len - TLS_HEADER_LEN) return NULL;
 
     int range = pad_max - pad_min;
@@ -105,7 +105,16 @@ static char* inject_padding(const char* in, int in_len, int* out_len, int pad_mi
 
     int pad_ext_len = 4 + pad_data_len;
     int new_total_len = in_len + pad_ext_len;
-    char* new_buf = (char*)malloc(new_total_len);
+    
+    // --- [Production Fix] 使用内存池 ---
+    char* new_buf = NULL;
+    if (new_total_len <= IO_BUFFER_SIZE) {
+        new_buf = (char*)Pool_Alloc_16K();
+    } else {
+        new_buf = (char*)malloc(new_total_len); // 极其罕见的大包回退到堆
+    }
+    // ---------------------------------
+    
     if (!new_buf) return NULL;
 
     memcpy(new_buf, in, in_len);
@@ -169,7 +178,12 @@ static int frag_write(BIO *b, const char *in, int inl) {
             if (frag_count >= MAX_FRAG_COUNT) {
                 int ret = BIO_write(next, send_buf + bytes_processed, remaining);
                 if (ret <= 0) { 
-                    if (alloc_buf) free(alloc_buf);
+                    // --- [Production Fix] 智能释放 ---
+                    if (alloc_buf) {
+                        if (send_len <= IO_BUFFER_SIZE) Pool_Free_16K(alloc_buf);
+                        else free(alloc_buf);
+                    }
+                    // -------------------------------
                     BIO_copy_next_retry(b); 
                     return (bytes_processed > 0 ? (alloc_buf ? inl : bytes_processed) : ret); 
                 }
@@ -184,7 +198,12 @@ static int frag_write(BIO *b, const char *in, int inl) {
             
             int ret = BIO_write(next, send_buf + bytes_processed, chunk_size);
             if (ret <= 0) { 
-                if (alloc_buf) free(alloc_buf);
+                // --- [Production Fix] 智能释放 ---
+                if (alloc_buf) {
+                    if (send_len <= IO_BUFFER_SIZE) Pool_Free_16K(alloc_buf);
+                    else free(alloc_buf);
+                }
+                // -------------------------------
                 BIO_copy_next_retry(b); 
                 return (bytes_processed > 0 ? (alloc_buf ? inl : bytes_processed) : ret); 
             }
@@ -199,7 +218,13 @@ static int frag_write(BIO *b, const char *in, int inl) {
     } else {
         total_sent = BIO_write(next, send_buf, send_len);
     }
-    if (alloc_buf) free(alloc_buf);
+    
+    // --- [Production Fix] 智能释放 ---
+    if (alloc_buf) {
+        if (send_len <= IO_BUFFER_SIZE) Pool_Free_16K(alloc_buf);
+        else free(alloc_buf);
+    }
+    // -------------------------------
     
     if (total_sent > 0) {
         BIO_copy_next_retry(b);
@@ -248,11 +273,9 @@ BOOL CALLBACK InitCryptoCallback(PINIT_ONCE InitOnce, PVOID Parameter, PVOID *Co
     SSL_CTX_set_min_proto_version(g_ssl_ctx, TLS1_2_VERSION);
     SSL_CTX_set_max_proto_version(g_ssl_ctx, TLS1_3_VERSION);
     
-    // TLS 1.2
     const char *chrome_ciphers = "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-RSA-AES128-SHA";
     SSL_CTX_set_cipher_list(g_ssl_ctx, chrome_ciphers);
 
-    // TLS 1.3
     const char *tls13_ciphers = "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256";
     if (SSL_CTX_set_ciphersuites(g_ssl_ctx, tls13_ciphers) != 1) {
          log_msg("[Warn] Failed to set TLS 1.3 ciphersuites");
@@ -344,17 +367,7 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
             // frag -> internal. internal 被链条持有。
             BIO_push(frag_bio, internal_bio); 
             
-            // SSL 使用 frag_bio 进行读写。
-            // SSL_set_bio 会消耗传入 BIO 的引用。
-            // 此时 internal_bio 被 frag_bio 引用，我们需要确保它不会因为 SSL 释放链头而过早销毁吗？
-            // BIO_push 不增加 internal 的引用计数，它只是接管所有权。
-            // SSL_set_bio 接管 frag_bio 的所有权。
-            // 我们还需要一个引用给 rbio 吗？如果不区分 r/w，SSL_set_bio(ssl, bio, bio)。
-            // 在这种情况下，rbio = internal, wbio = frag (chain to internal).
-            // 为简单起见，我们让 rbio 也走 frag（透传），或者直接设为 socket。
-            // 为了避免复杂的引用计数问题，这里让 rbio 和 wbio 都使用 frag_bio。
-            // 这样 frag_bio 的 read 会透传给 internal_bio。
-            
+            // SSL 使用 frag_bio 进行读写。SSL_set_bio 会接管 frag_bio 的所有权。
             SSL_set_bio(ctx->ssl, frag_bio, frag_bio);
         } else {
             SSL_set_bio(ctx->ssl, internal_bio, internal_bio);
