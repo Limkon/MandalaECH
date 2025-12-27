@@ -235,7 +235,6 @@ BOOL CALLBACK InitCryptoCallback(PINIT_ONCE InitOnce, PVOID Parameter, PVOID *Co
         return FALSE;
     }
 
-    // 默认协议范围
     SSL_CTX_set_min_proto_version(g_ssl_ctx, TLS1_2_VERSION);
     SSL_CTX_set_max_proto_version(g_ssl_ctx, TLS1_3_VERSION);
     
@@ -293,20 +292,17 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
     if (!ctx->ssl) return -1;
     SSL_set_fd(ctx->ssl, (int)ctx->sock);
 
-    // [Fix] 1. SNI 必须首先设置 (Inner SNI)
+    // 1. 设置 SNI (Inner SNI)
     const char *sni_name = (target_sni && strlen(target_sni)) ? target_sni : target_host;
     SSL_set_tlsext_host_name(ctx->ssl, sni_name);
 
-    // [Fix] 2. ALPN: 包含 h2 以支持 ECH (优先 h2)
-    unsigned char alpn_protos[] = { 
-        2, 'h', '2', 
-        8, 'h', 't', 't', 'p', '/', '1', '.', '1' 
-    };
+    // [Fix] 恢复仅使用 http/1.1
+    // 如果启用 h2，服务器会协商使用 HTTP/2，但我们的代理只发送 HTTP/1.1 请求，导致 WebSocket 握手失败
+    unsigned char alpn_protos[] = { 8, 'h', 't', 't', 'p', '/', '1', '.', '1' };
     SSL_set_alpn_protos(ctx->ssl, alpn_protos, sizeof(alpn_protos));
 
-    // [Fix] 3. 加载 ECH 配置 & 强制 TLS 1.3
+    // 3. ECH 配置 & 强制 TLS 1.3
     if (g_enableECH) {
-        // ECH 要求严格的 TLS 1.3。禁止 TLS 1.2 以防止协议降级导致的非法参数错误
         SSL_set_min_proto_version(ctx->ssl, TLS1_3_VERSION);
         SSL_set_max_proto_version(ctx->ssl, TLS1_3_VERSION);
 
@@ -326,7 +322,6 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
         }
     }
 
-    // [Fix] 4. ECH 开启时跳过 Fragmentation BIO
     if (method_frag && !g_enableECH) {
         BIO *frag = BIO_new(method_frag);
         if (frag) {
