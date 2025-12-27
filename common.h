@@ -1,4 +1,3 @@
-// common.h
 #ifndef COMMON_H
 #define COMMON_H
 
@@ -21,7 +20,6 @@
 #define NOCRYPT 
 
 // --- 生产环境限制参数 ---
-// [IOCP] 连接数限制主要受内存限制，可大幅提高
 #define MAX_CONNECTIONS 10000
 #define IO_BUFFER_SIZE 16384 
 #define MAX_WS_FRAME_SIZE 8388608 
@@ -34,7 +32,7 @@
 #include <shellapi.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
-#include <mswsock.h> // AcceptEx, GetAcceptExSockaddrs
+#include <mswsock.h> 
 #include <commctrl.h>
 #include <shlobj.h>
 #include <wininet.h>
@@ -45,7 +43,6 @@
 #ifdef X509_NAME
 #undef X509_NAME
 #endif
-// ... (保留原有的宏清理) ...
 #ifdef X509_EXTENSIONS
 #undef X509_EXTENSIONS
 #endif
@@ -112,7 +109,7 @@ typedef struct {
     OVERLAPPED overlapped;
     IO_OPERATION_TYPE opType;
     WSABUF wsaBuf;
-    char buffer[IO_BUFFER_SIZE]; // 每个操作独立的缓冲区
+    char buffer[IO_BUFFER_SIZE]; 
     DWORD bytesTransferred;
 } IO_CONTEXT;
 
@@ -123,8 +120,8 @@ typedef struct {
     SSL *ssl;
     
     // IOCP 使用 Memory BIO
-    BIO *io_in;  // 写加密数据供 SSL_read
-    BIO *io_out; // 读加密数据供发送
+    BIO *io_in;  
+    BIO *io_out; 
     
     // 用于 WS 解析的残留缓冲区
     char *ws_frag_buf;
@@ -132,14 +129,15 @@ typedef struct {
     int ws_frag_cap;
 
     // 两个方向的 IO 上下文
-    IO_CONTEXT rxClient; // 从 Client 读 (明文)
-    IO_CONTEXT rxRemote; // 从 Remote 读 (密文)
+    IO_CONTEXT rxClient; 
+    IO_CONTEXT rxRemote; 
     
-    // 发送通常是即时提交的，但也需要 Context 追踪完成
-    // 简化起见，我们在 Worker 中动态分配 Write Context 或使用对象池
-    // 这里保留引用计数以决定何时释放 Connection
     volatile LONG refCount; 
     BOOL closing;
+
+    // [Fix] 新增字段，用于修复 VLESS 协议头剥离问题
+    BOOL is_vless;
+    BOOL header_stripped;
 } CONNECTION_CONTEXT;
 
 typedef struct { 
@@ -161,9 +159,8 @@ typedef struct {
 extern ProxyConfig g_proxyConfig;
 extern volatile BOOL g_proxyRunning;
 extern SOCKET g_listen_sock;
-extern HANDLE hIOCP; // IOCP 句柄
+extern HANDLE hIOCP; 
 
-// ... (保留原有全局变量) ...
 extern SSL_CTX *g_ssl_ctx;
 extern HANDLE hProxyThread;
 extern NOTIFYICONDATAW nid;
