@@ -1,5 +1,5 @@
 #include "proxy.h"
-#include <ws2tcpip.h> // [Fix] 显式包含，解决 struct addrinfo 和 inet_ntop 未定义错误
+#include <ws2tcpip.h> // 必须显式包含
 #include "crypto.h"
 #include "utils.h"
 #include "common.h"
@@ -13,7 +13,7 @@ volatile LONG64 g_total_allocated_mem = 0;
 
 ProxyConfig g_proxyConfig;
 CRITICAL_SECTION g_configLock;
-char g_userAgentStr[512] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"; 
+// [Fix] 删除 g_userAgentStr 定义，它已在 globals.c 中定义，这里通过 common.h 引用
 
 BOOL g_proxyRunning = FALSE;
 int g_localPort = 10809;
