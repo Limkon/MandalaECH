@@ -3,6 +3,7 @@
 #include "utils.h"
 #include "common.h"
 #include <openssl/sha.h>
+#include <time.h> 
 
 // [Safety] 全局活跃连接计数器与内存水位监控
 static volatile LONG g_active_connections = 0;
@@ -18,6 +19,7 @@ typedef struct {
 
 // --- 辅助函数：解析 UUID ---
 void parse_uuid(const char* uuid_str, unsigned char* out) {
+    if (!uuid_str || !out) return;
     const char* p = uuid_str;
     int i = 0;
     while (*p && i < 16) {
@@ -36,6 +38,7 @@ void parse_uuid(const char* uuid_str, unsigned char* out) {
 
 // --- 辅助函数：Trojan 密码哈希 ---
 void trojan_password_hash(const char* password, char* out_hex) {
+    if (!password || !out_hex) return;
     unsigned char digest[SHA224_DIGEST_LENGTH];
     SHA224((unsigned char*)password, (size_t)strlen(password), digest);
     for(int i = 0; i < SHA224_DIGEST_LENGTH; i++) {
@@ -46,6 +49,7 @@ void trojan_password_hash(const char* password, char* out_hex) {
 
 // 接收超时辅助函数
 int recv_timeout(SOCKET s, char *buf, int len, int timeout_sec) {
+    if (s == INVALID_SOCKET) return -1;
     fd_set fds; 
     FD_ZERO(&fds); 
     FD_SET(s, &fds);
@@ -67,7 +71,7 @@ int read_header_robust(SOCKET s, char* buf, int max_len, int timeout_sec) {
         total_read += n;
         buf[total_read] = 0; 
         
-        // SOCKS5 探测 (05 01 00)
+        // SOCKS5 探测 (05 01 00 或 05 02 ...)
         if (buf[0] == 0x05) { 
             if (total_read >= 2) return total_read; 
         }
@@ -81,8 +85,33 @@ int read_header_robust(SOCKET s, char* buf, int max_len, int timeout_sec) {
     return total_read > 0 ? total_read : -1;
 }
 
+// [Fix] 健壮的 WebSocket 响应读取 (防止握手包分片导致连接中断)
+int read_ws_response_robust(TLSContext* tls, char* buf, int max_len, int timeout_ms) {
+    int total_read = 0;
+    DWORD start_time = GetTickCount();
+    
+    while (total_read < max_len - 1) {
+        if ((GetTickCount() - start_time) > (DWORD)timeout_ms) break;
+
+        // 尝试非阻塞读取
+        int n = tls_read(tls, buf + total_read, max_len - 1 - total_read);
+        if (n > 0) {
+            total_read += n;
+            buf[total_read] = 0;
+            // 检查是否收到完整的 HTTP 头结束标记
+            if (strstr(buf, "\r\n\r\n")) return total_read;
+        } else if (n < 0) {
+             // 严重错误
+             return -1; 
+        }
+        Sleep(10);
+    }
+    return total_read > 0 ? total_read : -1;
+}
+
 // 发送全部数据 (非阻塞兼容)
 int send_all(SOCKET s, const char *buf, int len) {
+    if (s == INVALID_SOCKET) return -1;
     int total = 0; 
     int bytesleft = len; 
     int n;
@@ -103,10 +132,13 @@ int send_all(SOCKET s, const char *buf, int len) {
     return total;
 }
 
-// Base64 编码 (用于 WS Key)
+// [Fix] 修复 Base64 编码 (Win7 Runtime Error 根源)
+// 原代码强制读取 16 字节后的内容导致越界
 void base64_encode_key(const unsigned char* src, char* dst) {
     const char* table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    for(int i=0; i<16; i+=3) {
+    int i = 0;
+    // 处理前 15 字节 (3 * 5)
+    for(i = 0; i < 15; i += 3) {
         int n = (src[i] << 16) + (src[i+1] << 8) + src[i+2];
         dst[0] = table[(n >> 18) & 0x3F];
         dst[1] = table[(n >> 12) & 0x3F];
@@ -114,13 +146,22 @@ void base64_encode_key(const unsigned char* src, char* dst) {
         dst[3] = table[n & 0x3F];
         dst += 4;
     }
-    *(dst-1) = '='; *dst = 0;
+    // 处理最后 1 个字节 (src[15])
+    if (i < 16) {
+        int n = src[i] << 16; 
+        dst[0] = table[(n >> 18) & 0x3F];
+        dst[1] = table[(n >> 12) & 0x3F];
+        dst[2] = '=';
+        dst[3] = '=';
+        dst += 4;
+    }
+    *dst = 0;
 }
 
 // [Optimization] 动态内存分配与监控包装器
 void* proxy_malloc(size_t size) {
     if (g_total_allocated_mem + (LONG64)size > MAX_TOTAL_MEMORY_USAGE) {
-        log_msg("[Warn] Memory limit reached, allocation denied.");
+        // [Safety] 避免日志输出导致死锁或递归，此处静默失败或仅返回 NULL
         return NULL;
     }
     void* p = malloc(size);
@@ -145,8 +186,10 @@ DWORD WINAPI client_handler(LPVOID p) {
     ProxyConfig localConfig = ctx->config; 
     CryptoSettings localCrypto = ctx->cryptoSettings;
     char localUserAgent[512];
+    
+    memset(localUserAgent, 0, sizeof(localUserAgent));
     strncpy(localUserAgent, ctx->userAgent, sizeof(localUserAgent)-1);
-    localUserAgent[sizeof(localUserAgent)-1] = 0;
+    
     free(ctx); 
 
     TLSContext tls; memset(&tls, 0, sizeof(tls));
@@ -164,7 +207,10 @@ DWORD WINAPI client_handler(LPVOID p) {
     c_buf = (char*)proxy_malloc(IO_BUFFER_SIZE); 
     ws_read_buf = (char*)proxy_malloc(ws_read_buf_cap); 
     ws_send_buf = (char*)proxy_malloc(IO_BUFFER_SIZE + 4096); 
-    if (!c_buf || !ws_read_buf || !ws_send_buf) goto cl_end; 
+    if (!c_buf || !ws_read_buf || !ws_send_buf) {
+        log_msg("[Err] Memory allocation failed");
+        goto cl_end; 
+    }
 
     int flag = 1;
     setsockopt(c, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
@@ -190,6 +236,7 @@ DWORD WINAPI client_handler(LPVOID p) {
                  port = ntohs(*(unsigned short*)&c_buf[8]);
              } else if (c_buf[3] == 0x03) { // Domain
                  int dlen = (unsigned char)c_buf[4];
+                 if (dlen > 250) goto cl_end; // 防止溢出
                  memcpy(host, &c_buf[5], dlen); host[dlen] = 0;
                  port = ntohs(*(unsigned short*)&c_buf[5+dlen]);
              } else goto cl_end;
@@ -198,7 +245,7 @@ DWORD WINAPI client_handler(LPVOID p) {
     } 
     else {
         // HTTP/HTTPS 处理
-        if (sscanf(c_buf, "%15s %255s", method, host) == 2) {
+        if (sscanf(c_buf, "%15s %250s", method, host) == 2) {
             char *p_col = strchr(host, ':');
             if (p_col) { *p_col = 0; port = atoi(p_col+1); }
             else if(stricmp(method, "CONNECT")==0) port = 443;
@@ -210,7 +257,8 @@ DWORD WINAPI client_handler(LPVOID p) {
     }
     
     // [Desensitization] 日志脱敏处理 (隐藏部分 Host 信息)
-    char display_host[256]; strcpy(display_host, host);
+    char display_host[256]; 
+    strncpy(display_host, host, 255); display_host[255] = 0;
 #if LOG_DESENSITIZE
     if (strlen(display_host) > 4) {
         // 简单脱敏：保留首尾，中间打码
@@ -257,7 +305,10 @@ DWORD WINAPI client_handler(LPVOID p) {
         if (r != INVALID_SOCKET && tls.ssl != NULL) break;
         Sleep(200);
     }
-    if (r == INVALID_SOCKET || tls.ssl == NULL) goto cl_end;
+    if (r == INVALID_SOCKET || tls.ssl == NULL) {
+        log_msg("[Err] Connect Failed: %s", localConfig.host);
+        goto cl_end;
+    }
     
     // 3. WebSocket 握手
     const char* sni_val = (strlen(localConfig.sni) > 0) ? localConfig.sni : localConfig.host;
@@ -272,7 +323,9 @@ DWORD WINAPI client_handler(LPVOID p) {
         req_path, sni_val, localUserAgent, ws_key_str);
 
     tls_write(&tls, ws_send_buf, offset);
-    int hlen = tls_read(&tls, ws_read_buf, ws_read_buf_cap - 1);
+    
+    // [Fix] 使用健壮的 WebSocket 响应读取
+    int hlen = read_ws_response_robust(&tls, ws_read_buf, ws_read_buf_cap, 5000);
     if (hlen <= 0) goto cl_end;
     ws_read_buf[hlen] = 0;
     
@@ -289,7 +342,11 @@ DWORD WINAPI client_handler(LPVOID p) {
         if (remaining > 0) {
             memmove(ws_read_buf, body_start, remaining);
             ws_buf_len = remaining;
+        } else {
+            ws_buf_len = 0;
         }
+    } else {
+        ws_buf_len = 0;
     }
     
     // 4. 代理协议封包 (VLESS / Trojan / SS / Mandala / Socks)
@@ -313,8 +370,9 @@ DWORD WINAPI client_handler(LPVOID p) {
         } else if (inet_pton(AF_INET6, host, &ip6) == 1) {
             proto_buf[proto_len++] = 0x03; memcpy(proto_buf + proto_len, &ip6, 16); proto_len += 16;
         } else {
-            proto_buf[proto_len++] = 0x02; proto_buf[proto_len++] = (unsigned char)strlen(host);
-            memcpy(proto_buf + proto_len, host, strlen(host)); proto_len += (int)strlen(host);
+            int hlen_local = strlen(host);
+            proto_buf[proto_len++] = 0x02; proto_buf[proto_len++] = (unsigned char)hlen_local;
+            memcpy(proto_buf + proto_len, host, hlen_local); proto_len += hlen_local;
         }
         flen = build_ws_frame((char*)proto_buf, proto_len, ws_send_buf);
         tls_write(&tls, ws_send_buf, flen);
@@ -464,23 +522,7 @@ DWORD WINAPI client_handler(LPVOID p) {
         
         // 代理 -> 浏览器
         if (FD_ISSET(r, &fds) || pending > 0) {
-            // [Optimization] 动态扩容与水位控制
-            if (ws_buf_len >= ws_read_buf_cap - 1024) { 
-                if (ws_read_buf_cap < MAX_WS_FRAME_SIZE) {
-                    int new_cap = ws_read_buf_cap * 2;
-                    if (new_cap > MAX_WS_FRAME_SIZE) new_cap = MAX_WS_FRAME_SIZE;
-                    
-                    // 尝试重分配
-                    char* new_buf = (char*)realloc(ws_read_buf, new_cap);
-                    if (new_buf) {
-                        // 更新全局内存计数
-                        InterlockedAdd64(&g_total_allocated_mem, (LONG64)(new_cap - ws_read_buf_cap));
-                        ws_read_buf = new_buf;
-                        ws_read_buf_cap = new_cap;
-                    }
-                }
-            }
-            // 确保不溢出
+            // [Safety] 不再动态扩容，防止 OOM 或 realloc 失败
             if (ws_buf_len < ws_read_buf_cap) {
                 int len = tls_read(&tls, ws_read_buf + ws_buf_len, ws_read_buf_cap - ws_buf_len);
                 if (len > 0) ws_buf_len += len;
@@ -501,7 +543,7 @@ DWORD WINAPI client_handler(LPVOID p) {
                     char* payload_ptr = ws_read_buf + hl;
                     int payload_size = pl;
                     
-                    // VLESS 响应头剥离 (Response Header: 2 bytes version + 1 byte len + N bytes info)
+                    // [Fix] VLESS 响应头剥离修复 (处理粘包/分包)
                     if (is_vless && !vless_response_header_stripped) {
                         if (payload_size >= 2) {
                             int addon_len = (unsigned char)payload_ptr[1];
@@ -511,9 +553,13 @@ DWORD WINAPI client_handler(LPVOID p) {
                                 payload_size -= head_size;
                                 vless_response_header_stripped = 1;
                             } else { 
-                                payload_size = 0; // 数据不足，等下一包
+                                // 数据不足以剥离头，跳出循环等待下一包 (不要 memmove 丢弃！)
+                                break; 
                             }
-                        } else payload_size = 0;
+                        } else {
+                             // 数据太短，等待下一包
+                             break;
+                        }
                     }
                     
                     if (payload_size > 0) {
@@ -611,6 +657,7 @@ DWORD WINAPI server_thread(LPVOID p) {
 
 void StartProxyCore() {
     if (g_proxyRunning) return;
+    srand((unsigned int)time(NULL)); // [Add] 初始化随机种子
     g_proxyRunning = TRUE;
     hProxyThread = CreateThread(NULL, 0, server_thread, NULL, 0, NULL);
     if (!hProxyThread) g_proxyRunning = FALSE;
