@@ -930,6 +930,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nSho
     srand((unsigned)time(NULL));
     InitGlobalLocks();
 
+    // --- [Production Fix] 初始化内存池 ---
+    InitMemoryPool(); 
+    // -------------------------------------
+
     wchar_t exePath[MAX_PATH]; GetModuleFileNameW(NULL, exePath, MAX_PATH);
     wchar_t* pDir = wcsrchr(exePath, L'\\'); if (pDir) { *pDir = 0; SetCurrentDirectoryW(exePath); }
 
@@ -972,6 +976,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nSho
     MSG msg; while(GetMessage(&msg, NULL, 0, 0)) { TranslateMessage(&msg); DispatchMessage(&msg); }
     
     cleanup_crypto_global();
+
+    // --- [Production Fix] 清理内存池 ---
+    CleanupMemoryPool();
+    // -----------------------------------
+
     DeleteGlobalLocks();
     return 0;
 }
