@@ -4,7 +4,7 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/bio.h>
-#include "common.h" 
+#include "common.h" // 确保包含 common.h 以获取 TLSContext 定义
 
 // [Production] 加密层配置快照，解耦全局变量
 typedef struct {
@@ -18,9 +18,6 @@ typedef struct {
     int padMax;
     
     BOOL enableChromeCiphers;
-    
-    // [Fix] 添加 ECH 开关，修复 proxy.c 编译错误
-    BOOL enableECH; 
 } CryptoSettings;
 
 // 线程安全的全局初始化 (BIO Method 等)

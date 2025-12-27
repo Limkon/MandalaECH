@@ -8,8 +8,7 @@ void StopProxyCore();
 int recv_timeout(SOCKET s, char *buf, int len, int timeout_sec);
 int send_all(SOCKET s, const char *buf, int len);
 
-// [Fix] 使用 _beginthreadex 兼容的签名
-unsigned __stdcall server_thread(void* p);
-unsigned __stdcall client_handler(void* p);
+DWORD WINAPI server_thread(LPVOID p);
+DWORD WINAPI client_handler(LPVOID p);
 
 #endif // PROXY_H

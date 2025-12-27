@@ -95,31 +95,29 @@ void LoadNodeToEdit(HWND hWnd, const wchar_t* tag) {
     cJSON* root = cJSON_Parse(buffer); free(buffer);
     if (!root) return;
     
-    // [Fix] 扩大缓冲区防止溢出，并显式初始化
-    char tagUtf8[1024] = {0}; 
-    WideCharToMultiByte(CP_UTF8, 0, tag, -1, tagUtf8, sizeof(tagUtf8) - 1, NULL, NULL);
-    
+    char tagUtf8[256];
+    WideCharToMultiByte(CP_UTF8, 0, tag, -1, tagUtf8, 256, NULL, NULL);
     cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
     cJSON* target = NULL;
     cJSON* node;
     cJSON_ArrayForEach(node, outbounds) {
         cJSON* t = cJSON_GetObjectItem(node, "tag");
-        if (t && t->valuestring && strcmp(t->valuestring, tagUtf8) == 0) { target = node; break; }
+        if (t && strcmp(t->valuestring, tagUtf8) == 0) { target = node; break; }
     }
     
     if (target) {
         SetDlgItemTextW(hWnd, ID_EDIT_TAG, tag);
         cJSON* server = cJSON_GetObjectItem(target, "server");
-        if(server && server->valuestring) SetDlgItemTextA(hWnd, ID_EDIT_ADDR, server->valuestring);
+        if(server) SetDlgItemTextA(hWnd, ID_EDIT_ADDR, server->valuestring);
         cJSON* port = cJSON_GetObjectItem(target, "server_port");
         if(port) SetDlgItemInt(hWnd, ID_EDIT_PORT, port->valueint, FALSE);
         
         cJSON* user = cJSON_GetObjectItem(target, "username");
         if(!user) user = cJSON_GetObjectItem(target, "uuid");
-        if(user && user->valuestring) SetDlgItemTextA(hWnd, ID_EDIT_USER, user->valuestring);
+        if(user) SetDlgItemTextA(hWnd, ID_EDIT_USER, user->valuestring);
         
         cJSON* pass = cJSON_GetObjectItem(target, "password");
-        if(pass && pass->valuestring) SetDlgItemTextA(hWnd, ID_EDIT_PASS, pass->valuestring);
+        if(pass) SetDlgItemTextA(hWnd, ID_EDIT_PASS, pass->valuestring);
         
         cJSON* trans = cJSON_GetObjectItem(target, "transport"); 
         if (!trans) trans = cJSON_GetObjectItem(target, "streamSettings"); // 兼容旧版
@@ -127,20 +125,20 @@ void LoadNodeToEdit(HWND hWnd, const wchar_t* tag) {
         HWND hNet = GetDlgItem(hWnd, ID_EDIT_NET);
         SendMessage(hNet, CB_SETCURSEL, 0, 0); 
         cJSON* netType = trans ? cJSON_GetObjectItem(trans, "type") : cJSON_GetObjectItem(target, "network");
-        if (netType && netType->valuestring && strcmp(netType->valuestring, "ws") == 0) SendMessage(hNet, CB_SETCURSEL, 1, 0);
+        if (netType && strcmp(netType->valuestring, "ws") == 0) SendMessage(hNet, CB_SETCURSEL, 1, 0);
         
         // WS Settings
         cJSON* wsSettings = NULL;
         if (trans) wsSettings = cJSON_GetObjectItem(trans, "wsSettings");
-        if (!wsSettings && trans && netType && netType->valuestring && strcmp(netType->valuestring, "ws") == 0) wsSettings = trans;
+        if (!wsSettings && trans && netType && strcmp(netType->valuestring, "ws") == 0) wsSettings = trans;
         
         if (wsSettings) {
              cJSON* path = cJSON_GetObjectItem(wsSettings, "path");
-             if (path && path->valuestring) SetDlgItemTextA(hWnd, ID_EDIT_PATH, path->valuestring);
+             if (path) SetDlgItemTextA(hWnd, ID_EDIT_PATH, path->valuestring);
              cJSON* headers = cJSON_GetObjectItem(wsSettings, "headers");
              if (headers) {
                  cJSON* host = cJSON_GetObjectItem(headers, "Host");
-                 if (host && host->valuestring) SetDlgItemTextA(hWnd, ID_EDIT_HOST, host->valuestring);
+                 if (host) SetDlgItemTextA(hWnd, ID_EDIT_HOST, host->valuestring);
              }
         }
         
@@ -148,10 +146,10 @@ void LoadNodeToEdit(HWND hWnd, const wchar_t* tag) {
         SendMessage(hTls, CB_SETCURSEL, 0, 0); 
         cJSON* tls = cJSON_GetObjectItem(target, "tls");
         cJSON* security = cJSON_GetObjectItem(target, "security");
-        if (tls || (security && security->valuestring && strcmp(security->valuestring, "tls") == 0)) {
+        if (tls || (security && strcmp(security->valuestring, "tls") == 0)) {
              SendMessage(hTls, CB_SETCURSEL, 1, 0);
              cJSON* sni = tls ? cJSON_GetObjectItem(tls, "server_name") : NULL;
-             if (sni && sni->valuestring) SetDlgItemTextA(hWnd, ID_EDIT_HOST, sni->valuestring);
+             if (sni) SetDlgItemTextA(hWnd, ID_EDIT_HOST, sni->valuestring);
         }
     }
     cJSON_Delete(root);
@@ -159,8 +157,7 @@ void LoadNodeToEdit(HWND hWnd, const wchar_t* tag) {
 
 void SaveEditedNode(HWND hWnd) {
     wchar_t wTag[256], wAddr[256], wUser[256], wPass[256], wHost[256], wPath[256];
-    // [Fix] 扩大栈缓冲区，防止 UTF-8 转换溢出导致 0x40000015 错误
-    char tag[768] = {0}, addr[768] = {0}, user[768] = {0}, pass[768] = {0}, host[768] = {0}, path[768] = {0};
+    char tag[256], addr[256], user[256], pass[256], host[256], path[256];
     
     int port = GetDlgItemInt(hWnd, ID_EDIT_PORT, NULL, FALSE);
     if (port <= 0 || port > 65535) {
@@ -174,13 +171,12 @@ void SaveEditedNode(HWND hWnd) {
     GetDlgItemTextW(hWnd, ID_EDIT_HOST, wHost, 256);
     GetDlgItemTextW(hWnd, ID_EDIT_PATH, wPath, 256);
     
-    // [Fix] 使用 sizeof - 1 并确保 NULL 结尾
-    WideCharToMultiByte(CP_UTF8, 0, wTag, -1, tag, sizeof(tag)-1, NULL, NULL);
-    WideCharToMultiByte(CP_UTF8, 0, wAddr, -1, addr, sizeof(addr)-1, NULL, NULL);
-    WideCharToMultiByte(CP_UTF8, 0, wUser, -1, user, sizeof(user)-1, NULL, NULL);
-    WideCharToMultiByte(CP_UTF8, 0, wPass, -1, pass, sizeof(pass)-1, NULL, NULL);
-    WideCharToMultiByte(CP_UTF8, 0, wHost, -1, host, sizeof(host)-1, NULL, NULL);
-    WideCharToMultiByte(CP_UTF8, 0, wPath, -1, path, sizeof(path)-1, NULL, NULL);
+    WideCharToMultiByte(CP_UTF8, 0, wTag, -1, tag, 256, NULL, NULL);
+    WideCharToMultiByte(CP_UTF8, 0, wAddr, -1, addr, 256, NULL, NULL);
+    WideCharToMultiByte(CP_UTF8, 0, wUser, -1, user, 256, NULL, NULL);
+    WideCharToMultiByte(CP_UTF8, 0, wPass, -1, pass, 256, NULL, NULL);
+    WideCharToMultiByte(CP_UTF8, 0, wHost, -1, host, 256, NULL, NULL);
+    WideCharToMultiByte(CP_UTF8, 0, wPath, -1, path, 256, NULL, NULL);
     
     if (strlen(addr) == 0) {
         MessageBoxW(hWnd, L"服务器地址不能为空", L"错误", MB_OK|MB_ICONERROR); return;
@@ -196,12 +192,12 @@ void SaveEditedNode(HWND hWnd) {
         cJSON* root = cJSON_Parse(buffer); free(buffer);
         if (root) {
             cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
-            char oldTagUtf8[768] = {0};
-            WideCharToMultiByte(CP_UTF8, 0, g_editingTag, -1, oldTagUtf8, sizeof(oldTagUtf8)-1, NULL, NULL);
+            char oldTagUtf8[256];
+            WideCharToMultiByte(CP_UTF8, 0, g_editingTag, -1, oldTagUtf8, 256, NULL, NULL);
             cJSON* node = NULL;
             cJSON_ArrayForEach(node, outbounds) {
                 cJSON* t = cJSON_GetObjectItem(node, "tag");
-                if (t && t->valuestring && strcmp(t->valuestring, oldTagUtf8) == 0) {
+                if (t && strcmp(t->valuestring, oldTagUtf8) == 0) {
                     cJSON* type = cJSON_GetObjectItem(node, "type");
                     if (type && type->valuestring) snprintf(originalType, sizeof(originalType), "%s", type->valuestring);
                     break;
@@ -264,8 +260,8 @@ void SaveEditedNode(HWND hWnd) {
         cJSON* root = cJSON_Parse(buffer); free(buffer);
         if (root) {
             cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
-            char oldTagUtf8[768] = {0};
-            WideCharToMultiByte(CP_UTF8, 0, g_editingTag, -1, oldTagUtf8, sizeof(oldTagUtf8)-1, NULL, NULL);
+            char oldTagUtf8[256];
+            WideCharToMultiByte(CP_UTF8, 0, g_editingTag, -1, oldTagUtf8, 256, NULL, NULL);
             
             // 查找并替换
             int count = cJSON_GetArraySize(outbounds);
@@ -273,7 +269,7 @@ void SaveEditedNode(HWND hWnd) {
             for (int i=0; i<count; i++) {
                 cJSON* item = cJSON_GetArrayItem(outbounds, i);
                 cJSON* t = cJSON_GetObjectItem(item, "tag");
-                if (t && t->valuestring && strcmp(t->valuestring, oldTagUtf8) == 0) {
+                if (t && strcmp(t->valuestring, oldTagUtf8) == 0) {
                     idxToReplace = i; break;
                 }
             }
@@ -694,9 +690,7 @@ LRESULT CALLBACK SubWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_UPDATE_FINISH: { 
             EnableWindow(GetDlgItem(hWnd, ID_SUB_UPD_BTN), TRUE);
             SetWindowTextW(hWnd, L"订阅设置");
-            // [Fix] 扩大缓冲区防止溢出 (0x40000015 on Win7 CRT)
-            wchar_t msg[512]; 
-            swprintf_s(msg, 512, L"更新完成，共获取 %d 个节点。", (int)wParam);
+            wchar_t msg[128]; swprintf_s(msg, 128, L"更新完成，共获取 %d 个节点。", (int)wParam);
             MessageBoxW(hWnd, msg, L"结果", MB_OK);
             HWND hMgr = FindWindowW(L"NodeMgr", NULL);
             if (hMgr) SendMessage(hMgr, WM_REFRESH_NODELIST, 0, 0);
@@ -876,9 +870,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 ParseTags();
                 HWND hMgr = FindWindowW(L"NodeMgr", NULL);
                 if (hMgr) SendMessage(hMgr, WM_REFRESH_NODELIST, 0, 0);
-                // [Fix] 扩大缓冲区防止溢出 (0x40000015)
-                wchar_t msgBuf[128]; 
-                swprintf_s(msgBuf, 128, L"导入 %d 个节点", count);
+                wchar_t msgBuf[64]; swprintf_s(msgBuf, 64, L"导入 %d 个节点", count);
                 MessageBoxW(hWnd, msgBuf, L"成功", MB_OK);
                 EnterCriticalSection(&g_configLock);
                 if (wcslen(currentNode) == 0 && nodeCount > 0) {
@@ -912,22 +904,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nSho
 
     INITCOMMONCONTROLSEX ic = {sizeof(INITCOMMONCONTROLSEX), ICC_HOTKEY_CLASS}; InitCommonControlsEx(&ic);
     NONCLIENTMETRICSW ncm = { sizeof(NONCLIENTMETRICSW) };
-    
-    // [Fix] Windows 7 兼容性修复：SystemParametersInfo 可能因为结构体大小不匹配而失败
-    // 如果第一次调用失败，尝试减去 Vista/Win7 新增的 padding 大小 (iPaddedBorderWidth)
-    if (!SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(NONCLIENTMETRICSW), &ncm, 0)) {
-        // 尝试旧版结构体大小 (兼容 WinXP/Server2003)
-        ncm.cbSize -= sizeof(int); 
-        if (!SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, ncm.cbSize, &ncm, 0)) {
-            // 彻底失败，使用回退字体
-            hAppFont = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Microsoft YaHei");
-        } else {
-            hAppFont = CreateFontIndirectW(&ncm.lfMenuFont);
-        }
-    } else {
-        hAppFont = CreateFontIndirectW(&ncm.lfMenuFont);
-    }
-
+    if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(NONCLIENTMETRICSW), &ncm, 0)) hAppFont = CreateFontIndirectW(&ncm.lfMenuFont);
+    else hAppFont = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Microsoft YaHei");
     hLogFont = CreateFontW(14,0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,0,0,0,0,L"Consolas");
     
     OpenLogViewer(FALSE); 

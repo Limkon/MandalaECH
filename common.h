@@ -18,15 +18,20 @@
 #endif
 
 #define WIN32_LEAN_AND_MEAN
+
+// 尝试阻止 windows.h 包含 wincrypt.h 以避免与 OpenSSL 冲突
 #define NOCRYPT 
 
 // --- 生产环境限制参数 ---
 #define MAX_CONNECTIONS 512
 #define IO_BUFFER_SIZE 16384 
+// 允许的最大单帧大小 (8MB)，但在处理时将增加更严苛的内存水位检查
 #define MAX_WS_FRAME_SIZE 8388608 
+// 生产环境建议：单个进程用于网络缓冲的最大内存总量 (如 512MB)，防止 OOM
 #define MAX_TOTAL_MEMORY_USAGE (512 * 1024 * 1024)
 
-#define LOG_DESENSITIZE TRUE 
+// --- 调试与安全配置 ---
+#define LOG_DESENSITIZE TRUE  // 开启日志脱敏，隐藏密码和敏感 Host
 
 // --- 1. Windows 系统头文件 ---
 #include <windows.h>
@@ -36,12 +41,11 @@
 #include <commctrl.h>
 #include <shlobj.h>
 #include <wininet.h>
-#include <process.h> // [Fix] 添加 process.h 以支持 _beginthreadex
 
 // --- 2. 引入资源头文件 ---
 #include "resource.h"
 
-// --- 3. 清理 Windows 宏污染 ---
+// --- 3. 清理 Windows 宏污染 (解决与 OpenSSL 的命名冲突) ---
 #ifdef X509_NAME
 #undef X509_NAME
 #endif
@@ -102,6 +106,7 @@
 #define ID_GLOBAL_HOTKEY 9001
 #define ID_TRAY_NODE_BASE 2000
 
+// ECH 设置控件 ID
 #define ID_CHK_ECH         7022
 #define ID_EDIT_ECH_SERVER 7023
 #define ID_EDIT_ECH_DOMAIN 7024
@@ -170,6 +175,9 @@ extern const wchar_t* UA_PLATFORMS[];
 extern const char* UA_TEMPLATES[];
 
 extern BOOL g_enableLog;
+
+// 内存水位管理变量 (由 proxy.c 维护)
+extern volatile LONG64 g_total_allocated_mem;
 
 extern CRITICAL_SECTION g_configLock; 
 void InitGlobalLocks();
