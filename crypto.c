@@ -13,6 +13,8 @@
 
 // 引用 globals.c 中的全局变量
 extern SSL_CTX *g_ssl_ctx;
+// 引用 common.h/globals.c 中的 ECH 开关
+extern int g_enableECH;
 
 static BIO_METHOD *method_frag = NULL;
 static INIT_ONCE g_crypto_init_once = INIT_ONCE_STATIC_INIT;
@@ -183,7 +185,9 @@ static int frag_write(BIO *b, const char *in, int inl) {
 
     // [Logic] 如果是第一个数据包（ClientHello），尝试注入 Padding
     if (inl > 0 && ctx->first_packet_sent == 0) {
-        if (ctx->enable_padding) {
+        // [Critical Fix] 当 ECH 开启时，禁止手动修改 ClientHelloOuter (注入 Padding)
+        // ECH 机制会对整个 ClientHello 进行完整性校验，修改会导致校验失败 (Bad MAC/Decode Error)
+        if (ctx->enable_padding && !g_enableECH) {
             int new_len = 0;
             char* padded = inject_padding(in, inl, &new_len, ctx->pad_min, ctx->pad_max);
             if (padded) {
@@ -193,6 +197,8 @@ static int frag_write(BIO *b, const char *in, int inl) {
                 alloc_buf = padded;
                 log_msg("[TLS] Padding injected: +%d bytes", new_len - inl);
             }
+        } else if (g_enableECH && ctx->enable_padding) {
+            log_msg("[TLS] Padding skipped because ECH is enabled (Integrity Protection)");
         }
         ctx->first_packet_sent = 1; 
     }
@@ -397,8 +403,21 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
     unsigned char alpn_protos[] = { 8, 'h', 't', 't', 'p', '/', '1', '.', '1' };
     SSL_set_alpn_protos(ctx->ssl, alpn_protos, sizeof(alpn_protos));
     
+    // [Fix] Add detailed error logging for SSL_connect
     int ret = SSL_connect(ctx->ssl);
-    if (ret != 1) return -1;
+    if (ret != 1) {
+        int err_code = SSL_get_error(ctx->ssl, ret);
+        log_msg("[Fatal] SSL_connect failed: ret=%d, ssl_err=%d", ret, err_code);
+        
+        // Print OpenSSL error stack to log
+        unsigned long l;
+        while ((l = ERR_get_error()) != 0) {
+            char buf[256];
+            ERR_error_string_n(l, buf, sizeof(buf));
+            log_msg("[OpenSSL] %s", buf);
+        }
+        return -1;
+    }
     return 0;
 }
 
