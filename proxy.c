@@ -1,4 +1,5 @@
 #include "proxy.h"
+#include <ws2tcpip.h> // [Fix] 显式包含，解决 struct addrinfo 和 inet_ntop 未定义错误
 #include "crypto.h"
 #include "utils.h"
 #include "common.h"
@@ -12,22 +13,22 @@ volatile LONG64 g_total_allocated_mem = 0;
 
 ProxyConfig g_proxyConfig;
 CRITICAL_SECTION g_configLock;
-char g_userAgentStr[512] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"; // 默认值
+char g_userAgentStr[512] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"; 
 
 BOOL g_proxyRunning = FALSE;
 int g_localPort = 10809;
-int g_hideTrayStart = 0; // 定义缺失的变量
+int g_hideTrayStart = 0; 
 
 static SOCKET g_listen_sock = INVALID_SOCKET;
 static HANDLE hProxyThread = NULL;
 
 // --- 内存池定义 ---
-#define MAX_POOL_ITEMS 1024 // 内存池最大缓存数量 (约 16MB)
+#define MAX_POOL_ITEMS 1024 
 static void* g_pool_items[MAX_POOL_ITEMS];
 static int g_pool_count = 0;
 static CRITICAL_SECTION g_pool_lock;
 
-// [Concurrency] 客户端线程上下文
+// 客户端线程上下文
 typedef struct {
     SOCKET clientSock;
     ProxyConfig config;          
@@ -40,7 +41,6 @@ typedef struct {
 void Proxy_InitMemPool() {
     InitializeCriticalSection(&g_pool_lock);
     g_pool_count = 0;
-    // 初始化配置锁 (若未初始化)
     static BOOL configLockInit = FALSE;
     if (!configLockInit) { InitializeCriticalSection(&g_configLock); configLockInit = TRUE; }
 }
@@ -81,11 +81,6 @@ void* Proxy_PoolAlloc() {
     LeaveCriticalSection(&g_pool_lock);
 
     if (!p) {
-        // 池为空，申请新内存 (不计入 g_total_allocated_mem，因为池内存单独管理或简化处理)
-        // 为了统计准确，这里也使用 malloc 但手动维护计数？
-        // 简单起见，PoolAlloc 的内存视为长期持有，不频繁计入全局水位波动，
-        // 或者我们统一使用 Proxy_Malloc 申请，Pool 只是缓存指针。
-        // 这里选择：从系统申请，PoolFree 时才决定是否缓存。
         p = malloc(IO_BUFFER_SIZE);
     }
     return p;
@@ -140,8 +135,8 @@ int recv_timeout(SOCKET s, char *buf, int len, int timeout_sec) {
     FD_SET(s, &fds);
     struct timeval tv = { timeout_sec, 0 };
     int n = select(0, &fds, NULL, NULL, &tv);
-    if (n == 0) return -2; // Timeout
-    if (n < 0) return -1;  // Error
+    if (n == 0) return -2; 
+    if (n < 0) return -1; 
     return recv(s, buf, len, 0);
 }
 
@@ -155,11 +150,9 @@ int read_header_robust(SOCKET s, char* buf, int max_len, int timeout_sec) {
         total_read += n;
         buf[total_read] = 0; 
         
-        // SOCKS5 探测 (05 01 00)
         if (buf[0] == 0x05) { 
             if (total_read >= 2) return total_read; 
         }
-        // HTTP 探测
         else { 
             if (strstr(buf, "\r\n\r\n")) return total_read; 
         }
@@ -203,8 +196,7 @@ void base64_encode_key(const unsigned char* src, char* dst) {
     *(dst-1) = '='; *dst = 0;
 }
 
-// --- 客户端处理线程 (核心逻辑) ---
-// [Change] 使用 unsigned __stdcall 适配 _beginthreadex
+// --- 客户端处理线程 ---
 unsigned __stdcall client_handler(void* p) {
     InterlockedIncrement(&g_active_connections);
     ClientContext* ctx = (ClientContext*)p;
@@ -229,36 +221,32 @@ unsigned __stdcall client_handler(void* p) {
     char *header_end = NULL; int header_len = 0;
     struct addrinfo hints, *res = NULL, *ptr = NULL;
 
-    // [Change] 使用内存池和受控分配
-    c_buf = (char*)Proxy_PoolAlloc(); // 固定 16KB
+    c_buf = (char*)Proxy_PoolAlloc(); 
     ws_read_buf = (char*)Proxy_Malloc(ws_read_buf_cap); 
-    ws_send_buf = (char*)Proxy_Malloc(IO_BUFFER_SIZE + 4096); // 约 20KB
+    ws_send_buf = (char*)Proxy_Malloc(IO_BUFFER_SIZE + 4096); 
     
     if (!c_buf || !ws_read_buf || !ws_send_buf) goto cl_end; 
 
     int flag = 1;
     setsockopt(c, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
     
-    // 1. 读取浏览器首包
     browser_len = read_header_robust(c, c_buf, IO_BUFFER_SIZE, 10);
     if (browser_len <= 0) goto cl_end; 
     c_buf[browser_len] = 0;
     
-    // 协议探测
     if (c_buf[0] == 0x05) { 
-        // Socks5 处理
-        send(c, "\x05\x00", 2, 0); // 无需认证
+        send(c, "\x05\x00", 2, 0); 
         is_socks5 = 1;
         
         int n = recv_timeout(c, c_buf, IO_BUFFER_SIZE, 10);
         if (n <= 0) goto cl_end;
         browser_len = n;
         
-        if (c_buf[1] == 0x01) { // CONNECT
-             if (c_buf[3] == 0x01) { // IPv4
+        if (c_buf[1] == 0x01) { 
+             if (c_buf[3] == 0x01) { 
                  inet_ntop(AF_INET, &c_buf[4], host, sizeof(host));
                  port = ntohs(*(unsigned short*)&c_buf[8]);
-             } else if (c_buf[3] == 0x03) { // Domain
+             } else if (c_buf[3] == 0x03) { 
                  int dlen = (unsigned char)c_buf[4];
                  memcpy(host, &c_buf[5], dlen); host[dlen] = 0;
                  port = ntohs(*(unsigned short*)&c_buf[5+dlen]);
@@ -267,7 +255,6 @@ unsigned __stdcall client_handler(void* p) {
         } else goto cl_end;
     } 
     else {
-        // HTTP/HTTPS 处理
         if (sscanf(c_buf, "%15s %255s", method, host) == 2) {
             char *p_col = strchr(host, ':');
             if (p_col) { *p_col = 0; port = atoi(p_col+1); }
@@ -279,7 +266,6 @@ unsigned __stdcall client_handler(void* p) {
         } else goto cl_end;
     }
     
-    // 日志脱敏处理
     char display_host[256]; strcpy(display_host, host);
 #if LOG_DESENSITIZE
     if (strlen(display_host) > 4) {
@@ -291,7 +277,6 @@ unsigned __stdcall client_handler(void* p) {
 #endif
     log_msg("[Proxy] %s -> %s:%d", method, display_host, port);
     
-    // 2. 连接代理服务器
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM;
     hints.ai_protocol = IPPROTO_TCP;
@@ -327,7 +312,6 @@ unsigned __stdcall client_handler(void* p) {
     }
     if (r == INVALID_SOCKET || tls.ssl == NULL) goto cl_end;
     
-    // 3. WebSocket 握手
     const char* sni_val = (strlen(localConfig.sni) > 0) ? localConfig.sni : localConfig.host;
     const char* req_path = (strlen(localConfig.path) > 0) ? localConfig.path : "/";
     unsigned char rnd_key[16]; char ws_key_str[32];
@@ -359,7 +343,6 @@ unsigned __stdcall client_handler(void* p) {
         }
     }
     
-    // 4. 代理协议封包 (VLESS / Trojan / SS / Mandala / Socks)
     unsigned char proto_buf[2048]; 
     int proto_len = 0, flen = 0;
     struct in_addr ip4; struct in6_addr ip6;
@@ -370,10 +353,10 @@ unsigned __stdcall client_handler(void* p) {
     BOOL is_mandala = (_stricmp(localConfig.type, "mandala") == 0);
 
     if (is_vless) {
-        proto_buf[proto_len++] = 0x00; // Version
+        proto_buf[proto_len++] = 0x00; 
         parse_uuid(localConfig.user, proto_buf + proto_len); proto_len += 16; 
-        proto_buf[proto_len++] = 0x00; // Addons
-        proto_buf[proto_len++] = 0x01; // TCP
+        proto_buf[proto_len++] = 0x00; 
+        proto_buf[proto_len++] = 0x01; 
         proto_buf[proto_len++] = (port >> 8) & 0xFF; proto_buf[proto_len++] = port & 0xFF;        
         if (inet_pton(AF_INET, host, &ip4) == 1) {
             proto_buf[proto_len++] = 0x01; memcpy(proto_buf + proto_len, &ip4, 4); proto_len += 4;
@@ -399,7 +382,7 @@ unsigned __stdcall client_handler(void* p) {
             int pad = rand() % 16; plaintext[p_len++] = (unsigned char)pad;
             for(int i=0; i<pad; i++) plaintext[p_len++] = rand() % 256;
             
-            plaintext[p_len++] = 0x01; // TCP
+            plaintext[p_len++] = 0x01; 
             if (inet_pton(AF_INET, host, &ip4) == 1) {
                  plaintext[p_len++] = 0x01; memcpy(plaintext + p_len, &ip4, 4); p_len += 4;
             } else if (inet_pton(AF_INET6, host, &ip6) == 1) {
@@ -445,7 +428,7 @@ unsigned __stdcall client_handler(void* p) {
         flen = build_ws_frame((char*)proto_buf, proto_len, ws_send_buf);
         tls_write(&tls, ws_send_buf, flen);
     }
-    else { // SOCKS5 Outbound
+    else { 
         char auth[] = {0x05, 0x01, 0x00}; 
         if (strlen(localConfig.user) > 0) auth[2] = 0x02; 
         flen = build_ws_frame(auth, 3, ws_send_buf);
@@ -481,7 +464,6 @@ unsigned __stdcall client_handler(void* p) {
         if (resp_buf[1] != 0x00) goto cl_end;
     }
     
-    // 5. 响应浏览器
     if (is_socks5) {
         unsigned char s5_ok[] = {0x05, 0x00, 0x00, 0x01, 0,0,0,0, 0,0};
         send(c, (char*)s5_ok, 10, 0);
@@ -498,7 +480,6 @@ unsigned __stdcall client_handler(void* p) {
         tls_write(&tls, ws_send_buf, flen);
     }
     
-    // 6. 转发循环 (非阻塞 IO)
     u_long mode = 1; 
     ioctlsocket(c, FIONBIO, &mode); 
     ioctlsocket(r, FIONBIO, &mode);
@@ -515,7 +496,6 @@ unsigned __stdcall client_handler(void* p) {
         int n = select(0, &fds, NULL, NULL, &tv);
         if (n < 0) break;
         
-        // 浏览器 -> 代理
         if (FD_ISSET(c, &fds)) {
             int len = recv(c, c_buf, IO_BUFFER_SIZE, 0);
             if (len > 0) {
@@ -528,14 +508,12 @@ unsigned __stdcall client_handler(void* p) {
             }
         }
         
-        // 代理 -> 浏览器
         if (FD_ISSET(r, &fds) || pending > 0) {
             if (ws_buf_len >= ws_read_buf_cap - 1024) { 
                 if (ws_read_buf_cap < MAX_WS_FRAME_SIZE) {
                     int new_cap = ws_read_buf_cap * 2;
                     if (new_cap > MAX_WS_FRAME_SIZE) new_cap = MAX_WS_FRAME_SIZE;
                     
-                    // [Change] 使用 Proxy_Malloc 重新分配 (需要手动处理 realloc 逻辑)
                     char* new_buf = (char*)Proxy_Malloc(new_cap);
                     if (new_buf) {
                         memcpy(new_buf, ws_read_buf, ws_buf_len);
@@ -556,7 +534,6 @@ unsigned __stdcall client_handler(void* p) {
             }
         }
         
-        // 解析 WebSocket 帧
         while (ws_buf_len > 0) {
             int hl, pl;
             long long frame_total = check_ws_frame((unsigned char*)ws_read_buf, ws_buf_len, &hl, &pl);
@@ -598,7 +575,6 @@ unsigned __stdcall client_handler(void* p) {
 
 cl_end:
     if (res) freeaddrinfo(res);
-    // [Change] 释放内存 (c_buf 使用 PoolFree，其他使用 Proxy_Free)
     Proxy_PoolFree(c_buf);
     Proxy_Free(ws_read_buf, ws_read_buf_cap);
     Proxy_Free(ws_send_buf, IO_BUFFER_SIZE + 4096);
@@ -611,8 +587,6 @@ cl_end:
     return 0;
 }
 
-// 监听线程与管理函数
-// [Change] 使用 unsigned __stdcall 适配 _beginthreadex
 unsigned __stdcall server_thread(void* p) {
     g_listen_sock = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in addr; 
@@ -660,7 +634,6 @@ unsigned __stdcall server_thread(void* p) {
                 ctx->cryptoSettings.enableChromeCiphers = g_enableChromeCiphers;
                 LeaveCriticalSection(&g_configLock);
 
-                // [Change] 使用 _beginthreadex 创建线程
                 uintptr_t th = _beginthreadex(NULL, 0, client_handler, (void*)ctx, 0, NULL);
                 if (th) CloseHandle((HANDLE)th); 
                 else { 
@@ -678,8 +651,7 @@ unsigned __stdcall server_thread(void* p) {
 void StartProxyCore() {
     if (g_proxyRunning) return;
     g_proxyRunning = TRUE;
-    Proxy_InitMemPool(); // 初始化内存池
-    // [Change] 使用 _beginthreadex
+    Proxy_InitMemPool(); 
     uintptr_t th = _beginthreadex(NULL, 0, server_thread, NULL, 0, NULL);
     hProxyThread = (HANDLE)th;
     if (!hProxyThread) g_proxyRunning = FALSE;
@@ -696,6 +668,6 @@ void StopProxyCore() {
         CloseHandle(hProxyThread); 
         hProxyThread = NULL; 
     }
-    Proxy_CleanupMemPool(); // 清理内存池
+    Proxy_CleanupMemPool(); 
     log_msg("[System] Proxy Stopped");
 }
