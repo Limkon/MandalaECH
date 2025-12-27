@@ -90,10 +90,19 @@ void AddComboItem(HWND hCombo, const wchar_t* text, BOOL select) {
 // --- 节点编辑逻辑 ---
 
 void LoadNodeToEdit(HWND hWnd, const wchar_t* tag) {
+    // [Fix: Race Condition] 加锁保护读取
+    EnterCriticalSection(&g_configLock);
+
     char* buffer = NULL; long size = 0;
-    if (!ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) return;
+    if (!ReadFileToBuffer(CONFIG_FILE, &buffer, &size)) {
+        LeaveCriticalSection(&g_configLock);
+        return;
+    }
     cJSON* root = cJSON_Parse(buffer); free(buffer);
-    if (!root) return;
+    if (!root) {
+        LeaveCriticalSection(&g_configLock);
+        return;
+    }
     
     char tagUtf8[256];
     WideCharToMultiByte(CP_UTF8, 0, tag, -1, tagUtf8, 256, NULL, NULL);
@@ -153,8 +162,10 @@ void LoadNodeToEdit(HWND hWnd, const wchar_t* tag) {
         }
     }
     cJSON_Delete(root);
+    LeaveCriticalSection(&g_configLock);
 }
 
+// [Fix] 增加 originalTagW 参数，不依赖全局变量，支持多窗口并发
 void SaveEditedNode(HWND hWnd, const wchar_t* originalTagW) {
     wchar_t wTag[256], wAddr[256], wUser[256], wPass[256], wHost[256], wPath[256];
     char tag[256], addr[256], user[256], pass[256], host[256], path[256];
@@ -185,6 +196,9 @@ void SaveEditedNode(HWND hWnd, const wchar_t* originalTagW) {
     int netIdx = SendMessage(GetDlgItem(hWnd, ID_EDIT_NET), CB_GETCURSEL, 0, 0);
     int tlsIdx = SendMessage(GetDlgItem(hWnd, ID_EDIT_TLS), CB_GETCURSEL, 0, 0);
 
+    // [Fix: Race Condition] 加锁开始
+    EnterCriticalSection(&g_configLock);
+
     // 1. 获取原始类型
     char originalType[64] = {0};
     char* buffer = NULL; long size = 0;
@@ -193,7 +207,7 @@ void SaveEditedNode(HWND hWnd, const wchar_t* originalTagW) {
         if (root) {
             cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
             char oldTagUtf8[256];
-            // [Fix] 使用传入的 originalTagW 而不是全局 g_editingTag
+            // 使用传入的 originalTagW
             WideCharToMultiByte(CP_UTF8, 0, originalTagW, -1, oldTagUtf8, 256, NULL, NULL);
             cJSON* node = NULL;
             cJSON_ArrayForEach(node, outbounds) {
@@ -262,7 +276,6 @@ void SaveEditedNode(HWND hWnd, const wchar_t* originalTagW) {
         if (root) {
             cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
             char oldTagUtf8[256];
-            // [Fix] 使用传入的 originalTagW
             WideCharToMultiByte(CP_UTF8, 0, originalTagW, -1, oldTagUtf8, 256, NULL, NULL);
             
             // 查找并替换
@@ -284,13 +297,17 @@ void SaveEditedNode(HWND hWnd, const wchar_t* originalTagW) {
             free(out); cJSON_Delete(root);
         } else cJSON_Delete(newNode);
     } else cJSON_Delete(newNode);
+
+    LeaveCriticalSection(&g_configLock);
+    // [Unlock]
 }
 
 // --- 节点编辑窗口消息处理 ---
 LRESULT CALLBACK NodeEditWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch(msg) {
         case WM_CREATE: {
-            // [Fix] 从全局变量读取 Tag，但立即保存到窗口属性中，后续只用窗口属性
+            // [Fix] 将全局 g_editingTag 复制一份并绑定到当前窗口句柄
+            // 这样即使全局变量被其他窗口覆盖，当前窗口仍保留正确的原始 Tag
             wchar_t* tagCopy = _wcsdup(g_editingTag); 
             SetPropW(hWnd, L"NodeTag", tagCopy);
 
@@ -339,8 +356,8 @@ LRESULT CALLBACK NodeEditWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             CreateWindowW(L"BUTTON", L"保存", WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON, 60, y, 80, 30, hWnd, (HMENU)ID_BTN_SAVE, NULL,NULL);
             CreateWindowW(L"BUTTON", L"取消", WS_CHILD|WS_VISIBLE, 180, y, 80, 30, hWnd, (HMENU)ID_BTN_CANCEL, NULL,NULL);
             
-            // 加载数据
-            if (wcslen(tagCopy) > 0) LoadNodeToEdit(hWnd, tagCopy);
+            // 加载数据 (使用绑定的 Tag)
+            if (tagCopy && wcslen(tagCopy) > 0) LoadNodeToEdit(hWnd, tagCopy);
             
             EnumChildWindows(hWnd, EnumSetFont, (LPARAM)hAppFont);
             SendMessage(hWnd, WM_SETFONT, (WPARAM)hAppFont, TRUE);
@@ -349,7 +366,7 @@ LRESULT CALLBACK NodeEditWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
         case WM_COMMAND: {
             int id = LOWORD(wParam);
             if (id == ID_BTN_SAVE) {
-                // [Fix] 从窗口属性获取 Tag
+                // [Fix] 从窗口属性获取该窗口对应的 Tag
                 wchar_t* tag = (wchar_t*)GetPropW(hWnd, L"NodeTag");
                 if (tag) {
                     SaveEditedNode(hWnd, tag);
@@ -363,7 +380,7 @@ LRESULT CALLBACK NodeEditWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             break;
         }
         case WM_DESTROY: {
-            // [Fix] 清理内存
+            // [Fix] 清理窗口属性和内存
             wchar_t* tag = (wchar_t*)GetPropW(hWnd, L"NodeTag");
             if(tag) { free(tag); RemovePropW(hWnd, L"NodeTag"); }
             break;
@@ -374,7 +391,7 @@ LRESULT CALLBACK NodeEditWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 }
 
 void OpenNodeEditWindow(const wchar_t* tag) {
-    // 仍然使用全局变量传递给 WM_CREATE，但在 WM_CREATE 中立即复制
+    // 依然更新全局变量以兼容旧逻辑，但实际窗口创建后会立即复制
     if (tag) wcsncpy(g_editingTag, tag, 255); else g_editingTag[0] = 0;
     
     WNDCLASSW wc = {0};
@@ -957,7 +974,4 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nSho
     cleanup_crypto_global();
     DeleteGlobalLocks();
     return 0;
-}
-
-
 }
