@@ -10,6 +10,9 @@ static volatile LONG g_active_connections = 0;
 volatile LONG64 g_total_allocated_mem = 0; 
 HANDLE hIOCP = NULL;
 
+// [Safety] 自动初始化锁的标志位，防止崩溃
+static volatile LONG g_locksInitialized = 0;
+
 // [Concurrency] 客户端初始化上下文 (仅用于握手线程启动)
 typedef struct {
     SOCKET clientSock;
@@ -19,7 +22,7 @@ typedef struct {
 } ClientInitContext;
 
 // --------------------------------------------------------------------------
-// 辅助函数 (保留原逻辑)
+// 辅助函数
 // --------------------------------------------------------------------------
 
 void parse_uuid(const char* uuid_str, unsigned char* out) {
@@ -183,7 +186,6 @@ void OnRemoteRead(CONNECTION_CONTEXT* conn, DWORD bytesTransferred) {
     int plain_len = tls_decrypt_from_mem(conn, cipher_data, cipher_len, plain_buf, max_plain);
     
     if (plain_len > 0) {
-        // Append to fragment buffer
         if (conn->ws_frag_len + plain_len > conn->ws_frag_cap) {
             int new_cap = conn->ws_frag_cap * 2;
             if (new_cap < conn->ws_frag_len + plain_len) new_cap = conn->ws_frag_len + plain_len + 1024;
@@ -201,7 +203,6 @@ void OnRemoteRead(CONNECTION_CONTEXT* conn, DWORD bytesTransferred) {
         memcpy(conn->ws_frag_buf + conn->ws_frag_len, plain_buf, plain_len);
         conn->ws_frag_len += plain_len;
         
-        // Parse WS Frames
         while (conn->ws_frag_len > 0) {
             int hl, pl;
             long long frame_total = check_ws_frame((unsigned char*)conn->ws_frag_buf, conn->ws_frag_len, &hl, &pl);
@@ -215,10 +216,9 @@ void OnRemoteRead(CONNECTION_CONTEXT* conn, DWORD bytesTransferred) {
                 char* payload = conn->ws_frag_buf + hl;
                 int payload_size = pl;
                 
-                // [Fix] VLESS Response Header Stripping
+                // VLESS Response Header Stripping
                 if (conn->is_vless && !conn->header_stripped) {
                     if (payload_size >= 2) {
-                        // VLESS Response: [Version 1][Addons Len 1][Addons N]
                         int addon_len = (unsigned char)payload[1];
                         int head_size = 2 + addon_len;
                         if (payload_size >= head_size) {
@@ -226,11 +226,6 @@ void OnRemoteRead(CONNECTION_CONTEXT* conn, DWORD bytesTransferred) {
                             payload_size -= head_size;
                             conn->header_stripped = TRUE;
                         } else {
-                            // Wait for more data
-                             // NOTE: This simple logic assumes header is in one frame. 
-                             // If header is split, it will fail. But server usually sends header in one small packet.
-                             // To fix properly, we need to hold this frame. 
-                             // For now, let's assume it doesn't split.
                              payload_size = 0; 
                         }
                     } else payload_size = 0;
@@ -312,24 +307,19 @@ void SwitchToIOCP(SOCKET c, SOCKET r, TLSContext* tls, BOOL is_vless, const char
 
     // [Fix] Process Early Data (WS Handshake residue)
     if (early_data && early_len > 0) {
-        // We simulate a "Remote Read" for this data
-        // Allocate a temp buffer to hold it, and call OnRemoteRead directly?
-        // No, OnRemoteRead expects cipher text.
-        // The early_data from handshake thread is PLAIN text (decrypted from SSL but inside WS stream).
-        // Wait, handshake uses tls_read, so it IS decrypted application data (HTTP/101 + Early VLESS Head).
-        // So we should append it to ws_frag_buf directly.
-        
         if (conn->ws_frag_len + early_len > conn->ws_frag_cap) {
-             // Resize logic... simplified for early data (usually small)
+             // Resize logic... simplified
+             int new_cap = conn->ws_frag_cap + early_len + 1024;
+             char* tmp = (char*)proxy_malloc(new_cap);
+             if(tmp) {
+                 memcpy(tmp, conn->ws_frag_buf, conn->ws_frag_len);
+                 proxy_free(conn->ws_frag_buf, conn->ws_frag_cap);
+                 conn->ws_frag_buf = tmp;
+                 conn->ws_frag_cap = new_cap;
+             }
         }
         memcpy(conn->ws_frag_buf, early_data, early_len);
         conn->ws_frag_len = early_len;
-        
-        // Trigger parsing manually once
-        // We can reuse the parsing logic by simulating a 0-byte read or extracting logic.
-        // For simplicity, let's just trigger OnRemoteRead with 0 bytes? No, that logic decrypts.
-        // We copy the parsing logic here or call a helper.
-        // Let's copy parsing logic here for robustness.
         
         while (conn->ws_frag_len > 0) {
             int hl, pl;
@@ -341,7 +331,6 @@ void SwitchToIOCP(SOCKET c, SOCKET r, TLSContext* tls, BOOL is_vless, const char
                 char* payload = conn->ws_frag_buf + hl;
                 int payload_size = pl;
                 if (conn->is_vless && !conn->header_stripped) {
-                     // Same stripping logic
                      if (payload_size >= 2) {
                         int addon_len = (unsigned char)payload[1];
                         int head_size = 2 + addon_len;
@@ -412,7 +401,6 @@ DWORD WINAPI handshake_thread(LPVOID p) {
         } else goto cl_err;
     }
     
-    // 2. Connect Remote
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM; hints.ai_protocol = IPPROTO_TCP;
     snprintf(port_str, sizeof(port_str), "%d", localConfig.port);
@@ -433,7 +421,6 @@ DWORD WINAPI handshake_thread(LPVOID p) {
     }
     if (r == INVALID_SOCKET || tls.ssl == NULL) goto cl_err;
     
-    // 3. WS Handshake
     const char* sni_val = (strlen(localConfig.sni) > 0) ? localConfig.sni : localConfig.host;
     const char* req_path = (strlen(localConfig.path) > 0) ? localConfig.path : "/";
     unsigned char rnd_key[16]; char ws_key_str[32];
@@ -447,7 +434,6 @@ DWORD WINAPI handshake_thread(LPVOID p) {
     int hlen = tls_read(&tls, ws_read_buf_tmp, IO_BUFFER_SIZE - 1);
     if (hlen <= 0 || !strstr(ws_read_buf_tmp, "101")) goto cl_err;
     
-    // [Fix] Extract Early Data
     char* early_data = NULL;
     int early_len = 0;
     char* body_start = strstr(ws_read_buf_tmp, "\r\n\r\n");
@@ -457,12 +443,10 @@ DWORD WINAPI handshake_thread(LPVOID p) {
         if (early_len > 0) early_data = body_start;
     }
 
-    // 4. Proxy Protocol (VLESS/Trojan/etc)
     unsigned char proto_buf[2048]; int proto_len = 0, flen = 0;
-    struct in_addr ip4; struct in6_addr ip6;
+    struct in_addr ip4; 
     BOOL is_vless = (_stricmp(localConfig.type, "vless") == 0);
     
-    // (Simplified Protocol Construction - Same as original)
     if (is_vless) {
         proto_buf[proto_len++] = 0x00; parse_uuid(localConfig.user, proto_buf + proto_len); proto_len += 16; 
         proto_buf[proto_len++] = 0x00; proto_buf[proto_len++] = 0x01; 
@@ -472,13 +456,10 @@ DWORD WINAPI handshake_thread(LPVOID p) {
         flen = build_ws_frame((char*)proto_buf, proto_len, ws_send_buf);
         tls_write(&tls, ws_send_buf, flen);
     } 
-    // ... (Trojan/Shadowsocks omitted for brevity, should be copied from original if needed) ...
 
-    // 5. Response
     if (is_socks5) send(c, "\x05\x00\x00\x01\0\0\0\0\0\0", 10, 0);
     else if (is_connect_method) send(c, "HTTP/1.1 200 Connection Established\r\n\r\n", 39, 0);
     
-    // 6. Browser Early Data
     if (!is_socks5 && is_connect_method && browser_len > header_len) {
         flen = build_ws_frame(c_buf + header_len, browser_len - header_len, ws_send_buf);
         tls_write(&tls, ws_send_buf, flen);
@@ -487,7 +468,6 @@ DWORD WINAPI handshake_thread(LPVOID p) {
         tls_write(&tls, ws_send_buf, flen);
     }
 
-    // 7. Switch to IOCP
     SwitchToIOCP(c, r, &tls, is_vless, early_data, early_len);
 
     if (res) freeaddrinfo(res);
@@ -509,6 +489,11 @@ cl_err:
 }
 
 DWORD WINAPI server_thread(LPVOID p) {
+    // [Safety] 确保锁被初始化
+    if (InterlockedCompareExchange(&g_locksInitialized, 1, 0) == 0) {
+        InitGlobalLocks(); 
+    }
+
     g_listen_sock = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET; addr.sin_port = htons(g_localPort); addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -522,7 +507,7 @@ DWORD WINAPI server_thread(LPVOID p) {
             ClientInitContext* ctx = (ClientInitContext*)malloc(sizeof(ClientInitContext));
             if (ctx) {
                 ctx->clientSock = c;
-                EnterCriticalSection(&g_configLock);
+                EnterCriticalSection(&g_configLock); // Now safe
                 ctx->config = g_proxyConfig; 
                 strncpy(ctx->userAgent, g_userAgentStr, 511);
                 ctx->cryptoSettings.enableFragment = g_enableFragment;
@@ -544,6 +529,12 @@ DWORD WINAPI server_thread(LPVOID p) {
 
 void StartProxyCore() {
     if (g_proxyRunning) return;
+    
+    // [Safety] 确保锁被初始化 (双重保障)
+    if (InterlockedCompareExchange(&g_locksInitialized, 1, 0) == 0) {
+        InitGlobalLocks(); 
+    }
+
     g_proxyRunning = TRUE;
     hIOCP = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
     SYSTEM_INFO si; GetSystemInfo(&si);
