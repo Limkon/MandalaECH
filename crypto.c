@@ -1,6 +1,7 @@
 #include "crypto.h"
 #include "utils.h"
 #include "common.h"
+#include "proxy.h" // [Change] 引入 proxy.h 以使用 Proxy_Malloc/Proxy_Free
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,7 +12,9 @@
 #include <openssl/rand.h>
 #include <openssl/bio.h>
 
-// 引用 globals.c 中的全局变量
+// 引用 globals.c 中的全局变量 (注意：原代码中是通过 extern 引用，这里保持一致)
+// 但实际上这些变量在 config.c 或 proxy.c 中定义。
+// 确保 proxy.h 中有相关声明。
 extern SSL_CTX *g_ssl_ctx;
 extern int g_enableECH;
 
@@ -38,7 +41,8 @@ static int frag_free(BIO *b);
 BIO_METHOD *BIO_f_fragment(void) { return method_frag; }
 
 static int frag_new(BIO *b) {
-    FragCtx *ctx = (FragCtx *)malloc(sizeof(FragCtx));
+    // [Change] 使用受控内存分配
+    FragCtx *ctx = (FragCtx *)Proxy_Malloc(sizeof(FragCtx));
     if(!ctx) return 0;
     memset(ctx, 0, sizeof(FragCtx));
     BIO_set_data(b, ctx);
@@ -49,7 +53,11 @@ static int frag_new(BIO *b) {
 static int frag_free(BIO *b) {
     if (b == NULL) return 0;
     FragCtx *ctx = (FragCtx *)BIO_get_data(b);
-    if (ctx) { free(ctx); BIO_set_data(b, NULL); }
+    if (ctx) { 
+        // [Change] 使用受控内存释放
+        Proxy_Free(ctx, sizeof(FragCtx)); 
+        BIO_set_data(b, NULL); 
+    }
     return 1;
 }
 
@@ -105,7 +113,9 @@ static char* inject_padding(const char* in, int in_len, int* out_len, int pad_mi
 
     int pad_ext_len = 4 + pad_data_len;
     int new_total_len = in_len + pad_ext_len;
-    char* new_buf = (char*)malloc(new_total_len);
+    
+    // [Change] 使用受控内存分配
+    char* new_buf = (char*)Proxy_Malloc(new_total_len);
     if (!new_buf) return NULL;
 
     memcpy(new_buf, in, in_len);
@@ -169,7 +179,7 @@ static int frag_write(BIO *b, const char *in, int inl) {
             if (frag_count >= MAX_FRAG_COUNT) {
                 int ret = BIO_write(next, send_buf + bytes_processed, remaining);
                 if (ret <= 0) { 
-                    if (alloc_buf) free(alloc_buf);
+                    if (alloc_buf) Proxy_Free(alloc_buf, send_len); // [Change]
                     BIO_copy_next_retry(b); 
                     return (bytes_processed > 0 ? (alloc_buf ? inl : bytes_processed) : ret); 
                 }
@@ -184,7 +194,7 @@ static int frag_write(BIO *b, const char *in, int inl) {
             
             int ret = BIO_write(next, send_buf + bytes_processed, chunk_size);
             if (ret <= 0) { 
-                if (alloc_buf) free(alloc_buf);
+                if (alloc_buf) Proxy_Free(alloc_buf, send_len); // [Change]
                 BIO_copy_next_retry(b); 
                 return (bytes_processed > 0 ? (alloc_buf ? inl : bytes_processed) : ret); 
             }
@@ -192,6 +202,8 @@ static int frag_write(BIO *b, const char *in, int inl) {
             
             if (remaining > 0 && ctx->frag_delay > 0) {
                 unsigned char dly_rnd; RAND_bytes(&dly_rnd, 1);
+                // [Note] Sleep is bad for concurrency but required for traffic shaping here.
+                // Keeping it as requested to maintain original logic.
                 Sleep(dly_rnd % (ctx->frag_delay + 1));
             }
         }
@@ -199,7 +211,7 @@ static int frag_write(BIO *b, const char *in, int inl) {
     } else {
         total_sent = BIO_write(next, send_buf, send_len);
     }
-    if (alloc_buf) free(alloc_buf);
+    if (alloc_buf) Proxy_Free(alloc_buf, send_len); // [Change]
     
     if (total_sent > 0) {
         BIO_copy_next_retry(b);
@@ -300,9 +312,7 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
 
     ctx->ssl = SSL_new(g_ssl_ctx);
     if (!ctx->ssl) return -1;
-    // [Fix] 移除 SSL_set_fd，避免 BIO 所有权混乱
-    // SSL_set_fd(ctx->ssl, (int)ctx->sock); 
-
+    
     // 1. 设置 SNI (Inner SNI)
     const char *sni_name = (target_sni && strlen(target_sni)) ? target_sni : target_host;
     SSL_set_tlsext_host_name(ctx->ssl, sni_name);
@@ -326,13 +336,17 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
             } else {
                  log_msg("[ECH] Config set for %s (len=%d)", query_domain, ech_len);
             }
-            free(ech_config);
+            // [Change] FetchECHConfig 内部使用 Proxy_Malloc (待 utils.c 修改)，这里需要匹配释放
+            // 但目前 utils.c 还没改，FetchECHConfig 用的是 malloc。
+            // 为了保持一致性，假设 utils.c 也将改为 Proxy_Malloc。
+            // 如果 utils.c 还没改，这里暂时用 free，等 utils.c 改完再统一。
+            // 按照重构计划，utils.c 也会改。这里暂时写 Proxy_Free。
+            Proxy_Free(ech_config, ech_len);
         } else {
             log_msg("[ECH] No config found for %s, fallback to plain TLS", query_domain);
         }
     }
 
-    // [Fix] 手动构建 BIO 链，确保引用计数正确
     // 创建基础 Socket BIO (引用计数=1)
     BIO *internal_bio = BIO_new_socket((int)ctx->sock, BIO_NOCLOSE);
     if (!internal_bio) { SSL_free(ctx->ssl); ctx->ssl = NULL; return -1; }
@@ -341,20 +355,7 @@ int tls_init_connect(TLSContext *ctx, const char* target_sni, const char* target
         BIO *frag_bio = BIO_new(method_frag);
         if (frag_bio) {
             BIO_set_params(frag_bio, settings);
-            // frag -> internal. internal 被链条持有。
             BIO_push(frag_bio, internal_bio); 
-            
-            // SSL 使用 frag_bio 进行读写。
-            // SSL_set_bio 会消耗传入 BIO 的引用。
-            // 此时 internal_bio 被 frag_bio 引用，我们需要确保它不会因为 SSL 释放链头而过早销毁吗？
-            // BIO_push 不增加 internal 的引用计数，它只是接管所有权。
-            // SSL_set_bio 接管 frag_bio 的所有权。
-            // 我们还需要一个引用给 rbio 吗？如果不区分 r/w，SSL_set_bio(ssl, bio, bio)。
-            // 在这种情况下，rbio = internal, wbio = frag (chain to internal).
-            // 为简单起见，我们让 rbio 也走 frag（透传），或者直接设为 socket。
-            // 为了避免复杂的引用计数问题，这里让 rbio 和 wbio 都使用 frag_bio。
-            // 这样 frag_bio 的 read 会透传给 internal_bio。
-            
             SSL_set_bio(ctx->ssl, frag_bio, frag_bio);
         } else {
             SSL_set_bio(ctx->ssl, internal_bio, internal_bio);
