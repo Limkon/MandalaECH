@@ -70,62 +70,52 @@ void log_msg(const char *format, ...) {
 }
 
 // --------------------------------------------------------------------------
-// Base64 / Hex (完全同步 Mandala 原版逻辑)
+// Base64 / Hex (Robust Implementation)
 // --------------------------------------------------------------------------
 
 static const int b64_table[] = {
     -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
     -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,62,-1,63, // 兼容 + 和 -
-    52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1,
-    -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
-    15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,63, // 兼容 _
-    -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
-    41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,62,-1,63, // + and -
+    52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1, // 0-9
+    -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14, // A-O
+    15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,63, // P-Z and _
+    -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40, // a-o
+    41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1  // p-z
 };
 
+// 健壮的 Base64 解码：忽略所有非 Base64 字符（空格、换行等），只处理有效字符
 unsigned char* Base64Decode(const char* input, size_t* out_len) {
     if(!input) return NULL;
     size_t len = strlen(input);
-    size_t out_size = len / 4 * 3 + 4;
-    unsigned char* out = (unsigned char*)malloc(out_size + 1);
+    if (len == 0) return NULL;
+
+    size_t out_capacity = len * 3 / 4 + 4;
+    unsigned char* out = (unsigned char*)malloc(out_capacity);
     if (!out) return NULL;
-    
-    size_t i = 0, j = 0;
+
+    size_t i = 0;
+    size_t j = 0;
+    int value_buf = 0;
+    int bits_collected = 0;
+
     while (i < len) {
-        if (input[i] == '\r' || input[i] == '\n' || input[i] == ' ') { i++; continue; }
-        if (input[i] == '=') break;
-        if (i + 1 >= len) break;
-        
-        unsigned char a = (unsigned char)input[i];
-        unsigned char b = (unsigned char)input[i+1];
-        
-        int va = (a > 127) ? -1 : b64_table[a];
-        int vb = (b > 127) ? -1 : b64_table[b];
-        
-        if (va == -1 || vb == -1) break;
-        
-        uint32_t n = (va << 18) | (vb << 12);
-        out[j++] = (n >> 16) & 0xFF;
-        
-        if (i + 2 < len && input[i+2] != '=') {
-            unsigned char c = (unsigned char)input[i+2];
-            int vc = (c > 127) ? -1 : b64_table[c];
-            if (vc != -1) {
-                n |= (vc << 6);
-                out[j++] = (n >> 8) & 0xFF;
-                if (i + 3 < len && input[i+3] != '=') {
-                    unsigned char d = (unsigned char)input[i+3];
-                    int vd = (d > 127) ? -1 : b64_table[d];
-                    if (vd != -1) {
-                        n |= vd;
-                        out[j++] = n & 0xFF;
-                    }
-                }
-            }
+        unsigned char c = (unsigned char)input[i++];
+        if (c == '=') break; // Padding end
+        if (c > 127) continue; // Skip non-ascii
+
+        int val = b64_table[c];
+        if (val == -1) continue; // Skip invalid chars (whitespace etc)
+
+        value_buf = (value_buf << 6) | val;
+        bits_collected += 6;
+
+        if (bits_collected >= 8) {
+            bits_collected -= 8;
+            out[j++] = (unsigned char)((value_buf >> bits_collected) & 0xFF);
         }
-        i += 4;
     }
+    
     out[j] = 0;
     if (out_len) *out_len = j;
     return out;
@@ -144,7 +134,7 @@ static int HexToBin(const char* hex, unsigned char* out, int max_len) {
 }
 
 // --------------------------------------------------------------------------
-// 网络请求实现 (核心移植部分)
+// 网络请求实现
 // --------------------------------------------------------------------------
 
 typedef struct { char host[256]; int port; char path[1024]; } URL_COMPONENTS_SIMPLE;
@@ -169,8 +159,6 @@ static BOOL ParseUrl(const char* url, URL_COMPONENTS_SIMPLE* out) {
     return TRUE;
 }
 
-// [核心] 移植自 Mandala 的 OpenSSL 下载引擎
-// 能够完美处理 Cloudflare SNI、Redirect 和 TLS 握手
 static char* InternalHttpsGet(const char* url) {
     URL_COMPONENTS_SIMPLE u;
     if (!ParseUrl(url, &u)) { log_msg("[Net] Invalid URL: %s", url); return NULL; }
@@ -199,7 +187,7 @@ static char* InternalHttpsGet(const char* url) {
     s = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
     if (s == INVALID_SOCKET) { freeaddrinfo(res); return NULL; }
     
-    DWORD timeout = 8000; // 8秒超时
+    DWORD timeout = 8000; 
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
     setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
 
@@ -213,7 +201,6 @@ static char* InternalHttpsGet(const char* url) {
     if (!ssl) { closesocket(s); return NULL; }
     SSL_set_fd(ssl, (int)s);
     
-    // [关键] 设置 SNI，防止 Cloudflare 拦截
     SSL_set_tlsext_host_name(ssl, u.host);
 
     if (SSL_connect(ssl) != 1) {
@@ -221,12 +208,11 @@ static char* InternalHttpsGet(const char* url) {
         SSL_free(ssl); closesocket(s); return NULL;
     }
 
-    // 构造请求头，模拟标准客户端
     char req[2048];
     snprintf(req, sizeof(req), 
         "GET %s HTTP/1.1\r\n"
         "Host: %s\r\n"
-        "User-Agent: Mandala-Client/1.0\r\n" // 使用 Mandala 原版 UA
+        "User-Agent: Mandala-Client/1.0\r\n"
         "Connection: close\r\n\r\n", 
         u.path, u.host);
         
@@ -255,7 +241,7 @@ static char* InternalHttpsGet(const char* url) {
             result = SafeStrDup(body, total_len - (int)(body - buf));
             free(buf);
         } else {
-            result = buf; // 如果没有头，可能是纯数据
+            result = buf; 
         }
     }
 
@@ -265,24 +251,27 @@ static char* InternalHttpsGet(const char* url) {
     return result;
 }
 
-// 统一入口：ECH获取也复用此函数，或者保留 ECH 独立逻辑
-// 这里我们让所有 HTTP GET 都走 OpenSSL，保证稳定性
 char* Utils_HttpGet(const char* url) {
     if (!url) return NULL;
     return InternalHttpsGet(url);
 }
 
-// ECH 配置获取 (修复版 v3)
-// 增加对 ech="Base64" 参数格式的解析 (RFC 9460 Presentation Format)
+// ECH 配置获取 (Debug Enhanced)
 unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t* out_len) {
     if (!domain || !doh_server) return NULL;
     char url[2048]; snprintf(url, sizeof(url), "%s?name=%s&type=65", doh_server, domain);
     
     char* json_str = Utils_HttpGet(url);
-    if (!json_str) return NULL;
+    if (!json_str) {
+        log_msg("[ECH] JSON fetch failed");
+        return NULL;
+    }
     
     cJSON* root = cJSON_Parse(json_str); free(json_str);
-    if (!root) return NULL;
+    if (!root) {
+        log_msg("[ECH] JSON parse failed");
+        return NULL;
+    }
     
     unsigned char* ech_config = NULL; *out_len = 0;
     cJSON* answer = cJSON_GetObjectItem(root, "Answer");
@@ -293,48 +282,67 @@ unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t
             cJSON* record = cJSON_GetArrayItem(answer, i);
             if (!record) continue;
             cJSON* type = cJSON_GetObjectItem(record, "type");
+            
+            // Type 65 = HTTPS
             if (type && type->valueint == 65) { 
                 cJSON* data = cJSON_GetObjectItem(record, "data");
                 if (data && data->valuestring) {
                     const char* data_str = data->valuestring;
                     log_msg("[ECH] Raw RR: %s", data_str); 
 
-                    // 策略 A: 检查是否存在 ech="Base64" 格式
+                    // ----------------------------------------------------
+                    // Strategy A: Check for ech="Base64"
+                    // ----------------------------------------------------
                     const char* tag = "ech=\"";
                     char* p_start = strstr(data_str, tag);
                     if (p_start) {
                         p_start += strlen(tag);
                         char* p_end = strchr(p_start, '"');
+                        
+                        // 防御性：处理转义引号，虽然在 Raw RR 中通常不需要
+                        while (p_end && *(p_end - 1) == '\\') {
+                            p_end = strchr(p_end + 1, '"');
+                        }
+
                         if (p_end) {
                             int b64_len = (int)(p_end - p_start);
-                            char* b64_str = (char*)malloc(b64_len + 1);
-                            if (b64_str) {
-                                memcpy(b64_str, p_start, b64_len);
-                                b64_str[b64_len] = 0;
-                                
-                                size_t decoded_len = 0;
-                                unsigned char* decoded = Base64Decode(b64_str, &decoded_len);
-                                free(b64_str);
-                                
-                                if (decoded && decoded_len > 0) {
-                                    ech_config = decoded;
-                                    *out_len = decoded_len;
-                                    log_msg("[ECH] Found ech param (Base64), len=%d", decoded_len);
-                                    // 成功提取，直接返回，因为 ech 参数的值就是 payload
-                                    break; 
+                            if (b64_len > 0) {
+                                char* b64_str = (char*)malloc(b64_len + 1);
+                                if (b64_str) {
+                                    memcpy(b64_str, p_start, b64_len);
+                                    b64_str[b64_len] = 0;
+                                    
+                                    log_msg("[ECH] Found tag, extracting %d chars: %.20s...", b64_len, b64_str);
+
+                                    size_t decoded_len = 0;
+                                    unsigned char* decoded = Base64Decode(b64_str, &decoded_len);
+                                    free(b64_str);
+                                    
+                                    if (decoded && decoded_len > 0) {
+                                        ech_config = decoded;
+                                        *out_len = decoded_len;
+                                        log_msg("[ECH] Base64 success, len=%d", decoded_len);
+                                        break; // Success!
+                                    } else {
+                                        log_msg("[ECH] Base64 decode failed or empty");
+                                        if(decoded) free(decoded);
+                                    }
                                 }
-                                if (decoded) free(decoded);
                             }
+                        } else {
+                            log_msg("[ECH] Malformed ech param (missing end quote)");
                         }
                     }
 
-                    // 策略 B: 检查 RFC 3597 Hex 格式 (\# <len> <hex>)
+                    // ----------------------------------------------------
+                    // Strategy B: RFC 3597 Hex Format (\# <len> <hex>)
+                    // ----------------------------------------------------
                     if (!ech_config) {
                         const char* p_hex = data_str;
                         if (strncmp(p_hex, "\\#", 2) == 0) {
                             p_hex += 2;
                             while (*p_hex && isspace((unsigned char)*p_hex)) p_hex++;
-                            while (*p_hex && isdigit((unsigned char)*p_hex)) p_hex++; // Skip length
+                            while (*p_hex && isdigit((unsigned char)*p_hex)) p_hex++;
                             while (*p_hex && isspace((unsigned char)*p_hex)) p_hex++;
                             
                             unsigned char rdata[4096];
@@ -367,7 +375,7 @@ unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t
                                                 if (ech_config) {
                                                     memcpy(ech_config, ptr, val_len);
                                                     *out_len = val_len;
-                                                    log_msg("[ECH] Found ech param (Hex Wire), len=%d", val_len);
+                                                    log_msg("[ECH] Hex wire format success, len=%d", val_len);
                                                 }
                                                 break;
                                             }
@@ -389,7 +397,7 @@ unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t
 }
 
 // --------------------------------------------------------------------------
-// 其他工具函数 (文件/字符串/剪贴板)
+// 其他工具函数
 // --------------------------------------------------------------------------
 
 BOOL ReadFileToBuffer(const wchar_t* filename, char** buffer, long* size) {
@@ -466,7 +474,7 @@ char* GetClipboardText() {
 }
 
 // --------------------------------------------------------------------------
-// 代理设置 (保留 Sing.c 的增强逻辑)
+// 代理设置
 // --------------------------------------------------------------------------
 
 void SetSystemProxy(BOOL enable) {
