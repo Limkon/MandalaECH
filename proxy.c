@@ -480,11 +480,17 @@ DWORD WINAPI client_handler(LPVOID p) {
                     }
                 }
             }
-            // 确保不溢出
+            
+            // [Bug Fix] 防止死循环: 如果缓冲区已满且无法继续扩容，则由于 ws_buf_len == ws_read_buf_cap，
+            // 导致 tls_read 读取 0 字节。此时若数据帧仍不完整，check_ws_frame 返回 0，循环将无限空转。
             if (ws_buf_len < ws_read_buf_cap) {
                 int len = tls_read(&tls, ws_read_buf + ws_buf_len, ws_read_buf_cap - ws_buf_len);
                 if (len > 0) ws_buf_len += len;
                 else if (len < 0) break; 
+            } else {
+                // 缓冲区已满且无法解析，认为遭遇超大帧或攻击，断开连接
+                log_msg("[Err] WS buffer overflow or packet too large. Dropping.");
+                break;
             }
         }
         
@@ -628,4 +634,6 @@ void StopProxyCore() {
         hProxyThread = NULL; 
     }
     log_msg("[System] Proxy Stopped");
+}
+
 }
