@@ -2,13 +2,32 @@
 #include "crypto.h"
 #include "utils.h"
 #include "common.h"
+#include <process.h> 
 #include <openssl/sha.h>
+#include <stdio.h>
 
-// [Safety] 全局活跃连接计数器与内存水位监控
-static volatile LONG g_active_connections = 0;
-volatile LONG64 g_total_allocated_mem = 0; 
+// --- 全局变量定义 ---
+volatile LONG g_active_connections = 0;
+volatile LONG64 g_total_allocated_mem = 0;
 
-// [Concurrency] 客户端线程上下文 - 确保配置在线程间隔离
+ProxyConfig g_proxyConfig;
+CRITICAL_SECTION g_configLock;
+char g_userAgentStr[512] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"; // 默认值
+
+BOOL g_proxyRunning = FALSE;
+int g_localPort = 10809;
+int g_hideTrayStart = 0; // 定义缺失的变量
+
+static SOCKET g_listen_sock = INVALID_SOCKET;
+static HANDLE hProxyThread = NULL;
+
+// --- 内存池定义 ---
+#define MAX_POOL_ITEMS 1024 // 内存池最大缓存数量 (约 16MB)
+static void* g_pool_items[MAX_POOL_ITEMS];
+static int g_pool_count = 0;
+static CRITICAL_SECTION g_pool_lock;
+
+// [Concurrency] 客户端线程上下文
 typedef struct {
     SOCKET clientSock;
     ProxyConfig config;          
@@ -16,7 +35,79 @@ typedef struct {
     CryptoSettings cryptoSettings; 
 } ClientContext;
 
-// --- 辅助函数：解析 UUID ---
+// --- 内存管理实现 ---
+
+void Proxy_InitMemPool() {
+    InitializeCriticalSection(&g_pool_lock);
+    g_pool_count = 0;
+    // 初始化配置锁 (若未初始化)
+    static BOOL configLockInit = FALSE;
+    if (!configLockInit) { InitializeCriticalSection(&g_configLock); configLockInit = TRUE; }
+}
+
+void Proxy_CleanupMemPool() {
+    EnterCriticalSection(&g_pool_lock);
+    while (g_pool_count > 0) {
+        void* p = g_pool_items[--g_pool_count];
+        free(p);
+    }
+    LeaveCriticalSection(&g_pool_lock);
+    DeleteCriticalSection(&g_pool_lock);
+}
+
+void* Proxy_Malloc(size_t size) {
+    if (g_total_allocated_mem + (LONG64)size > MAX_TOTAL_MEMORY_USAGE) {
+        log_msg("[Warn] Memory limit reached, allocation denied.");
+        return NULL;
+    }
+    void* p = malloc(size);
+    if (p) InterlockedAdd64(&g_total_allocated_mem, (LONG64)size);
+    return p;
+}
+
+void Proxy_Free(void* p, size_t size) {
+    if (p) {
+        free(p);
+        InterlockedAdd64(&g_total_allocated_mem, -(LONG64)size);
+    }
+}
+
+void* Proxy_PoolAlloc() {
+    void* p = NULL;
+    EnterCriticalSection(&g_pool_lock);
+    if (g_pool_count > 0) {
+        p = g_pool_items[--g_pool_count];
+    }
+    LeaveCriticalSection(&g_pool_lock);
+
+    if (!p) {
+        // 池为空，申请新内存 (不计入 g_total_allocated_mem，因为池内存单独管理或简化处理)
+        // 为了统计准确，这里也使用 malloc 但手动维护计数？
+        // 简单起见，PoolAlloc 的内存视为长期持有，不频繁计入全局水位波动，
+        // 或者我们统一使用 Proxy_Malloc 申请，Pool 只是缓存指针。
+        // 这里选择：从系统申请，PoolFree 时才决定是否缓存。
+        p = malloc(IO_BUFFER_SIZE);
+    }
+    return p;
+}
+
+void Proxy_PoolFree(void* ptr) {
+    if (!ptr) return;
+    BOOL cached = FALSE;
+    EnterCriticalSection(&g_pool_lock);
+    if (g_pool_count < MAX_POOL_ITEMS) {
+        g_pool_items[g_pool_count++] = ptr;
+        cached = TRUE;
+    }
+    LeaveCriticalSection(&g_pool_lock);
+
+    if (!cached) {
+        free(ptr);
+    }
+}
+
+// --- 辅助函数 ---
+
 void parse_uuid(const char* uuid_str, unsigned char* out) {
     const char* p = uuid_str;
     int i = 0;
@@ -34,7 +125,6 @@ void parse_uuid(const char* uuid_str, unsigned char* out) {
     }
 }
 
-// --- 辅助函数：Trojan 密码哈希 ---
 void trojan_password_hash(const char* password, char* out_hex) {
     unsigned char digest[SHA224_DIGEST_LENGTH];
     SHA224((unsigned char*)password, (size_t)strlen(password), digest);
@@ -44,7 +134,6 @@ void trojan_password_hash(const char* password, char* out_hex) {
     out_hex[SHA224_DIGEST_LENGTH * 2] = 0;
 }
 
-// 接收超时辅助函数
 int recv_timeout(SOCKET s, char *buf, int len, int timeout_sec) {
     fd_set fds; 
     FD_ZERO(&fds); 
@@ -56,7 +145,6 @@ int recv_timeout(SOCKET s, char *buf, int len, int timeout_sec) {
     return recv(s, buf, len, 0);
 }
 
-// 健壮的头部读取
 int read_header_robust(SOCKET s, char* buf, int max_len, int timeout_sec) {
     int total_read = 0;
     int remaining_time = timeout_sec;
@@ -76,12 +164,11 @@ int read_header_robust(SOCKET s, char* buf, int max_len, int timeout_sec) {
             if (strstr(buf, "\r\n\r\n")) return total_read; 
         }
         
-        if (total_read > 8192) break; // 防御超大头部攻击
+        if (total_read > 8192) break; 
     }
     return total_read > 0 ? total_read : -1;
 }
 
-// 发送全部数据 (非阻塞兼容)
 int send_all(SOCKET s, const char *buf, int len) {
     int total = 0; 
     int bytesleft = len; 
@@ -103,7 +190,6 @@ int send_all(SOCKET s, const char *buf, int len) {
     return total;
 }
 
-// Base64 编码 (用于 WS Key)
 void base64_encode_key(const unsigned char* src, char* dst) {
     const char* table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     for(int i=0; i<16; i+=3) {
@@ -117,26 +203,9 @@ void base64_encode_key(const unsigned char* src, char* dst) {
     *(dst-1) = '='; *dst = 0;
 }
 
-// [Optimization] 动态内存分配与监控包装器
-void* proxy_malloc(size_t size) {
-    if (g_total_allocated_mem + (LONG64)size > MAX_TOTAL_MEMORY_USAGE) {
-        log_msg("[Warn] Memory limit reached, allocation denied.");
-        return NULL;
-    }
-    void* p = malloc(size);
-    if (p) InterlockedAdd64(&g_total_allocated_mem, (LONG64)size);
-    return p;
-}
-
-void proxy_free(void* p, size_t size) {
-    if (p) {
-        free(p);
-        InterlockedAdd64(&g_total_allocated_mem, -(LONG64)size);
-    }
-}
-
 // --- 客户端处理线程 (核心逻辑) ---
-DWORD WINAPI client_handler(LPVOID p) {
+// [Change] 使用 unsigned __stdcall 适配 _beginthreadex
+unsigned __stdcall client_handler(void* p) {
     InterlockedIncrement(&g_active_connections);
     ClientContext* ctx = (ClientContext*)p;
     if (!ctx) { InterlockedDecrement(&g_active_connections); return 0; }
@@ -160,10 +229,11 @@ DWORD WINAPI client_handler(LPVOID p) {
     char *header_end = NULL; int header_len = 0;
     struct addrinfo hints, *res = NULL, *ptr = NULL;
 
-    // 分配初始缓冲区并记录内存占用
-    c_buf = (char*)proxy_malloc(IO_BUFFER_SIZE); 
-    ws_read_buf = (char*)proxy_malloc(ws_read_buf_cap); 
-    ws_send_buf = (char*)proxy_malloc(IO_BUFFER_SIZE + 4096); 
+    // [Change] 使用内存池和受控分配
+    c_buf = (char*)Proxy_PoolAlloc(); // 固定 16KB
+    ws_read_buf = (char*)Proxy_Malloc(ws_read_buf_cap); 
+    ws_send_buf = (char*)Proxy_Malloc(IO_BUFFER_SIZE + 4096); // 约 20KB
+    
     if (!c_buf || !ws_read_buf || !ws_send_buf) goto cl_end; 
 
     int flag = 1;
@@ -209,11 +279,10 @@ DWORD WINAPI client_handler(LPVOID p) {
         } else goto cl_end;
     }
     
-    // [Desensitization] 日志脱敏处理 (隐藏部分 Host 信息)
+    // 日志脱敏处理
     char display_host[256]; strcpy(display_host, host);
 #if LOG_DESENSITIZE
     if (strlen(display_host) > 4) {
-        // 简单脱敏：保留首尾，中间打码
         size_t dlen = strlen(display_host);
         if (dlen > 8) {
             for(size_t i=3; i<dlen-3; i++) if(display_host[i]!='.') display_host[i] = '*';
@@ -244,7 +313,6 @@ DWORD WINAPI client_handler(LPVOID p) {
 
             if (connect(r, ptr->ai_addr, (int)ptr->ai_addrlen) == 0) {
                 tls.sock = r;
-                // 使用 CryptoSettings 进行 TLS 握手 (支持分片/填充/ECH)
                 if (tls_init_connect(&tls, localConfig.sni, localConfig.host, &localCrypto) == 0) {
                     break;
                 } else {
@@ -280,7 +348,6 @@ DWORD WINAPI client_handler(LPVOID p) {
         log_msg("[Err] WS Handshake Fail: %.50s", ws_read_buf); goto cl_end; 
     }
     
-    // 处理 Early Data (粘包)
     char* body_start = strstr(ws_read_buf, "\r\n\r\n");
     if (body_start) {
         body_start += 4; 
@@ -323,7 +390,7 @@ DWORD WINAPI client_handler(LPVOID p) {
         char hex_pass[SHA224_DIGEST_LENGTH * 2 + 1]; 
         trojan_password_hash(localConfig.pass, hex_pass);
         
-        if (is_mandala) { // Mandala 自定义协议
+        if (is_mandala) { 
             unsigned char salt[4], plaintext[2048]; 
             int p_len = 0;
             for(int i=0; i<4; i++) salt[i] = rand() % 256;
@@ -347,7 +414,7 @@ DWORD WINAPI client_handler(LPVOID p) {
             memcpy(proto_buf, salt, 4);
             for(int i=0; i<p_len; i++) proto_buf[4 + i] = plaintext[i] ^ salt[i % 4];
             proto_len = 4 + p_len;
-        } else { // Trojan 标准协议
+        } else { 
             memcpy(proto_buf, hex_pass, 56); proto_len = 56;
             proto_buf[proto_len++] = 0x0D; proto_buf[proto_len++] = 0x0A;
             proto_buf[proto_len++] = 0x01; 
@@ -443,7 +510,6 @@ DWORD WINAPI client_handler(LPVOID p) {
         int pending = SSL_pending(tls.ssl);
         tv.tv_sec = 1; tv.tv_usec = 0;
         
-        // 如果有缓存数据，不再等待
         if (pending > 0 || ws_buf_len > 0) { tv.tv_sec = 0; tv.tv_usec = 0; }
         
         int n = select(0, &fds, NULL, NULL, &tv);
@@ -464,31 +530,27 @@ DWORD WINAPI client_handler(LPVOID p) {
         
         // 代理 -> 浏览器
         if (FD_ISSET(r, &fds) || pending > 0) {
-            // [Optimization] 动态扩容与水位控制
             if (ws_buf_len >= ws_read_buf_cap - 1024) { 
                 if (ws_read_buf_cap < MAX_WS_FRAME_SIZE) {
                     int new_cap = ws_read_buf_cap * 2;
                     if (new_cap > MAX_WS_FRAME_SIZE) new_cap = MAX_WS_FRAME_SIZE;
                     
-                    // 尝试重分配
-                    char* new_buf = (char*)realloc(ws_read_buf, new_cap);
+                    // [Change] 使用 Proxy_Malloc 重新分配 (需要手动处理 realloc 逻辑)
+                    char* new_buf = (char*)Proxy_Malloc(new_cap);
                     if (new_buf) {
-                        // 更新全局内存计数
-                        InterlockedAdd64(&g_total_allocated_mem, (LONG64)(new_cap - ws_read_buf_cap));
+                        memcpy(new_buf, ws_read_buf, ws_buf_len);
+                        Proxy_Free(ws_read_buf, ws_read_buf_cap);
                         ws_read_buf = new_buf;
                         ws_read_buf_cap = new_cap;
                     }
                 }
             }
             
-            // [Bug Fix] 防止死循环: 如果缓冲区已满且无法继续扩容，则由于 ws_buf_len == ws_read_buf_cap，
-            // 导致 tls_read 读取 0 字节。此时若数据帧仍不完整，check_ws_frame 返回 0，循环将无限空转。
             if (ws_buf_len < ws_read_buf_cap) {
                 int len = tls_read(&tls, ws_read_buf + ws_buf_len, ws_read_buf_cap - ws_buf_len);
                 if (len > 0) ws_buf_len += len;
                 else if (len < 0) break; 
             } else {
-                // 缓冲区已满且无法解析，认为遭遇超大帧或攻击，断开连接
                 log_msg("[Err] WS buffer overflow or packet too large. Dropping.");
                 break;
             }
@@ -498,16 +560,15 @@ DWORD WINAPI client_handler(LPVOID p) {
         while (ws_buf_len > 0) {
             int hl, pl;
             long long frame_total = check_ws_frame((unsigned char*)ws_read_buf, ws_buf_len, &hl, &pl);
-            if (frame_total < 0) goto cl_end; // 帧过大或错误
+            if (frame_total < 0) goto cl_end; 
             if (frame_total > 0) {
                 int opcode = ws_read_buf[0] & 0x0F;
-                if (opcode == 0x8) goto cl_end; // Close
+                if (opcode == 0x8) goto cl_end; 
                 
                 if ((opcode == 0x1 || opcode == 0x2) && pl > 0) {
                     char* payload_ptr = ws_read_buf + hl;
                     int payload_size = pl;
                     
-                    // VLESS 响应头剥离 (Response Header: 2 bytes version + 1 byte len + N bytes info)
                     if (is_vless && !vless_response_header_stripped) {
                         if (payload_size >= 2) {
                             int addon_len = (unsigned char)payload_ptr[1];
@@ -517,7 +578,7 @@ DWORD WINAPI client_handler(LPVOID p) {
                                 payload_size -= head_size;
                                 vless_response_header_stripped = 1;
                             } else { 
-                                payload_size = 0; // 数据不足，等下一包
+                                payload_size = 0; 
                             }
                         } else payload_size = 0;
                     }
@@ -527,21 +588,20 @@ DWORD WINAPI client_handler(LPVOID p) {
                     }
                 }
                 
-                // 移除已处理帧
                 if (frame_total < ws_buf_len) {
                     memmove(ws_read_buf, ws_read_buf + frame_total, ws_buf_len - (int)frame_total);
                 }
                 ws_buf_len -= (int)frame_total;
-            } else break; // 数据不完整
+            } else break; 
         }
     }
 
 cl_end:
     if (res) freeaddrinfo(res);
-    // 释放内存并更新全局水位
-    proxy_free(c_buf, IO_BUFFER_SIZE);
-    proxy_free(ws_read_buf, ws_read_buf_cap);
-    proxy_free(ws_send_buf, IO_BUFFER_SIZE + 4096);
+    // [Change] 释放内存 (c_buf 使用 PoolFree，其他使用 Proxy_Free)
+    Proxy_PoolFree(c_buf);
+    Proxy_Free(ws_read_buf, ws_read_buf_cap);
+    Proxy_Free(ws_send_buf, IO_BUFFER_SIZE + 4096);
     
     tls_close(&tls);
     if (r != INVALID_SOCKET) closesocket(r); 
@@ -552,7 +612,8 @@ cl_end:
 }
 
 // 监听线程与管理函数
-DWORD WINAPI server_thread(LPVOID p) {
+// [Change] 使用 unsigned __stdcall 适配 _beginthreadex
+unsigned __stdcall server_thread(void* p) {
     g_listen_sock = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in addr; 
     memset(&addr, 0, sizeof(addr));
@@ -575,14 +636,12 @@ DWORD WINAPI server_thread(LPVOID p) {
     while(g_proxyRunning) {
         SOCKET c = accept(g_listen_sock, NULL, NULL);
         if (c != INVALID_SOCKET) {
-            // [Safety] 最大连接数限制
             if (g_active_connections >= MAX_CONNECTIONS) {
                 closesocket(c);
                 Sleep(10); 
                 continue;
             }
 
-            // [Concurrency] 配置快照
             ClientContext* ctx = (ClientContext*)malloc(sizeof(ClientContext));
             if (ctx) {
                 ctx->clientSock = c;
@@ -601,8 +660,9 @@ DWORD WINAPI server_thread(LPVOID p) {
                 ctx->cryptoSettings.enableChromeCiphers = g_enableChromeCiphers;
                 LeaveCriticalSection(&g_configLock);
 
-                HANDLE hClient = CreateThread(NULL, 0, client_handler, (LPVOID)ctx, 0, NULL);
-                if (hClient) CloseHandle(hClient); 
+                // [Change] 使用 _beginthreadex 创建线程
+                uintptr_t th = _beginthreadex(NULL, 0, client_handler, (void*)ctx, 0, NULL);
+                if (th) CloseHandle((HANDLE)th); 
                 else { 
                     free(ctx); 
                     closesocket(c); 
@@ -618,7 +678,10 @@ DWORD WINAPI server_thread(LPVOID p) {
 void StartProxyCore() {
     if (g_proxyRunning) return;
     g_proxyRunning = TRUE;
-    hProxyThread = CreateThread(NULL, 0, server_thread, NULL, 0, NULL);
+    Proxy_InitMemPool(); // 初始化内存池
+    // [Change] 使用 _beginthreadex
+    uintptr_t th = _beginthreadex(NULL, 0, server_thread, NULL, 0, NULL);
+    hProxyThread = (HANDLE)th;
     if (!hProxyThread) g_proxyRunning = FALSE;
 }
 
@@ -633,5 +696,6 @@ void StopProxyCore() {
         CloseHandle(hProxyThread); 
         hProxyThread = NULL; 
     }
+    Proxy_CleanupMemPool(); // 清理内存池
     log_msg("[System] Proxy Stopped");
 }
