@@ -36,6 +36,7 @@
 #include <commctrl.h>
 #include <shlobj.h>
 #include <wininet.h>
+#include <stdio.h> 
 
 #include "resource.h"
 
@@ -43,25 +44,6 @@
 #ifdef X509_NAME
 #undef X509_NAME
 #endif
-#ifdef X509_EXTENSIONS
-#undef X509_EXTENSIONS
-#endif
-#ifdef X509_CERT_PAIR
-#undef X509_CERT_PAIR
-#endif
-#ifdef PKCS7_ISSUER_AND_SERIAL
-#undef PKCS7_ISSUER_AND_SERIAL
-#endif
-#ifdef PKCS7_SIGNER_INFO
-#undef PKCS7_SIGNER_INFO
-#endif
-#ifdef OCSP_REQUEST
-#undef OCSP_REQUEST
-#endif
-#ifdef OCSP_RESPONSE
-#undef OCSP_RESPONSE
-#endif
-
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/bio.h>
@@ -94,9 +76,21 @@
 #define ID_EDIT_ECH_SERVER 7023
 #define ID_EDIT_ECH_DOMAIN 7024
 
+// --- [原版功能恢复] 订阅与更新 ---
+#define MAX_SUBS 64
+#define UPDATE_MODE_MANUAL 0
+#define UPDATE_MODE_STARTUP 1
+#define UPDATE_MODE_DAILY 2
+#define UPDATE_MODE_WEEKLY 3
+#define UPDATE_MODE_CUSTOM 4
+
+typedef struct {
+    char url[512];
+    BOOL enabled;
+} Subscription;
+
 // --- [IOCP] 结构体定义 ---
 
-// 操作类型
 typedef enum {
     IO_READ_CLIENT,
     IO_WRITE_CLIENT,
@@ -104,7 +98,6 @@ typedef enum {
     IO_WRITE_REMOTE
 } IO_OPERATION_TYPE;
 
-// 单次 IO 操作的上下文 (继承自 OVERLAPPED)
 typedef struct {
     OVERLAPPED overlapped;
     IO_OPERATION_TYPE opType;
@@ -113,29 +106,24 @@ typedef struct {
     DWORD bytesTransferred;
 } IO_CONTEXT;
 
-// 每个连接的上下文
 typedef struct {
     SOCKET clientSock;
     SOCKET remoteSock;
     SSL *ssl;
     
-    // IOCP 使用 Memory BIO
     BIO *io_in;  
     BIO *io_out; 
     
-    // 用于 WS 解析的残留缓冲区
     char *ws_frag_buf;
     int ws_frag_len;
     int ws_frag_cap;
 
-    // 两个方向的 IO 上下文
     IO_CONTEXT rxClient; 
     IO_CONTEXT rxRemote; 
     
     volatile LONG refCount; 
     BOOL closing;
 
-    // [Fix] 新增字段，用于修复 VLESS 协议头剥离问题
     BOOL is_vless;
     BOOL header_stripped;
 } CONNECTION_CONTEXT;
@@ -156,6 +144,15 @@ typedef struct {
 } ProxyConfig;
 
 // --- 全局变量声明 ---
+
+// 1. 订阅相关 (修复 undeclared identifier)
+extern Subscription g_subs[MAX_SUBS];
+extern int g_subCount;
+extern int g_subUpdateMode;
+extern int g_subUpdateInterval;
+extern long long g_lastUpdateTime;
+
+// 2. 核心变量
 extern ProxyConfig g_proxyConfig;
 extern volatile BOOL g_proxyRunning;
 extern SOCKET g_listen_sock;
@@ -183,6 +180,7 @@ extern WNDPROC g_oldListBoxProc;
 extern int g_nEditScrollPos;
 extern int g_nEditContentHeight;
 
+// 3. 抗封锁相关
 extern BOOL g_enableChromeCiphers;
 extern BOOL g_enableALPN;
 extern BOOL g_enableFragment;
@@ -206,7 +204,20 @@ extern BOOL g_enableLog;
 extern volatile LONG64 g_total_allocated_mem;
 extern CRITICAL_SECTION g_configLock; 
 
+// --- 函数声明 (修复 implicit declaration) ---
 void InitGlobalLocks();
 void DeleteGlobalLocks();
+
+// 配置与订阅功能
+void LoadSettings();
+void SaveSettings();
+int UpdateAllSubscriptions(BOOL force);
+int ImportFromClipboard();
+BOOL IsAutorun();
+void ParseTags();
+void DeleteNode(wchar_t* tag);
+void SwitchNode(wchar_t* tag);
+void UpdateTrayIcon();
+void ReloadNodeList();
 
 #endif // COMMON_H
