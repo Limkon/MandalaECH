@@ -639,7 +639,10 @@ cJSON* ParseShadowsocks(const char* link) {
     cJSON_AddStringToObject(outbound, "method", methodPass); cJSON_AddStringToObject(outbound, "password", pass);
 
     if (qMark) {
-        char* queryStr = _strdup(qMark+1); if(hash) queryStr[hash-(qMark+1)] = 0;
+        char* queryStr = _strdup(qMark+1); 
+        // [Bug Fix] 确保 hash 在 qMark 之后才进行截断，防止指针减法溢出导致崩溃
+        if(hash && hash > qMark) queryStr[hash-(qMark+1)] = 0;
+        
         char* pluginVal = GetQueryParam(queryStr, "plugin");
         if (pluginVal) { 
             UrlDecode(pluginVal, pluginVal); 
