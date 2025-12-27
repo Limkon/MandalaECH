@@ -161,44 +161,75 @@ char* GetQueryParam(const char* query, const char* key) {
 static const int b64_table[] = {
     -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
     -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,62,-1,63, // 修正：支持 + 和 - (43, 45 -> 62)
     52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1,
     -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
-    15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
+    15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,63, // 修正：支持 _ (95 -> 63)
     -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
     41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1
 };
 
+// [Fixed] 增强版 Base64 解码，支持 URL-Safe 字符 (-_)
 unsigned char* Base64Decode(const char* input, size_t* out_len) {
+    if (!input) return NULL;
     size_t len = strlen(input);
-    size_t out_size = len / 4 * 3;
+    if (len == 0) return NULL;
+
+    size_t out_size = len / 4 * 3 + 4; // 多分配一点防止溢出
     unsigned char* out = (unsigned char*)malloc(out_size + 1);
     if (!out) return NULL;
+    
     size_t i = 0, j = 0;
     while (i < len) {
         if (input[i] == '\r' || input[i] == '\n' || input[i] == ' ') { i++; continue; } 
         if (input[i] == '=') break; 
-        if (i + 1 >= len) break;
+        if (i + 1 >= len) break; // 防止越界读取
+        
         unsigned char a = (unsigned char)input[i];
         unsigned char b = (unsigned char)input[i+1];
-        if (a > 127 || b64_table[a] == -1 || b > 127 || b64_table[b] == -1) break;
-        uint32_t n = (b64_table[a] << 18) | (b64_table[b] << 12);
+
+        // 手动处理 URL-Safe 字符兼容
+        int v1 = (a > 127) ? -1 : b64_table[a];
+        int v2 = (b > 127) ? -1 : b64_table[b];
+
+        // 查表法已在表中兼容 - 和 _，此处保留逻辑以防万一使用不同表
+        if (v1 == -1 && a == '-') v1 = 62;
+        if (v1 == -1 && a == '_') v1 = 63;
+        if (v2 == -1 && b == '-') v2 = 62;
+        if (v2 == -1 && b == '_') v2 = 63;
+
+        if (v1 == -1 || v2 == -1) break;
+
+        uint32_t n = (v1 << 18) | (v2 << 12);
         out[j++] = (n >> 16) & 0xFF;
+
         if (i + 2 < len && input[i+2] != '=') {
             unsigned char c = (unsigned char)input[i+2];
-            if (c < 128 && b64_table[c] != -1) {
-                n |= (b64_table[c] << 6); out[j++] = (n >> 8) & 0xFF;
+            int v3 = (c > 127) ? -1 : b64_table[c];
+            if (v3 == -1 && c == '-') v3 = 62;
+            if (v3 == -1 && c == '_') v3 = 63;
+
+            if (v3 != -1) {
+                n |= (v3 << 6); 
+                out[j++] = (n >> 8) & 0xFF;
+                
                 if (i + 3 < len && input[i+3] != '=') {
                     unsigned char d = (unsigned char)input[i+3];
-                    if (d < 128 && b64_table[d] != -1) {
-                        n |= b64_table[d]; out[j++] = n & 0xFF;
+                    int v4 = (d > 127) ? -1 : b64_table[d];
+                    if (v4 == -1 && d == '-') v4 = 62;
+                    if (v4 == -1 && d == '_') v4 = 63;
+                    
+                    if (v4 != -1) {
+                        n |= v4; 
+                        out[j++] = n & 0xFF;
                     }
                 }
             }
         }
         i += 4;
     }
-    out[j] = 0; if (out_len) *out_len = j;
+    out[j] = 0; 
+    if (out_len) *out_len = j;
     return out;
 }
 
@@ -302,7 +333,17 @@ static BOOL ParseUrl(const char* url, URL_COMPONENTS_SIMPLE* out) {
 
 static char* InternalWinInetGet(const char* url) {
     char* result = NULL;
-    HINTERNET hInternet = InternetOpenW(L"Mandala/1.0", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
+    
+    // [Fix] 使用全局定义的浏览器 User-Agent，避免被订阅源反爬
+    wchar_t wUA[512];
+    if (strlen(g_userAgentStr) > 0) {
+        MultiByteToWideChar(CP_UTF8, 0, g_userAgentStr, -1, wUA, 512);
+    } else {
+        // 默认使用一个现代浏览器的 UA
+        wcscpy(wUA, L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
+    }
+
+    HINTERNET hInternet = InternetOpenW(wUA, INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
     if (!hInternet) return NULL;
 
     // [核心修复] 强制 Windows 7 开启 TLS 支持
@@ -313,7 +354,7 @@ static char* InternalWinInetGet(const char* url) {
     InternetSetOptionW(hInternet, INTERNET_OPTION_CONNECT_TIMEOUT, &timeout, sizeof(DWORD));
 
     HINTERNET hFile = InternetOpenUrlA(hInternet, url, NULL, 0, 
-        INTERNET_FLAG_RELOAD | INTERNET_FLAG_SECURE | INTERNET_FLAG_IGNORE_CERT_CN_INVALID, 0);
+        INTERNET_FLAG_RELOAD | INTERNET_FLAG_SECURE | INTERNET_FLAG_IGNORE_CERT_CN_INVALID | INTERNET_FLAG_NO_CACHE_WRITE, 0);
     
     if (hFile) {
         int capacity = 256 * 1024;
