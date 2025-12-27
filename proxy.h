@@ -8,10 +8,8 @@
 // --- 常量定义 ---
 #define IO_BUFFER_SIZE 16384
 #define MAX_CONNECTIONS 512
-// 确保只定义一次
-#ifndef MAX_TOTAL_MEMORY_USAGE
-#define MAX_TOTAL_MEMORY_USAGE (1024LL * 1024 * 1024) 
-#endif
+
+// MAX_TOTAL_MEMORY_USAGE 已在 common.h 定义，此处移除以避免重定义警告
 
 // --- 数据结构 ---
 typedef struct {
@@ -28,7 +26,7 @@ typedef struct {
 // 核心运行状态
 extern BOOL g_proxyRunning; 
 extern int g_localPort;
-extern int g_hideTrayStart; // 补充声明
+extern int g_hideTrayStart; 
 
 // 统计
 extern volatile LONG g_active_connections;
