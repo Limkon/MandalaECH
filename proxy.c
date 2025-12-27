@@ -3,6 +3,7 @@
 #include "utils.h"
 #include "common.h"
 #include <openssl/sha.h>
+#include <openssl/rand.h> // [Fix] 引入 OpenSSL 随机数头文件
 
 // [Safety] 全局活跃连接计数器与内存水位监控
 static volatile LONG g_active_connections = 0;
@@ -211,7 +212,9 @@ DWORD WINAPI client_handler(LPVOID p) {
     }
     
     // [Desensitization] 日志脱敏处理 (隐藏部分 Host 信息)
-    char display_host[256]; strcpy(display_host, host);
+    char display_host[256]; 
+    strncpy(display_host, host, sizeof(display_host)-1); 
+    display_host[sizeof(display_host)-1] = 0;
 #if LOG_DESENSITIZE
     if (strlen(display_host) > 4) {
         // 简单脱敏：保留首尾，中间打码
@@ -264,7 +267,12 @@ DWORD WINAPI client_handler(LPVOID p) {
     const char* sni_val = (strlen(localConfig.sni) > 0) ? localConfig.sni : localConfig.host;
     const char* req_path = (strlen(localConfig.path) > 0) ? localConfig.path : "/";
     unsigned char rnd_key[16]; char ws_key_str[32];
-    for(int i=0; i<16; i++) rnd_key[i] = rand() % 256;
+    
+    // [Fix] 使用 OpenSSL 强随机数生成 WS Key
+    if (RAND_bytes(rnd_key, 16) != 1) {
+        // Fallback if RAND_bytes fails (unlikely)
+        for(int i=0; i<16; i++) rnd_key[i] = rand() % 256;
+    }
     base64_encode_key(rnd_key, ws_key_str);
 
     int offset = snprintf(ws_send_buf, IO_BUFFER_SIZE, 
@@ -295,6 +303,7 @@ DWORD WINAPI client_handler(LPVOID p) {
     
     // 4. 代理协议封包 (VLESS / Trojan / SS / Mandala / Socks)
     unsigned char proto_buf[2048]; 
+    memset(proto_buf, 0, sizeof(proto_buf)); // Init
     int proto_len = 0, flen = 0;
     struct in_addr ip4; struct in6_addr ip6;
     
@@ -327,11 +336,17 @@ DWORD WINAPI client_handler(LPVOID p) {
         if (is_mandala) { // Mandala 自定义协议
             unsigned char salt[4], plaintext[2048]; 
             int p_len = 0;
-            for(int i=0; i<4; i++) salt[i] = rand() % 256;
+            // [Fix] 使用 RAND_bytes 生成 Salt
+            if(RAND_bytes(salt, 4) != 1) for(int i=0; i<4; i++) salt[i] = rand() % 256;
             
             memcpy(plaintext, hex_pass, 56); p_len = 56;
-            int pad = rand() % 16; plaintext[p_len++] = (unsigned char)pad;
-            for(int i=0; i<pad; i++) plaintext[p_len++] = rand() % 256;
+            
+            // [Fix] 使用 RAND_bytes 生成 Padding
+            unsigned char rnd_byte; RAND_bytes(&rnd_byte, 1);
+            int pad = rnd_byte % 16; 
+            plaintext[p_len++] = (unsigned char)pad;
+            if (pad > 0) RAND_bytes(plaintext + p_len, pad);
+            p_len += pad;
             
             plaintext[p_len++] = 0x01; // TCP
             if (inet_pton(AF_INET, host, &ip4) == 1) {
