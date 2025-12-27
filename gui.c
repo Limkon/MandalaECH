@@ -155,7 +155,7 @@ void LoadNodeToEdit(HWND hWnd, const wchar_t* tag) {
     cJSON_Delete(root);
 }
 
-void SaveEditedNode(HWND hWnd) {
+void SaveEditedNode(HWND hWnd, const wchar_t* originalTagW) {
     wchar_t wTag[256], wAddr[256], wUser[256], wPass[256], wHost[256], wPath[256];
     char tag[256], addr[256], user[256], pass[256], host[256], path[256];
     
@@ -193,7 +193,8 @@ void SaveEditedNode(HWND hWnd) {
         if (root) {
             cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
             char oldTagUtf8[256];
-            WideCharToMultiByte(CP_UTF8, 0, g_editingTag, -1, oldTagUtf8, 256, NULL, NULL);
+            // [Fix] 使用传入的 originalTagW 而不是全局 g_editingTag
+            WideCharToMultiByte(CP_UTF8, 0, originalTagW, -1, oldTagUtf8, 256, NULL, NULL);
             cJSON* node = NULL;
             cJSON_ArrayForEach(node, outbounds) {
                 cJSON* t = cJSON_GetObjectItem(node, "tag");
@@ -261,7 +262,8 @@ void SaveEditedNode(HWND hWnd) {
         if (root) {
             cJSON* outbounds = cJSON_GetObjectItem(root, "outbounds");
             char oldTagUtf8[256];
-            WideCharToMultiByte(CP_UTF8, 0, g_editingTag, -1, oldTagUtf8, 256, NULL, NULL);
+            // [Fix] 使用传入的 originalTagW
+            WideCharToMultiByte(CP_UTF8, 0, originalTagW, -1, oldTagUtf8, 256, NULL, NULL);
             
             // 查找并替换
             int count = cJSON_GetArraySize(outbounds);
@@ -288,6 +290,10 @@ void SaveEditedNode(HWND hWnd) {
 LRESULT CALLBACK NodeEditWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch(msg) {
         case WM_CREATE: {
+            // [Fix] 从全局变量读取 Tag，但立即保存到窗口属性中，后续只用窗口属性
+            wchar_t* tagCopy = _wcsdup(g_editingTag); 
+            SetPropW(hWnd, L"NodeTag", tagCopy);
+
             int y = 20;
             CreateWindowW(L"STATIC", L"节点备注:", WS_CHILD|WS_VISIBLE, 20, y+3, 70, 20, hWnd, NULL,NULL,NULL);
             CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_AUTOHSCROLL, 100, y, 220, 24, hWnd, (HMENU)ID_EDIT_TAG, NULL,NULL);
@@ -334,7 +340,7 @@ LRESULT CALLBACK NodeEditWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             CreateWindowW(L"BUTTON", L"取消", WS_CHILD|WS_VISIBLE, 180, y, 80, 30, hWnd, (HMENU)ID_BTN_CANCEL, NULL,NULL);
             
             // 加载数据
-            if (wcslen(g_editingTag) > 0) LoadNodeToEdit(hWnd, g_editingTag);
+            if (wcslen(tagCopy) > 0) LoadNodeToEdit(hWnd, tagCopy);
             
             EnumChildWindows(hWnd, EnumSetFont, (LPARAM)hAppFont);
             SendMessage(hWnd, WM_SETFONT, (WPARAM)hAppFont, TRUE);
@@ -343,13 +349,23 @@ LRESULT CALLBACK NodeEditWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
         case WM_COMMAND: {
             int id = LOWORD(wParam);
             if (id == ID_BTN_SAVE) {
-                SaveEditedNode(hWnd);
-                HWND hMgr = FindWindowW(L"NodeMgr", NULL);
-                if (hMgr) PostMessage(hMgr, WM_REFRESH_NODELIST, 0, 0);
+                // [Fix] 从窗口属性获取 Tag
+                wchar_t* tag = (wchar_t*)GetPropW(hWnd, L"NodeTag");
+                if (tag) {
+                    SaveEditedNode(hWnd, tag);
+                    HWND hMgr = FindWindowW(L"NodeMgr", NULL);
+                    if (hMgr) PostMessage(hMgr, WM_REFRESH_NODELIST, 0, 0);
+                }
                 DestroyWindow(hWnd);
             } else if (id == ID_BTN_CANCEL) {
                 DestroyWindow(hWnd);
             }
+            break;
+        }
+        case WM_DESTROY: {
+            // [Fix] 清理内存
+            wchar_t* tag = (wchar_t*)GetPropW(hWnd, L"NodeTag");
+            if(tag) { free(tag); RemovePropW(hWnd, L"NodeTag"); }
             break;
         }
         case WM_CLOSE: DestroyWindow(hWnd); break;
@@ -358,6 +374,7 @@ LRESULT CALLBACK NodeEditWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 }
 
 void OpenNodeEditWindow(const wchar_t* tag) {
+    // 仍然使用全局变量传递给 WM_CREATE，但在 WM_CREATE 中立即复制
     if (tag) wcsncpy(g_editingTag, tag, 255); else g_editingTag[0] = 0;
     
     WNDCLASSW wc = {0};
@@ -942,3 +959,5 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nSho
     return 0;
 }
 
+
+}
