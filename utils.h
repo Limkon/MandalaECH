@@ -1,30 +1,40 @@
 #ifndef UTILS_H
 #define UTILS_H
 
-#include "common.h"
+#include <windows.h>
+#include <stdio.h>
+#include "cJSON.h" 
 
-// --- 基础工具函数 ---
-void log_msg(const char *format, ...);
-// [Delete] log_wsa_error 未在 utils.c 实现，已删除
-
-char* GetClipboardText();
+// --- 字符串与数据处理 ---
+unsigned char* Base64Decode(const char* input, size_t* out_len);
 void TrimString(char* str);
 void UrlDecode(char* dst, const char* src);
-unsigned char* Base64Decode(const char* src, size_t* out_len);
 char* GetQueryParam(const char* query, const char* key);
-BOOL ReadFileToBuffer(const wchar_t* filename, char** buffer, long* fileSize);
+char* GetClipboardText();
+
+// [Fix] 暴露给 config.c 使用
+char* SafeStrDup(const char* s, int len);
+
+// --- 网络与 ECH ---
+char* Utils_HttpGet(const char* url);
+unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t* out_len);
+
+// --- 文件操作 ---
+BOOL ReadFileToBuffer(const wchar_t* filename, char** buffer, long* size);
 BOOL WriteBufferToFile(const wchar_t* filename, const char* buffer);
 
-// --- 网络功能 ---
-char* Utils_HttpGet(const char* url);
-
-// --- 系统代理功能 ---
-BOOL IsWindows8OrGreater();
+// --- 系统设置 ---
 void SetSystemProxy(BOOL enable);
 BOOL IsSystemProxyEnabled();
+BOOL IsWindows8OrGreater();
 
-// --- [新增] ECH 功能 ---
-// 供 crypto.c 调用
-unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t* out_len);
+// --- 日志 ---
+void log_msg(const char *format, ...);
+
+// --- 内存池 ---
+void InitMemoryPool();
+void CleanupMemoryPool();
+void* Pool_Alloc_16K();
+void Pool_Free_16K(void* ptr);
 
 #endif // UTILS_H
