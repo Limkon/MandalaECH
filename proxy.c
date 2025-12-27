@@ -635,5 +635,3 @@ void StopProxyCore() {
     }
     log_msg("[System] Proxy Stopped");
 }
-
-}
