@@ -7,10 +7,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
+#include <shellapi.h> // [Fix] for NOTIFYICONDATAW
 
 // --- 基础配置 ---
 #define CONFIG_FILE L"config.json"
 #define MAX_SUBS 64
+#define MAX_TOTAL_MEMORY_USAGE (512 * 1024 * 1024)
+
+// --- 自定义消息与常量 ---
+#define WM_LOG_UPDATE (WM_USER + 2) // [Fix] Added missing definition
+#define REG_PATH_PROXY L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings" // [Fix] Added missing definition
 
 // 订阅结构定义
 typedef struct {
@@ -24,14 +30,14 @@ typedef struct {
 extern wchar_t g_iniFilePath[MAX_PATH];
 extern int g_enableLog;
 
-// 2. 当前选中节点 (修复为 wchar_t 以匹配 config.c 的处理)
+// 2. 当前选中节点
 extern wchar_t currentNode[64];
 
-// 3. 动态节点列表 (GUI与Config共享)
+// 3. 动态节点列表
 extern wchar_t** nodeTags;
 extern int nodeCount;
 
-// 4. ECH 配置 (全局共享)
+// 4. ECH 配置
 extern char g_echConfigServer[256];
 extern char g_echPublicName[256];
 extern int g_enableECH;
@@ -58,7 +64,8 @@ extern const char* UA_TEMPLATES[];
 extern unsigned int g_hotkeyModifiers;
 extern unsigned int g_hotkeyVk;
 
-// 注意：ProxyConfig, g_proxyConfig, g_proxyRunning 等已移动至 proxy.h
-// 请勿在此处重复声明，否则会导致冲突。
+// 8. GUI 状态 (供 config.c 使用) [Fix] Expose GUI globals
+extern NOTIFYICONDATAW nid;
+extern BOOL g_isIconVisible;
 
 #endif // COMMON_H
