@@ -272,12 +272,12 @@ char* Utils_HttpGet(const char* url) {
     return InternalHttpsGet(url);
 }
 
-// ECH 配置获取 (保留功能)
+// ECH 配置获取 (修复版)
+// 增加对 HTTPS RR 记录的解析逻辑，提取 ECH Config 参数 (Key=5)
 unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t* out_len) {
     if (!domain || !doh_server) return NULL;
     char url[2048]; snprintf(url, sizeof(url), "%s?name=%s&type=65", doh_server, domain);
     
-    // 复用 OpenSSL 引擎下载 JSON
     char* json_str = Utils_HttpGet(url);
     if (!json_str) return NULL;
     
@@ -297,23 +297,58 @@ unsigned char* FetchECHConfig(const char* domain, const char* doh_server, size_t
                 cJSON* data = cJSON_GetObjectItem(record, "data");
                 if (data && data->valuestring) {
                     const char* data_str = data->valuestring;
-                    // 尝试解析 hex 或 base64
-                    if (strstr(data_str, "ech=\"")) {
-                         // 简化处理，实际场景 DoH 通常返回 Hex
+                    
+                    // 1. 处理可能存在的 RFC 3597 格式前缀 (e.g., "\# 123 <hex>")
+                    const char* p_hex = data_str;
+                    if (strncmp(p_hex, "\\#", 2) == 0) {
+                        p_hex += 2;
+                        while (*p_hex && (*p_hex == ' ' || isdigit(*p_hex))) p_hex++; // 跳过长度和空格
                     }
-                    if (!ech_config) {
-                        unsigned char rdata[4096];
-                        int rdata_len = HexToBin(data_str, rdata, sizeof(rdata));
-                        // 简单的 ECH 提取逻辑 (偏移量探测)
-                        if (rdata_len > 5) { 
-                             // 此处省略复杂的 DNS 报文解析，直接假设数据有效
-                             // 实际应参考原项目完整逻辑，这里仅保证编译通过且逻辑存在
-                             ech_config = (unsigned char*)malloc(rdata_len);
-                             if(ech_config) {
-                                 memcpy(ech_config, rdata, rdata_len); // 简化的占位
-                                 *out_len = rdata_len;
-                             }
-                             break;
+
+                    // 2. 将数据转换为二进制 (假设是 HEX 格式)
+                    unsigned char rdata[4096];
+                    int rdata_len = HexToBin(p_hex, rdata, sizeof(rdata));
+                    
+                    if (rdata_len > 2) { 
+                        // 3. 解析 HTTPS RR RDATA (RFC 9460)
+                        // Structure: [Priority(2)] [TargetName(Var)] [Params(Var)]
+                        unsigned char* ptr = rdata;
+                        unsigned char* end = rdata + rdata_len;
+                        
+                        // Skip Priority (2 bytes)
+                        if (ptr + 2 > end) continue;
+                        ptr += 2;
+                        
+                        // Skip Target Name (Wire-format DNS name)
+                        while (ptr < end && *ptr != 0) {
+                            int label_len = *ptr;
+                            ptr++;
+                            if (ptr + label_len > end) { ptr = end; break; } // Error
+                            ptr += label_len;
+                        }
+                        if (ptr >= end) continue; 
+                        ptr++; // Skip terminating 0x00
+
+                        // Iterate Params
+                        // Param Structure: [Key(2)] [Len(2)] [Value(Len)]
+                        while (ptr + 4 <= end) {
+                            int key = (ptr[0] << 8) | ptr[1];
+                            int val_len = (ptr[2] << 8) | ptr[3];
+                            ptr += 4;
+                            
+                            if (ptr + val_len > end) break;
+                            
+                            // Key 5 = ECH Config
+                            if (key == 0x0005) {
+                                ech_config = (unsigned char*)malloc(val_len);
+                                if (ech_config) {
+                                    memcpy(ech_config, ptr, val_len);
+                                    *out_len = val_len;
+                                    log_msg("[ECH] Found config in HTTPS record, len=%d", val_len);
+                                }
+                                break;
+                            }
+                            ptr += val_len;
                         }
                     }
                 }
