@@ -183,4 +183,11 @@ extern CRITICAL_SECTION g_configLock;
 void InitGlobalLocks();
 void DeleteGlobalLocks();
 
+// --- 生产环境优化：内存池声明 ---
+// 仅针对 IO_BUFFER_SIZE (16KB) 的缓冲区进行池化
+void InitMemoryPool();
+void CleanupMemoryPool();
+void* Pool_Alloc_16K();
+void Pool_Free_16K(void* ptr);
+
 #endif // COMMON_H
